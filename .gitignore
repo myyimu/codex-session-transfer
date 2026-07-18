@@ -1,0 +1,7 @@
+node_modules/
+dist/
+release/
+.npm-cache/
+.DS_Store
+*.log
+design-*.png

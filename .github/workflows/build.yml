@@ -1,0 +1,40 @@
+name: Build portable apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            command: npm run build:mac
+            artifact: release/*.zip
+            name: macOS-arm64
+          - os: windows-latest
+            command: npm run build:win
+            artifact: release/*.exe
+            name: Windows-portable
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: ${{ matrix.command }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-session-transfer-${{ matrix.name }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error

@@ -1,0 +1,64 @@
+{
+  "name": "codex-session-transfer",
+  "version": "0.1.0",
+  "description": "A private, portable desktop utility for exporting and importing Codex task history.",
+  "author": "myyimu",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.mjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1 --port 5173 --strictPort\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "dev:web": "vite",
+    "build:web": "vite build",
+    "build": "vite build && electron-builder",
+    "build:mac": "vite build && electron-builder --mac zip",
+    "build:win": "vite build && electron-builder --win portable",
+    "preview": "vite preview",
+    "test": "node --test",
+    "check": "npm run test && npm run build:web"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
+    "@vitejs/plugin-react": "5.0.4",
+    "adm-zip": "^0.5.16",
+    "better-sqlite3": "^12.11.1",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "vite": "6.4.2"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3",
+    "wait-on": "^9.0.3"
+  },
+  "build": {
+    "appId": "com.yimu.codexsessiontransfer",
+    "productName": "Codex 会话迁移",
+    "icon": "build/icon.png",
+    "asar": true,
+    "npmRebuild": true,
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "artifactName": "Codex-Session-Transfer-${version}-${arch}.${ext}",
+    "mac": {
+      "category": "public.app-category.utilities",
+      "identity": null,
+      "target": ["zip"]
+    },
+    "win": {
+      "target": ["portable"]
+    },
+    "linux": {
+      "category": "Utility",
+      "target": ["AppImage"]
+    }
+  }
+}
