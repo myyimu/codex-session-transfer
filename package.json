@@ -12,7 +12,7 @@
     "build:web": "vite build",
     "build": "vite build && electron-builder",
     "build:mac": "vite build && electron-builder --mac zip",
-    "build:win": "vite build && electron-builder --win portable",
+    "build:win": "vite build && electron-builder --win portable --x64",
     "preview": "vite preview",
     "test": "node --test",
     "check": "npm run test && npm run build:web"
