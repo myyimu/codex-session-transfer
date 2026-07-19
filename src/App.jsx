@@ -45,12 +45,14 @@ function filename(value) {
 }
 
 function projectKey(task) {
-  return task.cwd || "__unknown__";
+  return task.projectKey || task.cwd || "__unknown__";
 }
 
-function projectName(cwd) {
-  if (!cwd || cwd === "__unknown__") return "未记录项目";
-  return filename(cwd) || cwd;
+function projectName(task) {
+  const key = projectKey(task);
+  if (task.projectName) return task.projectName;
+  if (!key || key === "__unknown__") return "未记录项目";
+  return filename(key) || key;
 }
 
 function projectMissing(task) {
@@ -128,7 +130,7 @@ function ExportView({ environment, showToast }) {
       const key = projectKey(task);
       const current = groups.get(key) || {
         key,
-        name: projectName(key),
+        name: projectName(task),
         count: 0,
         missing: false,
         updatedAt: "",

@@ -24,6 +24,12 @@ struct Task {
     created_at: String,
     updated_at: String,
     cwd: String,
+    #[serde(default)]
+    project_key: String,
+    #[serde(default)]
+    project_name: String,
+    #[serde(default)]
+    project_path: String,
     source: String,
     model_provider: String,
     git_branch: String,
@@ -150,6 +156,9 @@ fn session_details(path: &Path) -> Result<Task, String> {
         created_at: String::new(),
         updated_at: String::new(),
         cwd: String::new(),
+        project_key: String::new(),
+        project_name: String::new(),
+        project_path: String::new(),
         source: String::new(),
         model_provider: String::new(),
         git_branch: String::new(),
@@ -272,6 +281,123 @@ fn database_titles(home: &Path) -> HashMap<String, (String, String, bool)> {
     result
 }
 
+fn path_name(path: &str) -> String {
+    Path::new(path.trim_end_matches(['/', '\\']))
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn repository_name(url: &str) -> String {
+    let mut name = url
+        .trim()
+        .trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".git")
+        .to_string();
+    if name == "." || name == ".." {
+        name.clear();
+    }
+    name
+}
+
+fn title_project_hint(title: &str) -> String {
+    let token = title.split_whitespace().next().unwrap_or_default();
+    if token.len() < 3
+        || token
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+    {
+        return String::new();
+    }
+    if token.contains('-') || token.contains('_') || token.contains('.') {
+        token.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn is_generic_workspace_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "work" | "workspace" | "projects" | "project" | "documents" | "desktop"
+    )
+}
+
+fn is_codex_worktree(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|parts| parts == [".codex", "worktrees"])
+}
+
+fn first_existing_path(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|path| path.exists()).cloned()
+}
+
+fn infer_project(task: &Task) -> (String, String, String, bool) {
+    let cwd = task.cwd.trim();
+    if cwd.is_empty() {
+        return (
+            "__unknown__".to_string(),
+            "未记录项目".to_string(),
+            String::new(),
+            true,
+        );
+    }
+
+    let repo_name = repository_name(&task.git_origin_url);
+    let cwd_name = path_name(cwd);
+    let home = dirs::home_dir().unwrap_or_default();
+    let project_name = if !repo_name.is_empty() {
+        repo_name
+    } else if is_generic_workspace_name(&cwd_name) {
+        title_project_hint(&task.title)
+    } else {
+        cwd_name
+    };
+
+    if project_name.is_empty() {
+        return (
+            cwd.to_string(),
+            path_name(cwd),
+            cwd.to_string(),
+            Path::new(cwd).exists(),
+        );
+    }
+
+    let mut candidates = Vec::new();
+    if path_name(cwd) == project_name && !is_codex_worktree(cwd) {
+        candidates.push(PathBuf::from(cwd));
+    }
+    candidates.extend([
+        PathBuf::from(cwd).join(&project_name),
+        home.join("work").join(&project_name),
+        home.join("Projects").join(&project_name),
+        home.join("Documents").join(&project_name),
+    ]);
+
+    let inferred_path = first_existing_path(&candidates)
+        .or_else(|| candidates.first().cloned())
+        .unwrap_or_else(|| PathBuf::from(cwd));
+    let exists = first_existing_path(&candidates).is_some();
+    let key = if task.git_origin_url.trim().is_empty() {
+        inferred_path.to_string_lossy().to_string()
+    } else {
+        task.git_origin_url.clone()
+    };
+
+    (
+        key,
+        project_name,
+        inferred_path.to_string_lossy().to_string(),
+        exists,
+    )
+}
+
 fn list_local_tasks() -> Result<Vec<Task>, String> {
     let home = codex_home();
     let index = read_index(&home);
@@ -319,7 +445,12 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
             task.cwd = database_task.map(|item| item.1.clone()).unwrap_or_default();
         }
         task.archived = database_task.map(|item| item.2).unwrap_or(false);
-        task.project_exists = task.cwd.is_empty() || Path::new(&task.cwd).exists();
+        (
+            task.project_key,
+            task.project_name,
+            task.project_path,
+            task.project_exists,
+        ) = infer_project(&task);
         task.browser_file = home
             .join("browser")
             .join("sessions")
@@ -699,11 +830,74 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_session_cwd;
+    use super::{infer_project, repository_name, rewrite_session_cwd, Task};
+    use std::{env, path::PathBuf};
 
     #[test]
     fn rewrite_session_cwd_updates_nested_json() {
         let source = "{\"payload\":{\"cwd\":\"/old\",\"values\":[\"/old/file\"]}}\n";
         assert!(rewrite_session_cwd(source, "/old", "/new").contains("/new/file"));
+    }
+
+    fn task_with(title: &str, cwd: &str, git_origin_url: &str) -> Task {
+        Task {
+            id: "test-task".to_string(),
+            title: title.to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            cwd: cwd.to_string(),
+            project_key: String::new(),
+            project_name: String::new(),
+            project_path: String::new(),
+            source: String::new(),
+            model_provider: String::new(),
+            git_branch: String::new(),
+            git_origin_url: git_origin_url.to_string(),
+            first_user_message: String::new(),
+            preview: String::new(),
+            message_count: 0,
+            user_message_count: 0,
+            size: 0,
+            archived: false,
+            project_exists: true,
+            file_path: PathBuf::new(),
+            browser_file: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn repository_name_handles_ssh_urls() {
+        assert_eq!(
+            repository_name("git@github.com:myyimu/ai-novel-diagnosis.git"),
+            "ai-novel-diagnosis"
+        );
+    }
+
+    #[test]
+    fn infer_project_marks_missing_child_under_generic_workspace() {
+        let cwd = env::temp_dir().join("work");
+        let name = format!("codex-session-transfer-missing-{}", std::process::id());
+        let task = task_with(&format!("{name} 继续整理"), &cwd.to_string_lossy(), "");
+        let (_, project_name, project_path, exists) = infer_project(&task);
+        assert_eq!(project_name, name);
+        assert!(project_path.ends_with(&project_name));
+        assert!(!exists);
+    }
+
+    #[test]
+    fn infer_project_ignores_codex_worktree_as_real_project() {
+        let cwd = env::temp_dir()
+            .join(".codex")
+            .join("worktrees")
+            .join("abcd")
+            .join("deleted-project");
+        let task = task_with(
+            "继续",
+            &cwd.to_string_lossy(),
+            "git@github.com:myyimu/deleted-project.git",
+        );
+        let (_, project_name, _, exists) = infer_project(&task);
+        assert_eq!(project_name, "deleted-project");
+        assert!(!exists);
     }
 }
