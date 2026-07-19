@@ -17,12 +17,6 @@ Codex Session Transfer is designed for:
 - Backing up important task sessions, including project paths, task titles, original session logs, and optional browser session config.
 - Restoring existing local session files back into the Codex task list when the files exist locally but no longer appear in the Codex sidebar.
 
-Suggested GitHub repository About description:
-
-```text
-Local-first desktop utility for exporting, importing, syncing, and restoring selected Codex project task sessions across computers.
-```
-
 ## Features
 
 - **Export tasks**: scan local Codex task history and export selected tasks as a ZIP archive.
@@ -102,10 +96,34 @@ Imports do not overwrite existing tasks by default. The app detects duplicates b
 
 Download the latest build from GitHub Releases:
 
+**Latest releases:** [github.com/myyimu/codex-session-transfer/releases/latest](https://github.com/myyimu/codex-session-transfer/releases/latest)
+
 - macOS: `Codex-Session-Transfer-*-arm64.zip`
 - Windows: `Codex-Session-Transfer-*-Windows-portable.zip`
 
 On macOS, unzip the archive and open the `.app`. If macOS blocks the app, right-click it in Finder and choose Open.
+
+### macOS Permission
+
+If macOS says the app cannot be opened because the developer cannot be verified, try this first:
+
+1. Right-click `Codex Session Transfer.app` or `Codex 会话迁移.app` in Finder.
+2. Choose Open.
+3. Confirm Open in the system dialog.
+
+If it is still blocked and you trust the release downloaded from this repository, remove the quarantine attribute:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Codex 会话迁移.app"
+open "/Applications/Codex 会话迁移.app"
+```
+
+If the app is still in Downloads, replace the path with its actual location:
+
+```bash
+xattr -dr com.apple.quarantine "$HOME/Downloads/Codex 会话迁移.app"
+open "$HOME/Downloads/Codex 会话迁移.app"
+```
 
 ## Local Development
 
@@ -149,3 +167,11 @@ codex-session-transfer/v1
 ## Privacy
 
 The app only reads your local Codex data directory and creates or imports local ZIP files. It does not upload session content and does not require a server.
+
+## License
+
+[MIT](./LICENSE)
+
+## Star
+
+If this little tool helped you move your Codex sessions safely, a Star would make it very happy and keep the maintainer smiling for quite a while.

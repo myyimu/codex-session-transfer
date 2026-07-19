@@ -17,12 +17,6 @@ Codex Session Transfer 适合这些场景：
 - 备份重要任务会话，保留项目路径、任务标题、原始对话记录和浏览器会话配置。
 - 本地已经存在会话文件，但 Codex 侧边栏看不到时，把本地历史重新恢复到 Codex 任务列表。
 
-建议 GitHub 仓库 About 描述：
-
-```text
-Local-first desktop utility for exporting, importing, syncing, and restoring selected Codex project task sessions across computers.
-```
-
 ## 功能说明
 
 - **导出任务**：扫描本机 Codex 任务历史，按任务勾选后导出为标准 ZIP。
@@ -102,10 +96,34 @@ Local-first desktop utility for exporting, importing, syncing, and restoring sel
 
 在 GitHub Releases 中下载最新版本：
 
+**最新下载地址：** [github.com/myyimu/codex-session-transfer/releases/latest](https://github.com/myyimu/codex-session-transfer/releases/latest)
+
 - macOS: `Codex-Session-Transfer-*-arm64.zip`
 - Windows: `Codex-Session-Transfer-*-Windows-portable.zip`
 
 macOS 解压后直接打开 `.app`。如果系统提示无法打开，可在 Finder 中右键应用并选择“打开”。
+
+### macOS 授权打开
+
+如果 macOS 提示“无法打开，因为无法验证开发者”，可以先尝试：
+
+1. 在 Finder 中右键 `Codex 会话迁移.app`。
+2. 选择“打开”。
+3. 在系统确认弹窗中再次点击“打开”。
+
+如果仍然无法打开，并且你确认应用来自本仓库 Releases，可使用命令移除隔离标记：
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Codex 会话迁移.app"
+open "/Applications/Codex 会话迁移.app"
+```
+
+如果应用还在下载目录，把路径换成实际位置，例如：
+
+```bash
+xattr -dr com.apple.quarantine "$HOME/Downloads/Codex 会话迁移.app"
+open "$HOME/Downloads/Codex 会话迁移.app"
+```
 
 ## 本地开发
 
@@ -149,3 +167,11 @@ codex-session-transfer/v1
 ## 隐私说明
 
 应用只读取本机 Codex 数据目录，并在本机生成或导入 ZIP 文件。它不会上传会话内容，也不需要服务器。
+
+## 开源协议
+
+[MIT](./LICENSE)
+
+## Star
+
+如果这个小工具帮你把 Codex 会话顺利搬家了，可以顺手点一个 Star。它会乖乖继续变好，也会让作者开心很久。

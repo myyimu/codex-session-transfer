@@ -4,6 +4,15 @@
   "description": "Local-first desktop utility for exporting, importing, syncing, and restoring selected Codex project task sessions across computers.",
   "author": "myyimu",
   "private": true,
+  "keywords": [
+    "codex",
+    "tauri",
+    "session-transfer",
+    "task-history",
+    "backup",
+    "migration",
+    "local-first"
+  ],
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
