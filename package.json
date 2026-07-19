@@ -1,8 +1,14 @@
 {
   "name": "codex-session-transfer",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Local-first desktop utility for exporting, importing, syncing, and restoring selected Codex project task sessions across computers.",
   "author": "myyimu",
+  "license": "MIT",
+  "homepage": "https://github.com/myyimu/codex-session-transfer#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/myyimu/codex-session-transfer.git"
+  },
   "private": true,
   "keywords": [
     "codex",

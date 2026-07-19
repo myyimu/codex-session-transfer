@@ -1,9 +1,12 @@
 [package]
 name = "codex-session-transfer"
-version = "0.1.8"
+version = "0.1.9"
 description = "Portable Codex session export and import utility"
 authors = ["yimu"]
 edition = "2021"
+license = "MIT"
+homepage = "https://github.com/myyimu/codex-session-transfer"
+repository = "https://github.com/myyimu/codex-session-transfer"
 
 [lib]
 name = "codex_session_transfer_lib"
