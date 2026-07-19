@@ -1,6 +1,6 @@
 :root {
-  color: #172025;
-  background: #edf5f6;
+  color: #183344;
+  background: #eaf7fc;
   font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
   font-synthesis: none;
 }
@@ -34,7 +34,7 @@ button {
   grid-template-columns: 252px minmax(0, 1fr);
   position: relative;
   overflow: hidden;
-  background: #f8fbfb url("/watercolor-bg.png") center / cover no-repeat;
+  background: #eaf7fc url("/watercolor-dreamscape.png") center / cover no-repeat;
 }
 
 .app-shell::after {
@@ -42,7 +42,7 @@ button {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  background: rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.12);
 }
 
 .window-drag-region {
@@ -65,8 +65,8 @@ button {
   display: flex;
   flex-direction: column;
   border-right: 1px solid rgba(65, 91, 101, 0.12);
-  background: rgba(249, 252, 252, 0.7);
-  backdrop-filter: blur(22px) saturate(112%);
+  background: rgba(255, 255, 255, 0.56);
+  backdrop-filter: blur(24px) saturate(135%);
 }
 
 .brand {
@@ -81,11 +81,17 @@ button {
   height: 38px;
   display: grid;
   place-items: center;
-  color: #176c79;
-  background: #e7f6f6;
-  border: 1px solid rgba(40, 131, 144, 0.18);
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(90, 157, 210, 0.28);
   border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(50, 110, 120, 0.1);
+  box-shadow: 0 10px 24px rgba(69, 131, 186, 0.16);
+}
+
+.brand-mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .brand > span:last-child,
@@ -144,10 +150,10 @@ nav button:hover {
 }
 
 nav button.active {
-  color: #177584;
-  background: rgba(232, 248, 248, 0.9);
-  border-color: rgba(44, 139, 150, 0.16);
-  box-shadow: 0 8px 18px rgba(51, 111, 121, 0.06);
+  color: #147f9d;
+  background: rgba(225, 249, 255, 0.82);
+  border-color: rgba(67, 161, 191, 0.28);
+  box-shadow: 0 10px 22px rgba(81, 151, 194, 0.12);
 }
 
 nav button.active strong {
@@ -198,11 +204,14 @@ nav button.active strong {
 }
 
 .workspace {
+  height: 100%;
+  min-height: 0;
   min-width: 0;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 18px;
-  padding: 58px 42px 28px;
+  overflow: hidden;
+  padding: 58px 42px 24px;
 }
 
 .workspace.import-workspace {
@@ -213,7 +222,7 @@ nav button.active strong {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  min-height: 82px;
+  min-height: 76px;
 }
 
 .eyebrow {
@@ -277,6 +286,13 @@ h1 {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+}
+
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .search-field {
@@ -367,6 +383,9 @@ h1 {
   display: flex;
   flex-direction: column;
   gap: 7px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: 8px;
 }
 
 .task-row {
@@ -376,22 +395,24 @@ h1 {
   align-items: center;
   gap: 12px;
   padding: 10px 15px;
-  border: 1px solid rgba(48, 76, 87, 0.1);
+  border: 1px solid rgba(88, 131, 162, 0.16);
   border-radius: 7px;
   background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 8px 20px rgba(105, 145, 177, 0.06);
   cursor: pointer;
   transition: border-color 150ms ease, background-color 150ms ease, transform 150ms ease;
 }
 
 .task-row:hover {
   transform: translateY(-1px);
-  border-color: rgba(45, 121, 132, 0.22);
-  background: rgba(255, 255, 255, 0.92);
+  border-color: rgba(53, 153, 190, 0.42);
+  background: rgba(255, 255, 255, 0.9);
 }
 
 .task-row.is-selected {
-  border-color: rgba(43, 136, 148, 0.34);
-  background: rgba(237, 250, 250, 0.9);
+  border-color: rgba(44, 165, 195, 0.55);
+  background: rgba(227, 250, 255, 0.82);
+  box-shadow: 0 10px 24px rgba(68, 159, 196, 0.14);
 }
 
 .task-row input {
@@ -412,8 +433,8 @@ h1 {
 }
 
 .task-row.is-selected .check-control {
-  border-color: #258797;
-  background: #258797;
+  border-color: #239ab6;
+  background: #239ab6;
 }
 
 .task-mark,
@@ -421,9 +442,9 @@ h1 {
 .drop-icon {
   display: grid;
   place-items: center;
-  color: #2d8390;
-  background: #e8f5f5;
-  border: 1px solid rgba(46, 132, 144, 0.1);
+  color: #258db0;
+  background: rgba(224, 247, 255, 0.84);
+  border: 1px solid rgba(84, 166, 201, 0.18);
 }
 
 .task-mark {
@@ -546,11 +567,11 @@ h1 {
   justify-content: space-between;
   gap: 16px;
   padding: 10px 12px 10px 16px;
-  border: 1px solid rgba(48, 76, 87, 0.1);
+  border: 1px solid rgba(80, 142, 177, 0.18);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.84);
-  box-shadow: 0 14px 34px rgba(60, 90, 100, 0.08);
-  backdrop-filter: blur(16px);
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 16px 34px rgba(92, 142, 178, 0.12);
+  backdrop-filter: blur(20px) saturate(135%);
 }
 
 .action-bar > div {
@@ -584,18 +605,18 @@ h1 {
   justify-content: center;
   gap: 8px;
   padding: 0 16px;
-  border: 1px solid #237b88;
+  border: 1px solid #168fb0;
   border-radius: 7px;
-  background: #237b88;
+  background: #168fb0;
   color: #fff;
   font-size: 12px;
   font-weight: 700;
-  box-shadow: 0 8px 18px rgba(35, 123, 136, 0.2);
+  box-shadow: 0 9px 20px rgba(33, 146, 181, 0.28);
   cursor: pointer;
 }
 
 .primary-button:hover:not(:disabled) {
-  background: #1b6d79;
+  background: #0f7f9e;
 }
 
 .primary-button:disabled {
@@ -609,6 +630,13 @@ h1 {
   border-color: #ac6177;
   background: #ac6177;
   box-shadow: 0 8px 18px rgba(172, 97, 119, 0.18);
+}
+
+.toolbar-export {
+  min-width: 154px;
+  height: 36px;
+  padding-inline: 13px;
+  white-space: nowrap;
 }
 
 .rose-button:hover:not(:disabled) {

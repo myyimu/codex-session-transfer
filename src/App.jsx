@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Archive,
   ArrowClockwise,
-  ArrowsLeftRight,
   Check,
   CheckSquare,
   Clock,
@@ -172,10 +171,16 @@ function ExportView({ environment, showToast }) {
             <button onClick={() => setQuery("")} aria-label="清空搜索" title="清空搜索"><X size={15} /></button>
           )}
         </label>
-        <button className="text-button" onClick={toggleVisible} disabled={!filtered.length}>
-          <CheckSquare size={17} weight={allVisibleSelected ? "fill" : "regular"} />
-          {allVisibleSelected ? "取消全选" : "全选当前结果"}
-        </button>
+        <div className="toolbar-actions">
+          <button className="text-button" onClick={toggleVisible} disabled={!filtered.length}>
+            <CheckSquare size={17} weight={allVisibleSelected ? "fill" : "regular"} />
+            {allVisibleSelected ? "取消全选" : "全选当前结果"}
+          </button>
+          <button className="primary-button toolbar-export" disabled={!selected.size || working} onClick={exportSelected}>
+            <Export size={17} weight="bold" />
+            {working ? "正在打包…" : selected.size ? `导出 ${selected.size} 个任务` : "导出已选任务"}
+          </button>
+        </div>
       </div>
 
       <div className="task-list" aria-live="polite">
@@ -363,7 +368,7 @@ export function App() {
       <div className="window-drag-region" />
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark"><ArrowsLeftRight size={22} weight="bold" /></span>
+          <span className="brand-mark"><img src="/transfer-icon-dream.png" alt="" /></span>
           <span><strong>Codex 迁移</strong><small>Session Transfer</small></span>
         </div>
 
