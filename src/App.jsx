@@ -64,6 +64,13 @@ function taskHiddenInCodex(task) {
   return Boolean(task.cwd) && task.codexVisible === false;
 }
 
+function modelLabel(task) {
+  const provider = String(task.modelProvider || "").trim();
+  const model = String(task.model || "").trim();
+  if (provider && model) return `${provider} / ${model}`;
+  return provider || model;
+}
+
 function compactPath(value) {
   const path = String(value || "");
   return path.replace(/^\/Users\/([^/]+)/, "~");
@@ -135,6 +142,7 @@ function TaskRow({ task, selected, onToggle }) {
           {task.archived && <span className="status-chip neutral">已归档</span>}
           {projectMissing(task) && <span className="status-chip warning">项目路径不存在</span>}
           {taskHiddenInCodex(task) && <span className="status-chip warning">未在 Codex 侧栏显示</span>}
+          {modelLabel(task) && <span className="status-chip neutral">{modelLabel(task)}</span>}
         </span>
         <span className="task-meta">
           <span><Clock size={13} />{formatDate(task.updatedAt)}</span>
@@ -561,7 +569,10 @@ function ImportView({ environment, showToast }) {
                   {task.conflict ? <ArrowClockwise size={15} /> : <Check size={15} weight="bold" />}
                 </span>
                 <span className="task-copy">
-                  <strong>{task.title}</strong>
+                  <strong>
+                    {task.title}
+                    {modelLabel(task) && <span className="status-chip neutral">{modelLabel(task)}</span>}
+                  </strong>
                   <span>{task.cwd || "未记录工作目录"}</span>
                 </span>
                 <span className={`status-chip ${task.conflict ? "neutral" : "ready"}`}>

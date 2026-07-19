@@ -33,6 +33,28 @@ struct Task {
     project_path: String,
     source: String,
     model_provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    reasoning_effort: String,
+    #[serde(default)]
+    sandbox_policy: String,
+    #[serde(default)]
+    approval_mode: String,
+    #[serde(default)]
+    cli_version: String,
+    #[serde(default)]
+    thread_source: String,
+    #[serde(default)]
+    agent_path: String,
+    #[serde(default)]
+    agent_nickname: String,
+    #[serde(default)]
+    agent_role: String,
+    #[serde(default)]
+    memory_mode: String,
+    #[serde(default)]
+    history_mode: String,
     git_branch: String,
     git_origin_url: String,
     first_user_message: String,
@@ -117,6 +139,33 @@ struct ThreadProjectAssignment {
     cwd: String,
 }
 
+#[derive(Clone, Debug)]
+struct DatabaseTask {
+    title: String,
+    cwd: String,
+    archived: bool,
+    source: String,
+    model_provider: String,
+    model: String,
+    reasoning_effort: String,
+    sandbox_policy: String,
+    approval_mode: String,
+    cli_version: String,
+    thread_source: String,
+    agent_path: String,
+    agent_nickname: String,
+    agent_role: String,
+    memory_mode: String,
+    history_mode: String,
+}
+
+#[derive(Clone, Debug)]
+struct CodexModelSettings {
+    provider: String,
+    model: String,
+    reasoning_effort: String,
+}
+
 #[derive(Clone, Debug, Default)]
 struct DesktopProjectState {
     projects: HashMap<String, DesktopProject>,
@@ -136,6 +185,79 @@ fn codex_home() -> PathBuf {
     env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
+}
+
+fn simple_toml_string(contents: &str, key: &str) -> Option<String> {
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || !line.starts_with(key) {
+            continue;
+        }
+        let Some((left, right)) = line.split_once('=') else {
+            continue;
+        };
+        if left.trim() != key {
+            continue;
+        }
+        let value = right.trim().trim_matches('"').trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn model_exists_in_codex_cache(home: &Path, slug: &str) -> bool {
+    let Ok(contents) = fs::read_to_string(home.join("models_cache.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&contents) else {
+        return false;
+    };
+    value
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .any(|model| model.get("slug").and_then(Value::as_str) == Some(slug))
+        })
+        .unwrap_or(false)
+}
+
+fn latest_openai_model_from_database(home: &Path) -> Option<(String, String)> {
+    let connection = Connection::open_with_flags(
+        home.join("state_5.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    connection
+        .query_row(
+            "SELECT COALESCE(model, ''), COALESCE(reasoning_effort, '') FROM threads WHERE model_provider = 'openai' AND COALESCE(model, '') != '' ORDER BY updated_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .ok()
+}
+
+fn codex_model_settings(home: &Path) -> CodexModelSettings {
+    let config = fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+    let config_model = simple_toml_string(&config, "model");
+    let config_effort = simple_toml_string(&config, "model_reasoning_effort");
+    let database_model = latest_openai_model_from_database(home);
+    let model = config_model
+        .filter(|model| model_exists_in_codex_cache(home, model))
+        .or_else(|| database_model.as_ref().map(|item| item.0.clone()))
+        .unwrap_or_else(|| "gpt-5.5".to_string());
+    let reasoning_effort = config_effort
+        .or_else(|| database_model.map(|item| item.1))
+        .filter(|effort| !effort.trim().is_empty())
+        .unwrap_or_else(|| "high".to_string());
+    CodexModelSettings {
+        provider: "openai".to_string(),
+        model,
+        reasoning_effort,
+    }
 }
 
 fn codex_desktop_processes() -> Vec<String> {
@@ -223,6 +345,171 @@ fn content_text(value: Option<&Value>) -> String {
     }
 }
 
+fn nested_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in keys {
+        current = current.get(*key)?;
+    }
+    current.as_str().filter(|text| !text.trim().is_empty())
+}
+
+fn set_if_empty(target: &mut String, value: Option<&str>) {
+    if target.is_empty() {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            *target = value.to_string();
+        }
+    }
+}
+
+fn set_json_if_empty(target: &mut String, value: Option<&Value>) {
+    if target.is_empty() {
+        if let Some(value) = value {
+            if !value.is_null() {
+                *target = serde_json::to_string(value).unwrap_or_default();
+            }
+        }
+    }
+}
+
+fn apply_session_record_metadata(task: &mut Task, record: &Value) {
+    let record_type = record.get("type").and_then(Value::as_str);
+    let payload = record.get("payload").unwrap_or(&Value::Null);
+
+    if record_type == Some("session_meta") {
+        set_if_empty(&mut task.id, payload.get("id").and_then(Value::as_str));
+        set_if_empty(
+            &mut task.created_at,
+            payload
+                .get("timestamp")
+                .or_else(|| record.get("timestamp"))
+                .and_then(Value::as_str),
+        );
+        set_if_empty(&mut task.cwd, payload.get("cwd").and_then(Value::as_str));
+        set_if_empty(
+            &mut task.source,
+            payload.get("source").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.model_provider,
+            payload.get("model_provider").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.model,
+            payload.get("model").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.reasoning_effort,
+            payload.get("reasoning_effort").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.sandbox_policy,
+            payload.get("sandbox_policy").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.approval_mode,
+            payload.get("approval_mode").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.cli_version,
+            payload.get("cli_version").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.thread_source,
+            payload.get("thread_source").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.agent_path,
+            payload.get("agent_path").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.agent_nickname,
+            payload.get("agent_nickname").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.agent_role,
+            payload.get("agent_role").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.memory_mode,
+            payload.get("memory_mode").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.history_mode,
+            payload.get("history_mode").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.git_branch,
+            nested_string(payload, &["git", "branch"]),
+        );
+        set_if_empty(
+            &mut task.git_origin_url,
+            nested_string(payload, &["git", "repository_url"]),
+        );
+    }
+
+    if record_type == Some("turn_context") {
+        set_if_empty(&mut task.cwd, payload.get("cwd").and_then(Value::as_str));
+        set_json_if_empty(&mut task.sandbox_policy, payload.get("sandbox_policy"));
+        set_if_empty(
+            &mut task.approval_mode,
+            payload.get("approval_policy").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.model,
+            payload
+                .get("model")
+                .and_then(Value::as_str)
+                .or_else(|| nested_string(payload, &["collaboration_mode", "settings", "model"])),
+        );
+        set_if_empty(
+            &mut task.reasoning_effort,
+            payload
+                .get("reasoning_effort")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("effort").and_then(Value::as_str))
+                .or_else(|| {
+                    nested_string(
+                        payload,
+                        &["collaboration_mode", "settings", "reasoning_effort"],
+                    )
+                }),
+        );
+    }
+
+    if payload.get("type").and_then(Value::as_str) == Some("thread_settings_applied") {
+        let settings = payload.get("thread_settings").unwrap_or(&Value::Null);
+        set_if_empty(&mut task.cwd, settings.get("cwd").and_then(Value::as_str));
+        set_json_if_empty(&mut task.sandbox_policy, settings.get("sandbox_policy"));
+        set_if_empty(
+            &mut task.approval_mode,
+            settings.get("approval_policy").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.model_provider,
+            settings
+                .get("model_provider_id")
+                .or_else(|| settings.get("model_provider"))
+                .and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.model,
+            settings.get("model").and_then(Value::as_str),
+        );
+        set_if_empty(
+            &mut task.reasoning_effort,
+            settings.get("reasoning_effort").and_then(Value::as_str),
+        );
+    }
+}
+
+fn hydrate_task_from_session_content(task: &mut Task, contents: &str) {
+    for line in contents.lines() {
+        if let Ok(record) = serde_json::from_str::<Value>(line) {
+            apply_session_record_metadata(task, &record);
+        }
+    }
+}
+
 fn session_details(path: &Path) -> Result<Task, String> {
     let file = File::open(path).map_err(|error| error.to_string())?;
     let mut task = Task {
@@ -236,6 +523,17 @@ fn session_details(path: &Path) -> Result<Task, String> {
         project_path: String::new(),
         source: String::new(),
         model_provider: String::new(),
+        model: String::new(),
+        reasoning_effort: String::new(),
+        sandbox_policy: String::new(),
+        approval_mode: String::new(),
+        cli_version: String::new(),
+        thread_source: String::new(),
+        agent_path: String::new(),
+        agent_nickname: String::new(),
+        agent_role: String::new(),
+        memory_mode: String::new(),
+        history_mode: String::new(),
         git_branch: String::new(),
         git_origin_url: String::new(),
         first_user_message: String::new(),
@@ -254,6 +552,7 @@ fn session_details(path: &Path) -> Result<Task, String> {
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        apply_session_record_metadata(&mut task, &record);
         if record.get("type").and_then(Value::as_str) == Some("session_meta") {
             let payload = record.get("payload").unwrap_or(&Value::Null);
             if task.id.is_empty() {
@@ -271,6 +570,33 @@ fn session_details(path: &Path) -> Result<Task, String> {
             }
             if task.model_provider.is_empty() {
                 task.model_provider = value_string(payload.get("model_provider"));
+            }
+            if task.model.is_empty() {
+                task.model = value_string(payload.get("model"));
+            }
+            if task.reasoning_effort.is_empty() {
+                task.reasoning_effort = value_string(payload.get("reasoning_effort"));
+            }
+            if task.cli_version.is_empty() {
+                task.cli_version = value_string(payload.get("cli_version"));
+            }
+            if task.thread_source.is_empty() {
+                task.thread_source = value_string(payload.get("thread_source"));
+            }
+            if task.agent_path.is_empty() {
+                task.agent_path = value_string(payload.get("agent_path"));
+            }
+            if task.agent_nickname.is_empty() {
+                task.agent_nickname = value_string(payload.get("agent_nickname"));
+            }
+            if task.agent_role.is_empty() {
+                task.agent_role = value_string(payload.get("agent_role"));
+            }
+            if task.memory_mode.is_empty() {
+                task.memory_mode = value_string(payload.get("memory_mode"));
+            }
+            if task.history_mode.is_empty() {
+                task.history_mode = value_string(payload.get("history_mode"));
             }
             if task.git_branch.is_empty() {
                 task.git_branch =
@@ -329,7 +655,7 @@ fn read_index(home: &Path) -> HashMap<String, Value> {
     result
 }
 
-fn database_titles(home: &Path) -> HashMap<String, (String, String, bool)> {
+fn database_tasks(home: &Path) -> HashMap<String, DatabaseTask> {
     let mut result = HashMap::new();
     let path = home.join("state_5.sqlite");
     let Ok(connection) =
@@ -338,22 +664,37 @@ fn database_titles(home: &Path) -> HashMap<String, (String, String, bool)> {
         return result;
     };
     let Ok(mut statement) = connection.prepare(
-        "SELECT id, COALESCE(title, ''), COALESCE(cwd, ''), COALESCE(archived, 0) FROM threads",
+        "SELECT id, COALESCE(title, ''), COALESCE(cwd, ''), COALESCE(archived, 0), COALESCE(source, ''), COALESCE(model_provider, ''), COALESCE(model, ''), COALESCE(reasoning_effort, ''), COALESCE(sandbox_policy, ''), COALESCE(approval_mode, ''), COALESCE(cli_version, ''), COALESCE(thread_source, ''), COALESCE(agent_path, ''), COALESCE(agent_nickname, ''), COALESCE(agent_role, ''), COALESCE(memory_mode, ''), COALESCE(history_mode, '') FROM threads",
     ) else {
         return result;
     };
     let Ok(rows) = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, bool>(3)?,
+            DatabaseTask {
+                title: row.get::<_, String>(1)?,
+                cwd: row.get::<_, String>(2)?,
+                archived: row.get::<_, bool>(3)?,
+                source: row.get::<_, String>(4)?,
+                model_provider: row.get::<_, String>(5)?,
+                model: row.get::<_, String>(6)?,
+                reasoning_effort: row.get::<_, String>(7)?,
+                sandbox_policy: row.get::<_, String>(8)?,
+                approval_mode: row.get::<_, String>(9)?,
+                cli_version: row.get::<_, String>(10)?,
+                thread_source: row.get::<_, String>(11)?,
+                agent_path: row.get::<_, String>(12)?,
+                agent_nickname: row.get::<_, String>(13)?,
+                agent_role: row.get::<_, String>(14)?,
+                memory_mode: row.get::<_, String>(15)?,
+                history_mode: row.get::<_, String>(16)?,
+            },
         ))
     }) else {
         return result;
     };
     for row in rows.flatten() {
-        result.insert(row.0, (row.1, row.2, row.3));
+        result.insert(row.0, row.1);
     }
     result
 }
@@ -823,7 +1164,7 @@ fn infer_project(task: &Task) -> (String, String, String, bool) {
 fn list_local_tasks() -> Result<Vec<Task>, String> {
     let home = codex_home();
     let index = read_index(&home);
-    let database = database_titles(&home);
+    let database = database_tasks(&home);
     let catalog = catalog_tasks(&home);
     let desktop_projects = read_desktop_project_state(&home);
     let mut files = HashSet::new();
@@ -858,7 +1199,7 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
                     .filter(|item| item.2)
                     .map(|item| item.0.clone())
             })
-            .or_else(|| database_task.map(|item| item.0.clone()))
+            .or_else(|| database_task.map(|item| item.title.clone()))
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| truncate(&task.first_user_message, 96));
         if task.title.is_empty() {
@@ -875,7 +1216,7 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
             task.cwd = catalog_task
                 .filter(|item| item.2 && !item.1.is_empty())
                 .map(|item| item.1.clone())
-                .or_else(|| database_task.map(|item| item.1.clone()))
+                .or_else(|| database_task.map(|item| item.cwd.clone()))
                 .unwrap_or_default();
         } else if let Some(catalog_cwd) = catalog_task
             .filter(|item| item.2 && !item.1.is_empty())
@@ -883,7 +1224,48 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
         {
             task.cwd = catalog_cwd;
         }
-        task.archived = database_task.map(|item| item.2).unwrap_or(false);
+        if let Some(database_task) = database_task {
+            if task.source.is_empty() {
+                task.source = database_task.source.clone();
+            }
+            if task.model_provider.is_empty() {
+                task.model_provider = database_task.model_provider.clone();
+            }
+            if task.model.is_empty() {
+                task.model = database_task.model.clone();
+            }
+            if task.reasoning_effort.is_empty() {
+                task.reasoning_effort = database_task.reasoning_effort.clone();
+            }
+            if task.sandbox_policy.is_empty() {
+                task.sandbox_policy = database_task.sandbox_policy.clone();
+            }
+            if task.approval_mode.is_empty() {
+                task.approval_mode = database_task.approval_mode.clone();
+            }
+            if task.cli_version.is_empty() {
+                task.cli_version = database_task.cli_version.clone();
+            }
+            if task.thread_source.is_empty() {
+                task.thread_source = database_task.thread_source.clone();
+            }
+            if task.agent_path.is_empty() {
+                task.agent_path = database_task.agent_path.clone();
+            }
+            if task.agent_nickname.is_empty() {
+                task.agent_nickname = database_task.agent_nickname.clone();
+            }
+            if task.agent_role.is_empty() {
+                task.agent_role = database_task.agent_role.clone();
+            }
+            if task.memory_mode.is_empty() {
+                task.memory_mode = database_task.memory_mode.clone();
+            }
+            if task.history_mode.is_empty() {
+                task.history_mode = database_task.history_mode.clone();
+            }
+        }
+        task.archived = database_task.map(|item| item.archived).unwrap_or(false);
         let catalog_visible = catalog
             .as_ref()
             .map(|items| items.get(&task.id).map(|item| item.2).unwrap_or(false))
@@ -1050,6 +1432,96 @@ fn rewrite_session_meta_cwd(contents: &str, to: &str) -> String {
         + "\n"
 }
 
+fn normalize_task_to_codex_model(task: &mut Task, settings: &CodexModelSettings) {
+    task.model_provider = settings.provider.clone();
+    task.model = settings.model.clone();
+    task.reasoning_effort = settings.reasoning_effort.clone();
+}
+
+fn rewrite_session_model_context(contents: &str, settings: &CodexModelSettings) -> String {
+    contents
+        .lines()
+        .map(|line| match serde_json::from_str::<Value>(line) {
+            Ok(mut value) => {
+                if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+                    if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+                        payload.insert(
+                            "model_provider".to_string(),
+                            Value::String(settings.provider.clone()),
+                        );
+                        payload.insert("model".to_string(), Value::String(settings.model.clone()));
+                        payload.insert(
+                            "reasoning_effort".to_string(),
+                            Value::String(settings.reasoning_effort.clone()),
+                        );
+                    }
+                }
+
+                if value.get("type").and_then(Value::as_str) == Some("turn_context") {
+                    if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+                        payload.insert("model".to_string(), Value::String(settings.model.clone()));
+                        payload.insert(
+                            "effort".to_string(),
+                            Value::String(settings.reasoning_effort.clone()),
+                        );
+                        payload.insert(
+                            "reasoning_effort".to_string(),
+                            Value::String(settings.reasoning_effort.clone()),
+                        );
+                        if let Some(settings_value) = payload
+                            .get_mut("collaboration_mode")
+                            .and_then(Value::as_object_mut)
+                            .and_then(|mode| mode.get_mut("settings"))
+                            .and_then(Value::as_object_mut)
+                        {
+                            settings_value
+                                .insert("model".to_string(), Value::String(settings.model.clone()));
+                            settings_value.insert(
+                                "reasoning_effort".to_string(),
+                                Value::String(settings.reasoning_effort.clone()),
+                            );
+                        }
+                    }
+                }
+
+                if value
+                    .get("payload")
+                    .and_then(|payload| payload.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("thread_settings_applied")
+                {
+                    if let Some(thread_settings) = value
+                        .get_mut("payload")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|payload| payload.get_mut("thread_settings"))
+                        .and_then(Value::as_object_mut)
+                    {
+                        thread_settings.insert(
+                            "model_provider_id".to_string(),
+                            Value::String(settings.provider.clone()),
+                        );
+                        thread_settings.insert(
+                            "model_provider".to_string(),
+                            Value::String(settings.provider.clone()),
+                        );
+                        thread_settings
+                            .insert("model".to_string(), Value::String(settings.model.clone()));
+                        thread_settings.insert(
+                            "reasoning_effort".to_string(),
+                            Value::String(settings.reasoning_effort.clone()),
+                        );
+                    }
+                }
+
+                serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
+            }
+            Err(_) => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
 fn append_index(home: &Path, tasks: &[Task]) -> Result<(), String> {
     let path = home.join("session_index.jsonl");
     let existing = fs::read_to_string(&path).unwrap_or_default();
@@ -1081,6 +1553,29 @@ fn backup_database(path: &Path, stamp: &str) -> Option<String> {
     Some(target.to_string_lossy().to_string())
 }
 
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value.trim()
+    }
+}
+
+fn optional_text(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn replace_if_present(target: &mut String, source: &str) {
+    if !source.trim().is_empty() {
+        *target = source.trim().to_string();
+    }
+}
+
 fn register_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
     let state = home.join("state_5.sqlite");
     if !state.exists() {
@@ -1093,21 +1588,33 @@ fn register_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
     for task in tasks {
         transaction
             .execute(
-                "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, git_branch, git_origin_url, first_user_message, memory_mode, preview, recency_at, recency_at_ms, history_mode, has_user_event, archived, archived_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{\"type\":\"disabled\"}', 'never', ?9, ?10, ?11, 'enabled', ?12, ?4, ?13, 'legacy', 1, 0, NULL) ON CONFLICT(id) DO UPDATE SET rollout_path=excluded.rollout_path, updated_at=excluded.updated_at, source=excluded.source, model_provider=excluded.model_provider, cwd=excluded.cwd, title=excluded.title, git_branch=excluded.git_branch, git_origin_url=excluded.git_origin_url, first_user_message=excluded.first_user_message, preview=excluded.preview, recency_at=excluded.recency_at, recency_at_ms=excluded.recency_at_ms, history_mode=excluded.history_mode, has_user_event=1, archived=0, archived_at=NULL",
+                "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, git_branch, git_origin_url, first_user_message, memory_mode, preview, recency_at, recency_at_ms, history_mode, has_user_event, archived, archived_at, cli_version, model, reasoning_effort, thread_source, agent_path, agent_nickname, agent_role, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?24, ?25, ?9, ?10, ?11, ?18, ?12, ?4, ?13, ?19, 1, 0, NULL, ?14, ?15, ?16, ?17, ?20, ?21, ?22, ?23, ?13) ON CONFLICT(id) DO UPDATE SET rollout_path=excluded.rollout_path, updated_at=excluded.updated_at, source=excluded.source, model_provider=excluded.model_provider, cwd=excluded.cwd, title=excluded.title, sandbox_policy=excluded.sandbox_policy, approval_mode=excluded.approval_mode, git_branch=excluded.git_branch, git_origin_url=excluded.git_origin_url, first_user_message=excluded.first_user_message, preview=excluded.preview, recency_at=excluded.recency_at, recency_at_ms=excluded.recency_at_ms, history_mode=excluded.history_mode, cli_version=excluded.cli_version, model=excluded.model, reasoning_effort=excluded.reasoning_effort, thread_source=excluded.thread_source, agent_path=excluded.agent_path, agent_nickname=excluded.agent_nickname, agent_role=excluded.agent_role, memory_mode=excluded.memory_mode, created_at_ms=excluded.created_at_ms, updated_at_ms=excluded.updated_at_ms, has_user_event=1, archived=0, archived_at=NULL",
                 params![
                     task.id,
                     task.file_path.to_string_lossy(),
                     parse_time(&task.created_at).timestamp(),
                     parse_time(&task.updated_at).timestamp(),
-                    task.source,
-                    task.model_provider,
+                    non_empty_or(&task.source, "vscode"),
+                    non_empty_or(&task.model_provider, "openai"),
                     task.cwd,
                     task.title,
                     task.git_branch,
                     task.git_origin_url,
                     task.first_user_message,
                     task.preview,
-                    parse_time(&task.updated_at).timestamp_millis()
+                    parse_time(&task.updated_at).timestamp_millis(),
+                    task.cli_version,
+                    optional_text(&task.model),
+                    optional_text(&task.reasoning_effort),
+                    optional_text(&task.thread_source),
+                    non_empty_or(&task.memory_mode, "enabled"),
+                    non_empty_or(&task.history_mode, "legacy"),
+                    optional_text(&task.agent_path),
+                    optional_text(&task.agent_nickname),
+                    optional_text(&task.agent_role),
+                    parse_time(&task.created_at).timestamp_millis(),
+                    non_empty_or(&task.sandbox_policy, "{\"type\":\"disabled\"}"),
+                    non_empty_or(&task.approval_mode, "never"),
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1286,6 +1793,9 @@ fn export_tasks(task_ids: Vec<String>, destination: String) -> Result<serde_json
 #[tauri::command]
 fn inspect_archive(archive_path: String) -> Result<ArchiveInspection, String> {
     let manifest = archive_manifest(Path::new(&archive_path))?;
+    let model_settings = codex_model_settings(&codex_home());
+    let file = File::open(&archive_path).map_err(|_| "找不到所选压缩包".to_string())?;
+    let mut zip = ZipArchive::new(file).map_err(|_| "这不是有效的 ZIP 压缩包".to_string())?;
     let existing: HashSet<_> = list_local_tasks()?
         .into_iter()
         .map(|task| task.id)
@@ -1297,9 +1807,21 @@ fn inspect_archive(archive_path: String) -> Result<ArchiveInspection, String> {
         tasks: manifest
             .tasks
             .into_iter()
-            .map(|item| InspectedTask {
-                conflict: existing.contains(&item.task.id),
-                task: item.task,
+            .map(|item| {
+                let mut task = item.task;
+                let mut contents = String::new();
+                if let Ok(mut file) = zip.by_name(&item.session_file) {
+                    if file.read_to_string(&mut contents).is_ok() {
+                        hydrate_task_from_session_content(&mut task, &contents);
+                    }
+                }
+                if task.model_provider.trim() == "custom" {
+                    normalize_task_to_codex_model(&mut task, &model_settings);
+                }
+                InspectedTask {
+                    conflict: existing.contains(&task.id),
+                    task,
+                }
             })
             .collect(),
     })
@@ -1316,6 +1838,7 @@ fn import_archive(
     let source = PathBuf::from(&archive_path);
     let manifest = archive_manifest(&source)?;
     let home = codex_home();
+    let model_settings = codex_model_settings(&home);
     fs::create_dir_all(home.join("sessions")).map_err(|error| error.to_string())?;
     fs::create_dir_all(home.join("browser").join("sessions")).map_err(|error| error.to_string())?;
     let existing_tasks: HashMap<_, _> = list_local_tasks()?
@@ -1344,33 +1867,64 @@ fn import_archive(
     let mut skipped = Vec::new();
     let mut backups = Vec::new();
     for entry in manifest.tasks {
-        if let Some(existing_task) = existing_tasks.get(&entry.task.id) {
+        let mut archive_task = entry.task;
+        let mut content = String::new();
+        zip.by_name(&entry.session_file)
+            .map_err(|_| "压缩包缺少会话文件".to_string())?
+            .read_to_string(&mut content)
+            .map_err(|error| error.to_string())?;
+        hydrate_task_from_session_content(&mut archive_task, &content);
+        let normalize_to_codex = archive_task.model_provider.trim() == "custom";
+        if normalize_to_codex {
+            normalize_task_to_codex_model(&mut archive_task, &model_settings);
+        }
+
+        if let Some(existing_task) = existing_tasks.get(&archive_task.id) {
             if restore_existing {
                 let mut task = existing_task.clone();
+                let normalize_existing =
+                    normalize_to_codex || task.model_provider.trim() == "custom";
                 if task.title.is_empty() {
-                    task.title = entry.task.title;
+                    task.title = archive_task.title;
                 }
                 if task.first_user_message.is_empty() {
-                    task.first_user_message = entry.task.first_user_message;
+                    task.first_user_message = archive_task.first_user_message;
                 }
                 if task.preview.is_empty() {
-                    task.preview = entry.task.preview;
+                    task.preview = archive_task.preview;
                 }
-                if task.source.is_empty() {
-                    task.source = entry.task.source;
+                replace_if_present(&mut task.source, &archive_task.source);
+                replace_if_present(&mut task.model_provider, &archive_task.model_provider);
+                replace_if_present(&mut task.model, &archive_task.model);
+                replace_if_present(&mut task.reasoning_effort, &archive_task.reasoning_effort);
+                replace_if_present(&mut task.sandbox_policy, &archive_task.sandbox_policy);
+                replace_if_present(&mut task.approval_mode, &archive_task.approval_mode);
+                replace_if_present(&mut task.cli_version, &archive_task.cli_version);
+                replace_if_present(&mut task.thread_source, &archive_task.thread_source);
+                replace_if_present(&mut task.agent_path, &archive_task.agent_path);
+                replace_if_present(&mut task.agent_nickname, &archive_task.agent_nickname);
+                replace_if_present(&mut task.agent_role, &archive_task.agent_role);
+                replace_if_present(&mut task.memory_mode, &archive_task.memory_mode);
+                replace_if_present(&mut task.history_mode, &archive_task.history_mode);
+                if normalize_existing {
+                    normalize_task_to_codex_model(&mut task, &model_settings);
                 }
-                if task.model_provider.is_empty() {
-                    task.model_provider = entry.task.model_provider;
-                }
-                if let Some(cwd) = target_cwd.as_deref() {
-                    if let Ok(contents) = fs::read_to_string(&task.file_path) {
+                if target_cwd.is_some() || normalize_existing {
+                    if let Ok(mut contents) = fs::read_to_string(&task.file_path) {
                         if let Some(backup) = backup_database(&task.file_path, &stamp) {
                             backups.push(backup);
                         }
-                        fs::write(&task.file_path, rewrite_session_meta_cwd(&contents, cwd))
-                            .map_err(|error| error.to_string())?;
+                        if let Some(cwd) = target_cwd.as_deref() {
+                            contents = rewrite_session_meta_cwd(&contents, cwd);
+                        }
+                        if normalize_existing {
+                            contents = rewrite_session_model_context(&contents, &model_settings);
+                        }
+                        fs::write(&task.file_path, contents).map_err(|error| error.to_string())?;
                     }
-                    task.cwd = cwd.to_string();
+                    if let Some(cwd) = target_cwd.as_deref() {
+                        task.cwd = cwd.to_string();
+                    }
                 }
                 task.archived = false;
                 (
@@ -1381,11 +1935,11 @@ fn import_archive(
                 ) = infer_project(&task);
                 restored.push(task);
             } else {
-                skipped.push(serde_json::json!({"id": entry.task.id, "title": entry.task.title, "reason": "already_exists"}));
+                skipped.push(serde_json::json!({"id": archive_task.id, "title": archive_task.title, "reason": "already_exists"}));
             }
             continue;
         }
-        let mut task = entry.task;
+        let mut task = archive_task;
         let date = parse_time(if task.created_at.is_empty() {
             &task.updated_at
         } else {
@@ -1402,11 +1956,6 @@ fn import_archive(
             date.format("%Y-%m-%dT%H-%M-%S"),
             task.id
         ));
-        let mut content = String::new();
-        zip.by_name(&entry.session_file)
-            .map_err(|_| "压缩包缺少会话文件".to_string())?
-            .read_to_string(&mut content)
-            .map_err(|error| error.to_string())?;
         let local_cwd = if let Some(cwd) = target_cwd.as_deref() {
             cwd.to_string()
         } else if adapt_paths {
@@ -1417,6 +1966,10 @@ fn import_archive(
         let mut session_content = rewrite_session_cwd(&content, &task.cwd, &local_cwd);
         if target_cwd.is_some() {
             session_content = rewrite_session_meta_cwd(&session_content, &local_cwd);
+        }
+        if normalize_to_codex {
+            session_content = rewrite_session_model_context(&session_content, &model_settings);
+            normalize_task_to_codex_model(&mut task, &model_settings);
         }
         fs::write(&rollout_path, session_content).map_err(|error| error.to_string())?;
         if let Some(browser_file) = entry.browser_file {
@@ -1516,13 +2069,189 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{infer_project, repository_name, rewrite_session_cwd, Task};
-    use std::{env, path::PathBuf};
+    use super::{
+        infer_project, register_threads, repository_name, rewrite_session_cwd,
+        rewrite_session_model_context, session_details, CodexModelSettings, Task,
+    };
+    use rusqlite::Connection;
+    use serde_json::Value;
+    use std::{env, fs, path::PathBuf};
 
     #[test]
     fn rewrite_session_cwd_updates_nested_json() {
         let source = "{\"payload\":{\"cwd\":\"/old\",\"values\":[\"/old/file\"]}}\n";
         assert!(rewrite_session_cwd(source, "/old", "/new").contains("/new/file"));
+    }
+
+    #[test]
+    fn session_details_preserves_custom_model_metadata() {
+        let path = env::temp_dir().join(format!(
+            "codex-session-transfer-model-metadata-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"custom-model-task","timestamp":"2026-07-19T12:00:00Z","cwd":"/tmp/project","source":"vscode","thread_source":"user","cli_version":"0.145.0-alpha.18","model_provider":"custom","model":"glm-5.2","reasoning_effort":"high","memory_mode":"enabled","history_mode":"legacy"}}"#,
+        )
+        .unwrap();
+        let task = session_details(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(task.model_provider, "custom");
+        assert_eq!(task.model, "glm-5.2");
+        assert_eq!(task.reasoning_effort, "high");
+        assert_eq!(task.cli_version, "0.145.0-alpha.18");
+        assert_eq!(task.thread_source, "user");
+    }
+
+    #[test]
+    fn session_details_reads_model_from_turn_context() {
+        let path = env::temp_dir().join(format!(
+            "codex-session-transfer-turn-context-model-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"custom-model-task","timestamp":"2026-07-19T12:00:00Z","cwd":"/tmp/project","source":"vscode","thread_source":"user","cli_version":"0.145.0-alpha.18","model_provider":"custom"}}
+{"type":"turn_context","payload":{"model":"glm-5.2","effort":"high","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"collaboration_mode":{"settings":{"reasoning_effort":"high"}}}}"#,
+        )
+        .unwrap();
+        let task = session_details(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(task.model_provider, "custom");
+        assert_eq!(task.model, "glm-5.2");
+        assert_eq!(task.reasoning_effort, "high");
+        assert_eq!(task.sandbox_policy, r#"{"type":"danger-full-access"}"#);
+        assert_eq!(task.approval_mode, "never");
+    }
+
+    #[test]
+    fn rewrite_session_model_context_converts_custom_to_codex_model() {
+        let settings = CodexModelSettings {
+            provider: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        let source = r#"{"type":"session_meta","payload":{"id":"custom-model-task","model_provider":"custom"}}
+{"type":"turn_context","payload":{"model":"glm-5.2","effort":"high","collaboration_mode":{"settings":{"model":"glm-5.2","reasoning_effort":"high"}}}}
+{"payload":{"type":"thread_settings_applied","thread_settings":{"model_provider_id":"custom","model":"glm-5.2","reasoning_effort":"high"}}}"#;
+        let rewritten = rewrite_session_model_context(source, &settings);
+        let lines = rewritten
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines[0]["payload"]["model_provider"].as_str(),
+            Some("openai")
+        );
+        assert_eq!(lines[0]["payload"]["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(lines[1]["payload"]["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(
+            lines[1]["payload"]["collaboration_mode"]["settings"]["model"].as_str(),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            lines[2]["payload"]["thread_settings"]["model_provider_id"].as_str(),
+            Some("openai")
+        );
+        assert_eq!(
+            lines[2]["payload"]["thread_settings"]["model"].as_str(),
+            Some("gpt-5.5")
+        );
+    }
+
+    #[test]
+    fn register_threads_writes_custom_model_metadata() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-db-metadata-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        let connection = Connection::open(home.join("state_5.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    model_provider TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    sandbox_policy TEXT NOT NULL,
+                    approval_mode TEXT NOT NULL,
+                    git_branch TEXT,
+                    git_origin_url TEXT,
+                    first_user_message TEXT NOT NULL DEFAULT '',
+                    memory_mode TEXT NOT NULL DEFAULT 'enabled',
+                    preview TEXT NOT NULL DEFAULT '',
+                    recency_at INTEGER NOT NULL DEFAULT 0,
+                    recency_at_ms INTEGER NOT NULL DEFAULT 0,
+                    history_mode TEXT NOT NULL DEFAULT 'legacy',
+                    has_user_event INTEGER NOT NULL DEFAULT 0,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    archived_at INTEGER,
+                    cli_version TEXT NOT NULL DEFAULT '',
+                    model TEXT,
+                    reasoning_effort TEXT,
+                    thread_source TEXT,
+                    agent_path TEXT,
+                    agent_nickname TEXT,
+                    agent_role TEXT,
+                    created_at_ms INTEGER,
+                    updated_at_ms INTEGER
+                );
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut task = task_with("custom", "/tmp/project", "");
+        task.id = "custom-model-task".to_string();
+        task.created_at = "2026-07-19T12:00:00Z".to_string();
+        task.updated_at = "2026-07-19T12:10:00Z".to_string();
+        task.file_path = PathBuf::from("/tmp/custom-model-task.jsonl");
+        task.source = "vscode".to_string();
+        task.model_provider = "custom".to_string();
+        task.model = "glm-5.2".to_string();
+        task.reasoning_effort = "high".to_string();
+        task.sandbox_policy = r#"{"type":"danger-full-access"}"#.to_string();
+        task.approval_mode = "never".to_string();
+        task.cli_version = "0.145.0-alpha.18".to_string();
+        task.thread_source = "user".to_string();
+
+        register_threads(&home, &[task]).unwrap();
+        let connection = Connection::open(home.join("state_5.sqlite")).unwrap();
+        let row = connection
+            .query_row(
+                "SELECT model_provider, model, reasoning_effort, cli_version, thread_source, sandbox_policy, approval_mode FROM threads WHERE id = 'custom-model-task'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(row.0, "custom");
+        assert_eq!(row.1, "glm-5.2");
+        assert_eq!(row.2, "high");
+        assert_eq!(row.3, "0.145.0-alpha.18");
+        assert_eq!(row.4, "user");
+        assert_eq!(row.5, r#"{"type":"danger-full-access"}"#);
+        assert_eq!(row.6, "never");
     }
 
     fn task_with(title: &str, cwd: &str, git_origin_url: &str) -> Task {
@@ -1537,6 +2266,17 @@ mod tests {
             project_path: String::new(),
             source: String::new(),
             model_provider: String::new(),
+            model: String::new(),
+            reasoning_effort: String::new(),
+            sandbox_policy: String::new(),
+            approval_mode: String::new(),
+            cli_version: String::new(),
+            thread_source: String::new(),
+            agent_path: String::new(),
+            agent_nickname: String::new(),
+            agent_role: String::new(),
+            memory_mode: String::new(),
+            history_mode: String::new(),
             git_branch: String::new(),
             git_origin_url: git_origin_url.to_string(),
             first_user_message: String::new(),
