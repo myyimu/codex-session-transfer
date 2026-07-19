@@ -65,7 +65,7 @@ button {
   display: flex;
   flex-direction: column;
   border-right: 1px solid rgba(65, 91, 101, 0.12);
-  background: rgba(255, 255, 255, 0.56);
+  background: rgba(255, 255, 255, 0.76);
   backdrop-filter: blur(24px) saturate(135%);
 }
 
@@ -104,6 +104,7 @@ nav button span {
 }
 
 .brand strong {
+  color: #122c3b;
   font-size: 15px;
   line-height: 20px;
 }
@@ -113,7 +114,7 @@ nav button span {
 .privacy-note small,
 nav button small {
   margin-top: 1px;
-  color: #78878d;
+  color: #526b78;
   font-size: 11px;
   line-height: 16px;
 }
@@ -133,13 +134,13 @@ nav button {
   border: 1px solid transparent;
   border-radius: 7px;
   background: transparent;
-  color: #66767c;
+  color: #426070;
   text-align: left;
   cursor: pointer;
 }
 
 nav button strong {
-  color: #34434a;
+  color: #1a3545;
   font-size: 13px;
   font-weight: 650;
   line-height: 18px;
@@ -150,14 +151,14 @@ nav button:hover {
 }
 
 nav button.active {
-  color: #147f9d;
-  background: rgba(225, 249, 255, 0.82);
-  border-color: rgba(67, 161, 191, 0.28);
-  box-shadow: 0 10px 22px rgba(81, 151, 194, 0.12);
+  color: #006f91;
+  background: rgba(208, 247, 255, 0.94);
+  border-color: rgba(11, 140, 179, 0.46);
+  box-shadow: 0 10px 22px rgba(34, 144, 187, 0.18);
 }
 
 nav button.active strong {
-  color: #175a65;
+  color: #07546f;
 }
 
 .privacy-note {
@@ -167,10 +168,10 @@ nav button.active strong {
   margin-top: auto;
   margin-bottom: 18px;
   padding: 12px;
-  color: #58786f;
-  border: 1px solid rgba(84, 141, 116, 0.14);
+  color: #2f6d5c;
+  border: 1px solid rgba(55, 135, 104, 0.24);
   border-radius: 7px;
-  background: rgba(239, 249, 243, 0.68);
+  background: rgba(237, 255, 245, 0.86);
 }
 
 .privacy-note strong {
@@ -228,7 +229,7 @@ nav button.active strong {
 .eyebrow {
   display: block;
   margin-bottom: 7px;
-  color: #2b8793;
+  color: #087d9b;
   font-size: 11px;
   font-weight: 700;
   line-height: 16px;
@@ -240,7 +241,7 @@ nav button.active strong {
 
 h1 {
   margin: 0;
-  color: #182227;
+  color: #102a3a;
   font-size: 27px;
   font-weight: 700;
   line-height: 36px;
@@ -249,7 +250,7 @@ h1 {
 
 .workspace-header p {
   margin: 5px 0 0;
-  color: #718086;
+  color: #506b79;
   font-size: 12px;
   line-height: 18px;
 }
@@ -261,9 +262,9 @@ h1 {
   display: grid;
   place-items: center;
   padding: 0;
-  border: 1px solid rgba(50, 77, 87, 0.12);
+  border: 1px solid rgba(39, 99, 128, 0.24);
   border-radius: 7px;
-  background: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.9);
   cursor: pointer;
 }
 
@@ -302,11 +303,11 @@ h1 {
   align-items: center;
   gap: 9px;
   padding: 0 12px;
-  color: #809097;
-  border: 1px solid rgba(45, 76, 87, 0.14);
+  color: #557282;
+  border: 1px solid rgba(37, 105, 137, 0.28);
   border-radius: 7px;
-  background: rgba(255, 255, 255, 0.82);
-  box-shadow: 0 8px 22px rgba(58, 91, 101, 0.04);
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 8px 22px rgba(58, 110, 138, 0.11);
 }
 
 .search-field:focus-within {
@@ -319,13 +320,13 @@ h1 {
   flex: 1;
   border: 0;
   outline: 0;
-  color: #243036;
+  color: #183545;
   background: transparent;
   font-size: 12px;
 }
 
 .search-field input::placeholder {
-  color: #9aa7ab;
+  color: #718996;
 }
 
 .search-field button {
@@ -350,7 +351,7 @@ h1 {
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: #52666e;
+  color: #23576d;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
@@ -395,10 +396,10 @@ h1 {
   align-items: center;
   gap: 12px;
   padding: 10px 15px;
-  border: 1px solid rgba(88, 131, 162, 0.16);
+  border: 1px solid rgba(55, 119, 153, 0.28);
   border-radius: 7px;
-  background: rgba(255, 255, 255, 0.72);
-  box-shadow: 0 8px 20px rgba(105, 145, 177, 0.06);
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 8px 20px rgba(75, 130, 163, 0.11);
   cursor: pointer;
   transition: border-color 150ms ease, background-color 150ms ease, transform 150ms ease;
 }
@@ -410,9 +411,9 @@ h1 {
 }
 
 .task-row.is-selected {
-  border-color: rgba(44, 165, 195, 0.55);
-  background: rgba(227, 250, 255, 0.82);
-  box-shadow: 0 10px 24px rgba(68, 159, 196, 0.14);
+  border-color: #139abd;
+  background: rgba(216, 250, 255, 0.97);
+  box-shadow: 0 10px 24px rgba(31, 154, 193, 0.2);
 }
 
 .task-row input {
@@ -470,7 +471,7 @@ h1 {
 .task-title-line > strong,
 .import-row .task-copy > strong {
   overflow: hidden;
-  color: #273238;
+  color: #183545;
   font-size: 13px;
   font-weight: 650;
   line-height: 18px;
@@ -483,7 +484,7 @@ h1 {
   display: flex;
   align-items: center;
   gap: 16px;
-  color: #7f8d92;
+  color: #597382;
   font-size: 10px;
   line-height: 15px;
 }
@@ -508,13 +509,13 @@ h1 {
 }
 
 .task-stats strong {
-  color: #405159;
+  color: #21475d;
   font-size: 13px;
   line-height: 18px;
 }
 
 .task-stats span {
-  color: #99a5a9;
+  color: #5f7d8c;
   font-size: 9px;
   line-height: 14px;
 }
@@ -567,10 +568,10 @@ h1 {
   justify-content: space-between;
   gap: 16px;
   padding: 10px 12px 10px 16px;
-  border: 1px solid rgba(80, 142, 177, 0.18);
+  border: 1px solid rgba(40, 113, 151, 0.32);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.78);
-  box-shadow: 0 16px 34px rgba(92, 142, 178, 0.12);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 16px 34px rgba(64, 126, 166, 0.18);
   backdrop-filter: blur(20px) saturate(135%);
 }
 
@@ -582,14 +583,14 @@ h1 {
 }
 
 .action-bar strong {
-  color: #344249;
+  color: #193b4f;
   font-size: 12px;
   line-height: 17px;
 }
 
 .action-bar span {
   overflow: hidden;
-  color: #88959a;
+  color: #5d7785;
   font-size: 9px;
   line-height: 14px;
   text-overflow: ellipsis;
@@ -605,18 +606,18 @@ h1 {
   justify-content: center;
   gap: 8px;
   padding: 0 16px;
-  border: 1px solid #168fb0;
+  border: 1px solid #007d9f;
   border-radius: 7px;
-  background: #168fb0;
+  background: #007f9f;
   color: #fff;
   font-size: 12px;
   font-weight: 700;
-  box-shadow: 0 9px 20px rgba(33, 146, 181, 0.28);
+  box-shadow: 0 9px 20px rgba(0, 114, 149, 0.34);
   cursor: pointer;
 }
 
 .primary-button:hover:not(:disabled) {
-  background: #0f7f9e;
+  background: #006b89;
 }
 
 .primary-button:disabled {
