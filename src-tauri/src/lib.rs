@@ -34,6 +34,8 @@ struct Task {
     user_message_count: usize,
     size: u64,
     archived: bool,
+    #[serde(default = "default_project_exists")]
+    project_exists: bool,
     #[serde(skip_serializing, default)]
     file_path: PathBuf,
     #[serde(skip_serializing, default)]
@@ -86,6 +88,10 @@ struct InspectedTask {
 #[serde(rename_all = "camelCase")]
 struct ImportOptions {
     adapt_paths: Option<bool>,
+}
+
+fn default_project_exists() -> bool {
+    true
 }
 
 fn codex_home() -> PathBuf {
@@ -154,6 +160,7 @@ fn session_details(path: &Path) -> Result<Task, String> {
         user_message_count: 0,
         size: fs::metadata(path).map_err(|error| error.to_string())?.len(),
         archived: false,
+        project_exists: true,
         file_path: path.to_path_buf(),
         browser_file: PathBuf::new(),
     };
@@ -312,6 +319,7 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
             task.cwd = database_task.map(|item| item.1.clone()).unwrap_or_default();
         }
         task.archived = database_task.map(|item| item.2).unwrap_or(false);
+        task.project_exists = task.cwd.is_empty() || Path::new(&task.cwd).exists();
         task.browser_file = home
             .join("browser")
             .join("sessions")

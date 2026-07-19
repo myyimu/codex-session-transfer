@@ -11,6 +11,7 @@ const demoTasks = [
   id: `${id}-demo-${index}`,
   title,
   cwd,
+  projectExists: index !== 5,
   preview: title,
   updatedAt: new Date(now - days * 86400000).toISOString(),
   createdAt: new Date(now - (days + 2) * 86400000).toISOString(),
@@ -58,4 +59,3 @@ export const demoBridge = {
   async revealPath() { return { ok: true }; },
   async getEnvironment() { return { codexHome: "/Users/yimu/.codex", platform: "darwin", version: "0.1.0" }; },
 };
-

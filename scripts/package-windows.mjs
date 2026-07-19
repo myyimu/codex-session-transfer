@@ -8,4 +8,4 @@ const installer = files.find((file) => file.endsWith(".exe"));
 if (!installer) throw new Error("Tauri NSIS installer was not generated");
 
 await mkdir("release", { recursive: true });
-await cp(path.join(sourceDir, installer), path.join("release", "Codex-Session-Transfer-0.1.1-x64-setup.exe"));
+await cp(path.join(sourceDir, installer), path.join("release", "Codex-Session-Transfer-0.1.2-x64-setup.exe"));

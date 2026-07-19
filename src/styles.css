@@ -18,7 +18,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -289,6 +290,15 @@ h1 {
   gap: 16px;
 }
 
+.filter-row {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(220px, 470px) minmax(180px, 250px);
+  align-items: center;
+  gap: 10px;
+}
+
 .toolbar-actions {
   display: flex;
   align-items: center;
@@ -296,8 +306,8 @@ h1 {
   gap: 8px;
 }
 
-.search-field {
-  width: min(100%, 470px);
+.search-field,
+.project-field {
   height: 40px;
   display: flex;
   align-items: center;
@@ -310,12 +320,25 @@ h1 {
   box-shadow: 0 8px 22px rgba(58, 110, 138, 0.11);
 }
 
-.search-field:focus-within {
+.search-field {
+  min-width: 0;
+}
+
+.project-field {
+  min-width: 0;
+  color: #23576d;
+  border-color: rgba(29, 137, 166, 0.34);
+  background: rgba(231, 252, 255, 0.95);
+}
+
+.search-field:focus-within,
+.project-field:focus-within {
   border-color: rgba(41, 133, 145, 0.48);
   box-shadow: 0 0 0 3px rgba(60, 154, 165, 0.1);
 }
 
-.search-field input {
+.search-field input,
+.project-field select {
   min-width: 0;
   flex: 1;
   border: 0;
@@ -323,6 +346,11 @@ h1 {
   color: #183545;
   background: transparent;
   font-size: 12px;
+}
+
+.project-field select {
+  cursor: pointer;
+  appearance: none;
 }
 
 .search-field input::placeholder {
@@ -540,6 +568,11 @@ h1 {
 .status-chip.ready {
   color: #3a8061;
   background: #e8f5ed;
+}
+
+.status-chip.warning {
+  color: #a44761;
+  background: #fde9f0;
 }
 
 .empty-state {
@@ -926,5 +959,20 @@ h1 {
 
   .task-meta span:last-child {
     max-width: 240px;
+  }
+}
+
+@media (max-width: 1060px) {
+  .toolbar {
+    flex-wrap: wrap;
+  }
+
+  .filter-row {
+    width: 100%;
+    flex-basis: 100%;
+  }
+
+  .toolbar-actions {
+    width: 100%;
   }
 }

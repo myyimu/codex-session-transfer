@@ -10,6 +10,7 @@ import {
   Export,
   FileArchive,
   FolderOpen,
+  FolderSimple,
   MagnifyingGlass,
   Path,
   ShieldCheck,
@@ -43,6 +44,19 @@ function filename(value) {
   return String(value || "").split(/[\\/]/).pop();
 }
 
+function projectKey(task) {
+  return task.cwd || "__unknown__";
+}
+
+function projectName(cwd) {
+  if (!cwd || cwd === "__unknown__") return "未记录项目";
+  return filename(cwd) || cwd;
+}
+
+function projectMissing(task) {
+  return Boolean(task.cwd) && task.projectExists === false;
+}
+
 function Toast({ toast, onClose }) {
   if (!toast) return null;
   return (
@@ -71,6 +85,7 @@ function TaskRow({ task, selected, onToggle }) {
         <span className="task-title-line">
           <strong>{task.title}</strong>
           {task.archived && <span className="status-chip neutral">已归档</span>}
+          {projectMissing(task) && <span className="status-chip warning">项目已删除</span>}
         </span>
         <span className="task-meta">
           <span><Clock size={13} />{formatDate(task.updatedAt)}</span>
@@ -88,6 +103,7 @@ function TaskRow({ task, selected, onToggle }) {
 function ExportView({ environment, showToast }) {
   const [tasks, setTasks] = useState([]);
   const [query, setQuery] = useState("");
+  const [project, setProject] = useState("all");
   const [selected, setSelected] = useState(new Set());
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState(false);
@@ -106,14 +122,38 @@ function ExportView({ environment, showToast }) {
 
   useEffect(() => { load(); }, []);
 
+  const projects = useMemo(() => {
+    const groups = new Map();
+    tasks.forEach((task) => {
+      const key = projectKey(task);
+      const current = groups.get(key) || {
+        key,
+        name: projectName(key),
+        count: 0,
+        missing: false,
+        updatedAt: "",
+      };
+      current.count += 1;
+      current.missing ||= projectMissing(task);
+      if ((task.updatedAt || "") > current.updatedAt) current.updatedAt = task.updatedAt || "";
+      groups.set(key, current);
+    });
+    return [...groups.values()].sort((left, right) => {
+      if (left.missing !== right.missing) return left.missing ? 1 : -1;
+      if (right.count !== left.count) return right.count - left.count;
+      return left.name.localeCompare(right.name, "zh-CN");
+    });
+  }, [tasks]);
+
   const filtered = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
-    if (!needle) return tasks;
-    return tasks.filter((task) =>
-      [task.title, task.cwd, task.preview, task.gitBranch]
-        .some((value) => String(value || "").toLocaleLowerCase().includes(needle)),
-    );
-  }, [query, tasks]);
+    return tasks.filter((task) => {
+      if (project !== "all" && projectKey(task) !== project) return false;
+      if (!needle) return true;
+      return [task.title, task.cwd, task.preview, task.gitBranch]
+        .some((value) => String(value || "").toLocaleLowerCase().includes(needle));
+    });
+  }, [project, query, tasks]);
 
   const selectedTasks = tasks.filter((task) => selected.has(task.id));
   const selectedBytes = selectedTasks.reduce((sum, task) => sum + (task.size || 0), 0);
@@ -164,13 +204,26 @@ function ExportView({ environment, showToast }) {
       </header>
 
       <div className="toolbar">
-        <label className="search-field">
-          <MagnifyingGlass size={18} />
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索任务名、路径或内容" />
-          {query && (
-            <button onClick={() => setQuery("")} aria-label="清空搜索" title="清空搜索"><X size={15} /></button>
-          )}
-        </label>
+        <div className="filter-row">
+          <label className="search-field">
+            <MagnifyingGlass size={18} />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索任务名、路径或内容" />
+            {query && (
+              <button onClick={() => setQuery("")} aria-label="清空搜索" title="清空搜索"><X size={15} /></button>
+            )}
+          </label>
+          <label className="project-field" title="按项目筛选任务">
+            <FolderSimple size={18} weight="duotone" />
+            <select value={project} onChange={(event) => setProject(event.target.value)} aria-label="按项目筛选">
+              <option value="all">全部项目 · {tasks.length}</option>
+              {projects.map((item) => (
+                <option key={item.key} value={item.key}>
+                  {item.missing ? `${item.name} · 已删除 · ${item.count}` : `${item.name} · ${item.count}`}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
         <div className="toolbar-actions">
           <button className="text-button" onClick={toggleVisible} disabled={!filtered.length}>
             <CheckSquare size={17} weight={allVisibleSelected ? "fill" : "regular"} />
