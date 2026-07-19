@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Codex 会话迁移",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "identifier": "com.yimu.codexsessiontransfer",
   "build": {
     "frontendDist": "../dist",
@@ -24,8 +24,15 @@
   "bundle": {
     "active": true,
     "category": "Utility",
-    "shortDescription": "迁移 Codex 会话历史",
-    "longDescription": "私有、本地运行的 Codex 会话导入导出工具。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "本地迁移 Codex 任务会话",
+    "longDescription": "Local-first desktop utility for exporting and importing selected Codex task sessions across computers.",
     "macOS": { "minimumSystemVersion": "12.0" },
     "windows": { "nsis": { "displayLanguageSelector": false } }
   }

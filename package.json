@@ -1,7 +1,7 @@
 {
   "name": "codex-session-transfer",
-  "version": "0.1.5",
-  "description": "A private, portable desktop utility for exporting and importing Codex task history.",
+  "version": "0.1.6",
+  "description": "Local-first desktop utility for exporting and importing selected Codex task sessions across computers.",
   "author": "myyimu",
   "private": true,
   "type": "module",
