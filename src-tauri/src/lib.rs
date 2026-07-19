@@ -94,6 +94,8 @@ struct InspectedTask {
 #[serde(rename_all = "camelCase")]
 struct ImportOptions {
     adapt_paths: Option<bool>,
+    restore_existing: Option<bool>,
+    target_cwd: Option<String>,
 }
 
 fn default_project_exists() -> bool {
@@ -556,6 +558,28 @@ fn rewrite_session_cwd(contents: &str, from: &str, to: &str) -> String {
         + "\n"
 }
 
+fn rewrite_session_meta_cwd(contents: &str, to: &str) -> String {
+    if to.is_empty() {
+        return contents.to_string();
+    }
+    contents
+        .lines()
+        .map(|line| match serde_json::from_str::<Value>(line) {
+            Ok(mut value) => {
+                if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+                    if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+                        payload.insert("cwd".to_string(), Value::String(to.to_string()));
+                    }
+                }
+                serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
+            }
+            Err(_) => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
 fn append_index(home: &Path, tasks: &[Task]) -> Result<(), String> {
     let path = home.join("session_index.jsonl");
     let existing = fs::read_to_string(&path).unwrap_or_default();
@@ -587,16 +611,39 @@ fn backup_database(path: &Path, stamp: &str) -> Option<String> {
     Some(target.to_string_lossy().to_string())
 }
 
-fn register_threads(home: &Path, tasks: &[Task]) {
+fn register_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
     let state = home.join("state_5.sqlite");
-    if let Ok(mut connection) = Connection::open(state) {
-        if let Ok(transaction) = connection.transaction() {
-            for task in tasks {
-                let _ = transaction.execute("INSERT OR IGNORE INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, git_branch, git_origin_url, first_user_message, memory_mode, preview, recency_at, recency_at_ms, history_mode, has_user_event) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{\"type\":\"disabled\"}', 'never', ?9, ?10, ?11, 'enabled', ?12, ?4, ?13, 'legacy', 1)", params![task.id, task.file_path.to_string_lossy(), parse_time(&task.created_at).timestamp(), parse_time(&task.updated_at).timestamp(), task.source, task.model_provider, task.cwd, task.title, task.git_branch, task.git_origin_url, task.first_user_message, task.preview, parse_time(&task.updated_at).timestamp_millis()]);
-            }
-            let _ = transaction.commit();
-        }
+    if !state.exists() {
+        return Ok(());
     }
+    let mut connection = Connection::open(state).map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    for task in tasks {
+        transaction
+            .execute(
+                "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, git_branch, git_origin_url, first_user_message, memory_mode, preview, recency_at, recency_at_ms, history_mode, has_user_event, archived, archived_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{\"type\":\"disabled\"}', 'never', ?9, ?10, ?11, 'enabled', ?12, ?4, ?13, 'legacy', 1, 0, NULL) ON CONFLICT(id) DO UPDATE SET rollout_path=excluded.rollout_path, updated_at=excluded.updated_at, source=excluded.source, model_provider=excluded.model_provider, cwd=excluded.cwd, title=excluded.title, git_branch=excluded.git_branch, git_origin_url=excluded.git_origin_url, first_user_message=excluded.first_user_message, preview=excluded.preview, recency_at=excluded.recency_at, recency_at_ms=excluded.recency_at_ms, history_mode=excluded.history_mode, has_user_event=1, archived=0, archived_at=NULL",
+                params![
+                    task.id,
+                    task.file_path.to_string_lossy(),
+                    parse_time(&task.created_at).timestamp(),
+                    parse_time(&task.updated_at).timestamp(),
+                    task.source,
+                    task.model_provider,
+                    task.cwd,
+                    task.title,
+                    task.git_branch,
+                    task.git_origin_url,
+                    task.first_user_message,
+                    task.preview,
+                    parse_time(&task.updated_at).timestamp_millis()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -702,18 +749,71 @@ fn import_archive(
     let home = codex_home();
     fs::create_dir_all(home.join("sessions")).map_err(|error| error.to_string())?;
     fs::create_dir_all(home.join("browser").join("sessions")).map_err(|error| error.to_string())?;
-    let existing: HashSet<_> = list_local_tasks()?
+    let existing_tasks: HashMap<_, _> = list_local_tasks()?
         .into_iter()
-        .map(|task| task.id)
+        .map(|task| (task.id.clone(), task))
         .collect();
     let file = File::open(source).map_err(|error| error.to_string())?;
     let mut zip = ZipArchive::new(file).map_err(|error| error.to_string())?;
-    let adapt_paths = options.and_then(|value| value.adapt_paths).unwrap_or(true);
+    let adapt_paths = options
+        .as_ref()
+        .and_then(|value| value.adapt_paths)
+        .unwrap_or(true);
+    let restore_existing = options
+        .as_ref()
+        .and_then(|value| value.restore_existing)
+        .unwrap_or(false);
+    let target_cwd = options
+        .as_ref()
+        .and_then(|value| value.target_cwd.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
     let mut imported = Vec::new();
+    let mut restored = Vec::new();
     let mut skipped = Vec::new();
+    let mut backups = Vec::new();
     for entry in manifest.tasks {
-        if existing.contains(&entry.task.id) {
-            skipped.push(serde_json::json!({"id": entry.task.id, "title": entry.task.title, "reason": "already_exists"}));
+        if let Some(existing_task) = existing_tasks.get(&entry.task.id) {
+            if restore_existing {
+                let mut task = existing_task.clone();
+                if task.title.is_empty() {
+                    task.title = entry.task.title;
+                }
+                if task.first_user_message.is_empty() {
+                    task.first_user_message = entry.task.first_user_message;
+                }
+                if task.preview.is_empty() {
+                    task.preview = entry.task.preview;
+                }
+                if task.source.is_empty() {
+                    task.source = entry.task.source;
+                }
+                if task.model_provider.is_empty() {
+                    task.model_provider = entry.task.model_provider;
+                }
+                if let Some(cwd) = target_cwd.as_deref() {
+                    if let Ok(contents) = fs::read_to_string(&task.file_path) {
+                        if let Some(backup) = backup_database(&task.file_path, &stamp) {
+                            backups.push(backup);
+                        }
+                        fs::write(&task.file_path, rewrite_session_meta_cwd(&contents, cwd))
+                            .map_err(|error| error.to_string())?;
+                    }
+                    task.cwd = cwd.to_string();
+                }
+                task.archived = false;
+                (
+                    task.project_key,
+                    task.project_name,
+                    task.project_path,
+                    task.project_exists,
+                ) = infer_project(&task);
+                restored.push(task);
+            } else {
+                skipped.push(serde_json::json!({"id": entry.task.id, "title": entry.task.title, "reason": "already_exists"}));
+            }
             continue;
         }
         let mut task = entry.task;
@@ -738,16 +838,18 @@ fn import_archive(
             .map_err(|_| "压缩包缺少会话文件".to_string())?
             .read_to_string(&mut content)
             .map_err(|error| error.to_string())?;
-        let local_cwd = if adapt_paths {
+        let local_cwd = if let Some(cwd) = target_cwd.as_deref() {
+            cwd.to_string()
+        } else if adapt_paths {
             resolve_local_cwd(&task.cwd)
         } else {
             task.cwd.clone()
         };
-        fs::write(
-            &rollout_path,
-            rewrite_session_cwd(&content, &task.cwd, &local_cwd),
-        )
-        .map_err(|error| error.to_string())?;
+        let mut session_content = rewrite_session_cwd(&content, &task.cwd, &local_cwd);
+        if target_cwd.is_some() {
+            session_content = rewrite_session_meta_cwd(&session_content, &local_cwd);
+        }
+        fs::write(&rollout_path, session_content).map_err(|error| error.to_string())?;
         if let Some(browser_file) = entry.browser_file {
             let mut contents = Vec::new();
             zip.by_name(&browser_file)
@@ -780,25 +882,36 @@ fn import_archive(
         if task.title.is_empty() {
             task.title = truncate(&task.first_user_message, 96);
         }
+        (
+            task.project_key,
+            task.project_name,
+            task.project_path,
+            task.project_exists,
+        ) = infer_project(&task);
         imported.push(task);
     }
-    if imported.is_empty() {
+    if imported.is_empty() && restored.is_empty() {
         return Ok(
-            serde_json::json!({"imported": [], "skipped": skipped, "backups": [], "codexHome": home}),
+            serde_json::json!({"imported": [], "restored": [], "skipped": skipped, "backups": [], "codexHome": home}),
         );
     }
-    let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let backups = [
+    backups.extend(
+        [
         backup_database(&home.join("state_5.sqlite"), &stamp),
         backup_database(&home.join("sqlite").join("codex-dev.db"), &stamp),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    append_index(&home, &imported)?;
-    register_threads(&home, &imported);
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    let registered = imported
+        .iter()
+        .chain(restored.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    append_index(&home, &registered)?;
+    register_threads(&home, &registered)?;
     Ok(
-        serde_json::json!({"imported": imported.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "skipped": skipped, "backups": backups, "codexHome": home}),
+        serde_json::json!({"imported": imported.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "restored": restored.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "skipped": skipped, "backups": backups, "codexHome": home}),
     )
 }
 

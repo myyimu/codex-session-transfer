@@ -60,6 +60,31 @@ function projectMissing(task) {
   return Boolean(task.cwd) && task.projectExists === false;
 }
 
+function buildProjects(tasks) {
+  const groups = new Map();
+  tasks.forEach((task) => {
+    const key = projectKey(task);
+    const current = groups.get(key) || {
+      key,
+      name: projectName(task),
+      path: task.projectPath || task.cwd || "",
+      count: 0,
+      missing: false,
+      updatedAt: "",
+    };
+    current.count += 1;
+    current.missing ||= projectMissing(task);
+    if (!current.path && task.cwd) current.path = task.cwd;
+    if ((task.updatedAt || "") > current.updatedAt) current.updatedAt = task.updatedAt || "";
+    groups.set(key, current);
+  });
+  return [...groups.values()].sort((left, right) => {
+    if (left.missing !== right.missing) return left.missing ? 1 : -1;
+    if (right.count !== left.count) return right.count - left.count;
+    return left.name.localeCompare(right.name, "zh-CN");
+  });
+}
+
 function Toast({ toast, onClose }) {
   if (!toast) return null;
   return (
@@ -178,6 +203,78 @@ function ProjectPicker({ tasks, projects, value, onChange }) {
   );
 }
 
+function ImportProjectPicker({ projects, value, onChange }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
+  const selected = projects.find((item) => item.path === value);
+  const label = selected ? selected.name : "保持压缩包中的项目";
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const close = (event) => {
+      if (!rootRef.current?.contains(event.target)) setOpen(false);
+    };
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  const choose = (next) => {
+    onChange(next);
+    setOpen(false);
+  };
+
+  return (
+    <div className={`project-picker import-project-picker ${open ? "is-open" : ""}`} ref={rootRef}>
+      <button
+        type="button"
+        className="project-trigger"
+        onClick={() => setOpen((current) => !current)}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        title="选择恢复到哪个项目"
+      >
+        <FolderSimple size={18} weight="duotone" />
+        <span>{label}</span>
+        <CaretDown size={14} weight="bold" />
+      </button>
+      {open && (
+        <div className="project-menu" role="listbox" aria-label="选择目标项目">
+          <button
+            type="button"
+            className={`project-option ${value ? "" : "is-active"}`}
+            onClick={() => choose("")}
+            role="option"
+            aria-selected={!value}
+          >
+            <span>保持压缩包中的项目</span>
+            <strong>默认</strong>
+          </button>
+          {projects.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              className={`project-option ${value === item.path ? "is-active" : ""}`}
+              onClick={() => choose(item.path)}
+              role="option"
+              aria-selected={value === item.path}
+            >
+              <span>{item.name}</span>
+              <strong>{item.count}</strong>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function NavButton({ active, icon: Icon, title, subtitle, onSelect }) {
   const handlePointerDown = (event) => {
     if (event.button === undefined || event.button === 0) {
@@ -221,28 +318,7 @@ function ExportView({ environment, showToast }) {
 
   useEffect(() => { load(); }, []);
 
-  const projects = useMemo(() => {
-    const groups = new Map();
-    tasks.forEach((task) => {
-      const key = projectKey(task);
-      const current = groups.get(key) || {
-        key,
-        name: projectName(task),
-        count: 0,
-        missing: false,
-        updatedAt: "",
-      };
-      current.count += 1;
-      current.missing ||= projectMissing(task);
-      if ((task.updatedAt || "") > current.updatedAt) current.updatedAt = task.updatedAt || "";
-      groups.set(key, current);
-    });
-    return [...groups.values()].sort((left, right) => {
-      if (left.missing !== right.missing) return left.missing ? 1 : -1;
-      if (right.count !== left.count) return right.count - left.count;
-      return left.name.localeCompare(right.name, "zh-CN");
-    });
-  }, [tasks]);
+  const projects = useMemo(() => buildProjects(tasks), [tasks]);
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
@@ -352,9 +428,16 @@ function ExportView({ environment, showToast }) {
 function ImportView({ environment, showToast }) {
   const [archive, setArchive] = useState(null);
   const [adaptPaths, setAdaptPaths] = useState(true);
+  const [restoreExisting, setRestoreExisting] = useState(false);
+  const [targetCwd, setTargetCwd] = useState("");
+  const [localTasks, setLocalTasks] = useState([]);
   const [dragging, setDragging] = useState(false);
   const [working, setWorking] = useState(false);
   const [result, setResult] = useState(null);
+
+  useEffect(() => {
+    bridge.listTasks().then((next) => setLocalTasks(next.tasks || [])).catch(() => setLocalTasks([]));
+  }, []);
 
   const choose = async () => {
     try {
@@ -362,6 +445,7 @@ function ImportView({ environment, showToast }) {
       if (!next.canceled) {
         setArchive(next);
         setResult(null);
+        setRestoreExisting(false);
       }
     } catch (error) {
       showToast("error", "无法读取压缩包", error.message);
@@ -382,6 +466,7 @@ function ImportView({ environment, showToast }) {
       const next = await bridge.inspectArchive(archivePath);
       setArchive(next);
       setResult(null);
+      setRestoreExisting(false);
     } catch (error) {
       showToast("error", "无法读取压缩包", error.message);
     }
@@ -390,12 +475,15 @@ function ImportView({ environment, showToast }) {
   const runImport = async () => {
     setWorking(true);
     try {
-      const next = await bridge.importArchive(archive.path, { adaptPaths });
+      const next = await bridge.importArchive(archive.path, { adaptPaths, restoreExisting, targetCwd });
+      const importedCount = next.imported?.length || 0;
+      const restoredCount = next.restored?.length || 0;
+      const skippedCount = next.skipped?.length || 0;
       setResult(next);
       showToast(
         "success",
-        next.imported.length ? `已导入 ${next.imported.length} 个任务` : "没有需要导入的任务",
-        next.skipped.length ? `${next.skipped.length} 个重复任务已跳过` : "重启 Codex 后即可看到",
+        importedCount || restoredCount ? `已处理 ${importedCount + restoredCount} 个任务` : "没有需要导入的任务",
+        skippedCount ? `${skippedCount} 个重复任务已跳过` : "重启 Codex 后即可看到",
       );
     } catch (error) {
       showToast("error", "导入失败", error.message);
@@ -405,6 +493,10 @@ function ImportView({ environment, showToast }) {
   };
 
   const importableCount = archive?.tasks.filter((task) => !task.conflict).length || 0;
+  const conflictCount = archive?.tasks.filter((task) => task.conflict).length || 0;
+  const actionCount = importableCount + (restoreExisting ? conflictCount : 0);
+  const localProjects = useMemo(() => buildProjects(localTasks).filter((item) => !item.missing && item.path), [localTasks]);
+  const targetName = targetCwd ? (localProjects.find((item) => item.path === targetCwd)?.name || filename(targetCwd)) : "";
 
   return (
     <section className="workspace import-workspace" aria-labelledby="import-title">
@@ -412,7 +504,7 @@ function ImportView({ environment, showToast }) {
         <div>
           <span className="eyebrow rose">导入到这台电脑</span>
           <h1 id="import-title">恢复 Codex 任务</h1>
-          <p>导入时会自动跳过已有任务，并为本机数据库创建备份</p>
+          <p>可跳过重复任务，也可从本地历史恢复到 Codex 列表</p>
         </div>
       </header>
 
@@ -451,10 +543,33 @@ function ImportView({ environment, showToast }) {
                   <span>{task.cwd || "未记录工作目录"}</span>
                 </span>
                 <span className={`status-chip ${task.conflict ? "neutral" : "ready"}`}>
-                  {task.conflict ? "已存在，将跳过" : "可导入"}
+                  {task.conflict ? (restoreExisting ? "将恢复" : "已存在，将跳过") : "可导入"}
                 </span>
               </div>
             ))}
+          </div>
+
+          {conflictCount > 0 && (
+            <div className="setting-row choice-row">
+              <span className="setting-icon"><ArrowClockwise size={19} /></span>
+              <span>
+                <strong>重复任务处理</strong>
+                <small>{conflictCount} 个任务本地历史已存在，但可重新恢复到 Codex 列表</small>
+              </span>
+              <span className="segmented-control" role="group" aria-label="重复任务处理">
+                <button type="button" className={!restoreExisting ? "is-active" : ""} onClick={() => setRestoreExisting(false)}>跳过</button>
+                <button type="button" className={restoreExisting ? "is-active" : ""} onClick={() => setRestoreExisting(true)}>从本地历史恢复</button>
+              </span>
+            </div>
+          )}
+
+          <div className="setting-row project-target-row">
+            <span className="setting-icon"><FolderOpen size={19} /></span>
+            <span>
+              <strong>导入到项目</strong>
+              <small>{targetCwd ? `恢复到 ${targetName || targetCwd}` : "默认保留压缩包记录的项目路径"}</small>
+            </span>
+            <ImportProjectPicker projects={localProjects} value={targetCwd} onChange={setTargetCwd} />
           </div>
 
           <label className="setting-row">
@@ -470,7 +585,7 @@ function ImportView({ environment, showToast }) {
           {result && (
             <div className="result-strip">
               <ShieldCheck size={20} weight="duotone" />
-              <span><strong>导入完成</strong><small>请重启 Codex 刷新任务列表</small></span>
+              <span><strong>导入完成</strong><small>{result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}</small></span>
               <button className="icon-button" onClick={() => bridge.revealPath(environment.codexHome)} title="打开 Codex 数据目录" aria-label="打开 Codex 数据目录"><FolderOpen size={18} /></button>
             </div>
           )}
@@ -479,10 +594,10 @@ function ImportView({ environment, showToast }) {
 
       <footer className="action-bar">
         <div>
-          <strong>{archive ? `${importableCount} 个新任务可导入` : "等待选择压缩包"}</strong>
+          <strong>{archive ? (restoreExisting ? `${importableCount} 个新任务，${conflictCount} 个可恢复` : `${importableCount} 个新任务可导入`) : "等待选择压缩包"}</strong>
           <span>{environment?.codexHome}</span>
         </div>
-        <button className="primary-button rose-button" disabled={!archive || !importableCount || working} onClick={runImport}>
+        <button className="primary-button rose-button" disabled={!archive || !actionCount || working} onClick={runImport}>
           <TrayArrowDown size={18} weight="bold" />
           {working ? "正在导入…" : "导入到 Codex"}
         </button>

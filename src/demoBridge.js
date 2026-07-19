@@ -49,11 +49,19 @@ export const demoBridge = {
   async inspectArchive() {
     return this.chooseArchive();
   },
-  async importArchive() {
+  async importArchive(_archivePath, options = {}) {
     await new Promise((resolve) => setTimeout(resolve, 700));
+    const targetCwd = options.targetCwd || "";
+    const imported = archive.tasks
+      .filter((task) => !task.conflict)
+      .map((task) => ({ ...task, cwd: targetCwd || task.cwd }));
+    const restored = options.restoreExisting
+      ? archive.tasks.filter((task) => task.conflict).map((task) => ({ ...task, cwd: targetCwd || task.cwd }))
+      : [];
     return {
-      imported: archive.tasks.filter((task) => !task.conflict),
-      skipped: archive.tasks.filter((task) => task.conflict),
+      imported,
+      restored,
+      skipped: options.restoreExisting ? [] : archive.tasks.filter((task) => task.conflict),
       backups: ["state_5.sqlite.backup-demo"],
       codexHome: "/Users/yimu/.codex",
     };

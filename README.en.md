@@ -24,9 +24,10 @@ Local-first desktop utility for exporting and importing selected Codex task sess
 - Marks missing projects as deleted and places them at the bottom of the project picker.
 - Exports selected tasks as a standard ZIP archive.
 - Previews an archive before importing it into the current Codex data directory.
-- Skips duplicate task IDs during import, so existing sessions are not overwritten.
+- Skips duplicate task IDs by default, with an option to restore existing local history back into the Codex task list.
 - Creates a backup of the Codex SQLite database before importing.
 - Can adapt old project paths to common local folders on the new machine.
+- Lets you choose a target project when importing or restoring tasks.
 
 ## App Usage Guide
 
@@ -45,15 +46,18 @@ Local-first desktop utility for exporting and importing selected Codex task sess
 1. Switch to the Import Tasks page.
 2. Choose a ZIP archive created by this app.
 3. Preview the tasks in the archive and review duplicate tasks.
-4. Keep Adapt Project Paths enabled if you want missing old paths to be matched against `~/work`, `~/Projects`, and `~/Documents`.
-5. Click Import to Codex.
-6. Restart Codex to see the imported tasks.
+4. If duplicate tasks are found, choose Skip or Restore From Local History. Restore does not replace the existing session file; it registers the local history back into the Codex task list.
+5. Choose a target project, or keep the project path recorded in the archive.
+6. Keep Adapt Project Paths enabled if you want missing old paths to be matched against `~/work`, `~/Projects`, and `~/Documents`.
+7. Click Import to Codex.
+8. Restart Codex to see the imported or restored tasks.
 
 ### Duplicate and Overwrite Rules
 
-Imports do not overwrite existing tasks. The app detects duplicates by Codex task ID:
+Imports do not overwrite existing tasks by default. The app detects duplicates by Codex task ID:
 
-- Existing local tasks are skipped.
+- Existing local tasks are skipped by default.
+- If Restore From Local History is selected, the app registers the existing local session back into the Codex task list and clears the hidden archived state.
 - New tasks are written into the Codex session directory.
 - The Codex database is backed up before importing.
 
