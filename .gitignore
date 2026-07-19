@@ -5,3 +5,5 @@ release/
 .DS_Store
 *.log
 design-*.png
+/src-tauri/target/
+/src-tauri/gen/

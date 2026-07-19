@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Codex 会话迁移",
+  "version": "0.1.0",
+  "identifier": "com.yimu.codexsessiontransfer",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeDevCommand": "npm run dev:web -- --host 127.0.0.1 --port 5173 --strictPort",
+    "beforeBuildCommand": "npm run build:web"
+  },
+  "app": {
+    "windows": [{
+      "title": "Codex 会话迁移",
+      "width": 1120,
+      "height": 760,
+      "minWidth": 900,
+      "minHeight": 620,
+      "visible": false,
+      "titleBarStyle": "Overlay"
+    }],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "category": "Utility",
+    "shortDescription": "迁移 Codex 会话历史",
+    "longDescription": "私有、本地运行的 Codex 会话导入导出工具。",
+    "macOS": { "minimumSystemVersion": "12.0" },
+    "windows": { "nsis": { "displayLanguageSelector": false } }
+  }
+}

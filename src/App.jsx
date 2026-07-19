@@ -18,8 +18,9 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { demoBridge } from "./demoBridge.js";
+import { tauriBridge } from "./tauriBridge.js";
 
-const bridge = window.codexBridge || demoBridge;
+const bridge = window.__TAURI_INTERNALS__ ? tauriBridge : demoBridge;
 
 function formatDate(value) {
   if (!value) return "时间未知";
@@ -226,7 +227,11 @@ function ImportView({ environment, showToast }) {
     const file = event.dataTransfer.files?.[0];
     if (!file) return;
     try {
-      const archivePath = bridge.getPathForFile ? bridge.getPathForFile(file) : file.name;
+      const archivePath = bridge.getPathForFile ? bridge.getPathForFile(file) : null;
+      if (!archivePath) {
+        showToast("error", "请使用选择文件", "Tauri 版本会通过系统文件选择器安全读取压缩包");
+        return;
+      }
       const next = await bridge.inspectArchive(archivePath);
       setArchive(next);
       setResult(null);

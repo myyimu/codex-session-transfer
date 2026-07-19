@@ -30,6 +30,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
       - run: npm test
       - run: ${{ matrix.command }}
