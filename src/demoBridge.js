@@ -68,5 +68,5 @@ export const demoBridge = {
   },
   getPathForFile(file) { return file.name; },
   async revealPath() { return { ok: true }; },
-  async getEnvironment() { return { codexHome: "/Users/yimu/.codex", platform: "darwin", version: "0.1.0" }; },
+  async getEnvironment() { return { codexHome: "/Users/yimu/.codex", platform: "darwin", version: "0.1.0", demo: true, codexRunning: false, codexProcesses: [] }; },
 };

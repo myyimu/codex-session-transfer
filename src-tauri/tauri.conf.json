@@ -31,8 +31,8 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "shortDescription": "本地迁移 Codex 任务会话",
-    "longDescription": "Local-first desktop utility for exporting and importing selected Codex task sessions across computers.",
+    "shortDescription": "本地迁移和恢复 Codex 项目任务会话",
+    "longDescription": "Local-first desktop utility for exporting, importing, syncing, and restoring selected Codex project task sessions across computers.",
     "macOS": { "minimumSystemVersion": "12.0" },
     "windows": { "nsis": { "displayLanguageSelector": false } }
   }

@@ -1,13 +1,14 @@
 use chrono::{DateTime, Datelike, Local, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{
     collections::{HashMap, HashSet},
     env,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
+    process::Command,
 };
 use tauri::Manager;
 use walkdir::WalkDir;
@@ -42,6 +43,10 @@ struct Task {
     archived: bool,
     #[serde(default = "default_project_exists")]
     project_exists: bool,
+    #[serde(default = "default_codex_visible")]
+    codex_visible: bool,
+    #[serde(default)]
+    project_pinned: bool,
     #[serde(skip_serializing, default)]
     file_path: PathBuf,
     #[serde(skip_serializing, default)]
@@ -98,7 +103,32 @@ struct ImportOptions {
     target_cwd: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct DesktopProject {
+    id: String,
+    name: String,
+    root_paths: Vec<String>,
+    pinned: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ThreadProjectAssignment {
+    project_id: String,
+    cwd: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DesktopProjectState {
+    projects: HashMap<String, DesktopProject>,
+    assignments: HashMap<String, ThreadProjectAssignment>,
+    client_threads: HashSet<String>,
+}
+
 fn default_project_exists() -> bool {
+    true
+}
+
+fn default_codex_visible() -> bool {
     true
 }
 
@@ -106,6 +136,49 @@ fn codex_home() -> PathBuf {
     env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
+}
+
+fn codex_desktop_processes() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FO", "CSV", "/NH"])
+            .output()
+            .ok();
+        let text = output
+            .as_ref()
+            .map(|item| String::from_utf8_lossy(&item.stdout).to_string())
+            .unwrap_or_default();
+        return text
+            .lines()
+            .filter_map(|line| line.split(',').next())
+            .map(|name| name.trim().trim_matches('"').to_string())
+            .filter(|name| matches!(name.as_str(), "ChatGPT.exe" | "Codex.exe"))
+            .collect();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,args="])
+            .output()
+            .ok();
+        let text = output
+            .as_ref()
+            .map(|item| String::from_utf8_lossy(&item.stdout).to_string())
+            .unwrap_or_default();
+        text.lines()
+            .filter(|line| {
+                line.contains("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")
+                    || line.contains("/Applications/Codex.app/Contents/MacOS/Codex")
+            })
+            .map(|line| clean_text(line))
+            .collect()
+    }
+}
+
+fn is_codex_desktop_running() -> bool {
+    !codex_desktop_processes().is_empty()
 }
 
 fn clean_text(value: &str) -> String {
@@ -172,6 +245,8 @@ fn session_details(path: &Path) -> Result<Task, String> {
         size: fs::metadata(path).map_err(|error| error.to_string())?.len(),
         archived: false,
         project_exists: true,
+        codex_visible: true,
+        project_pinned: false,
         file_path: path.to_path_buf(),
         browser_file: PathBuf::new(),
     };
@@ -283,6 +358,123 @@ fn database_titles(home: &Path) -> HashMap<String, (String, String, bool)> {
     result
 }
 
+fn catalog_tasks(home: &Path) -> Option<HashMap<String, (String, String, bool)>> {
+    let mut result = HashMap::new();
+    let path = home.join("sqlite").join("codex-dev.db");
+    let Ok(connection) =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return None;
+    };
+    let Ok(mut statement) = connection.prepare(
+        "SELECT thread_id, display_title, cwd, COALESCE(missing_candidate, 0) FROM local_thread_catalog WHERE host_id = 'local'",
+    ) else {
+        return None;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)? == 0,
+        ))
+    }) else {
+        return None;
+    };
+    for row in rows.flatten() {
+        result.insert(row.0, (row.1, row.2, row.3));
+    }
+    Some(result)
+}
+
+fn value_array_strings(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|item| !item.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn read_desktop_project_state(home: &Path) -> Option<DesktopProjectState> {
+    let contents = fs::read_to_string(home.join(".codex-global-state.json")).ok()?;
+    let value: Value = serde_json::from_str(&contents).ok()?;
+    let nested_state = value.get("electron-persisted-atom-state");
+    let state = if value.get("local-projects").is_some()
+        || value.get("thread-project-assignments").is_some()
+        || value.get("project-order").is_some()
+    {
+        &value
+    } else {
+        nested_state?
+    };
+    let mut result = DesktopProjectState::default();
+    let pinned_ids = value_array_strings(state.get("pinned-project-ids"))
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+    if let Some(projects) = state.get("local-projects").and_then(Value::as_object) {
+        for (id, item) in projects {
+            let root_paths = value_array_strings(item.get("rootPaths"));
+            if root_paths.is_empty() {
+                continue;
+            }
+            result.projects.insert(
+                id.to_string(),
+                DesktopProject {
+                    id: id.to_string(),
+                    name: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| path_name(&root_paths[0])),
+                    root_paths,
+                    pinned: pinned_ids.contains(id),
+                },
+            );
+        }
+    }
+
+    if let Some(assignments) = state
+        .get("thread-project-assignments")
+        .and_then(Value::as_object)
+    {
+        for (thread_id, item) in assignments {
+            if let Some(project_id) = item.get("projectId").and_then(Value::as_str) {
+                result.assignments.insert(
+                    thread_id.to_string(),
+                    ThreadProjectAssignment {
+                        project_id: project_id.to_string(),
+                        cwd: item
+                            .get("cwd")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    for source in [Some(&value), nested_state] {
+        if let Some(items) = source.and_then(Value::as_object) {
+            for key in items.keys() {
+                if let Some(id) = key.strip_prefix("thread-client-id-v1:local%3A") {
+                    result.client_threads.insert(id.to_string());
+                }
+            }
+        }
+    }
+
+    Some(result)
+}
+
 fn path_name(path: &str) -> String {
     Path::new(path.trim_end_matches(['/', '\\']))
         .file_name()
@@ -338,6 +530,234 @@ fn is_codex_worktree(path: &str) -> bool {
 
 fn first_existing_path(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates.iter().find(|path| path.exists()).cloned()
+}
+
+fn is_path_in_root(path: &str, root: &str) -> bool {
+    let path = Path::new(path);
+    let root = Path::new(root);
+    path == root || path.starts_with(root)
+}
+
+fn project_paths_exist(paths: &[String]) -> bool {
+    paths.iter().any(|path| Path::new(path).exists())
+}
+
+fn apply_desktop_project(task: &mut Task, project: &DesktopProject) {
+    task.project_key = project.id.clone();
+    task.project_name = project.name.clone();
+    task.project_path = project
+        .root_paths
+        .first()
+        .cloned()
+        .unwrap_or_else(|| task.cwd.clone());
+    task.project_exists = project_paths_exist(&project.root_paths);
+    task.project_pinned = project.pinned;
+}
+
+fn matching_desktop_project<'a>(
+    state: &'a DesktopProjectState,
+    cwd: &str,
+    inferred_path: &str,
+) -> Option<&'a DesktopProject> {
+    state
+        .projects
+        .values()
+        .filter(|project| {
+            project
+                .root_paths
+                .iter()
+                .any(|root| is_path_in_root(cwd, root) || is_path_in_root(inferred_path, root))
+        })
+        .max_by_key(|project| {
+            project
+                .root_paths
+                .iter()
+                .map(|root| root.len())
+                .max()
+                .unwrap_or(0)
+        })
+}
+
+fn stable_local_project_id(cwd: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in cwd.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("local-{hash:016x}")
+}
+
+fn object_mut(value: &mut Value) -> &mut Map<String, Value> {
+    if !value.is_object() {
+        *value = Value::Object(Map::new());
+    }
+    value
+        .as_object_mut()
+        .expect("value was converted to object")
+}
+
+fn array_mut(value: &mut Value) -> &mut Vec<Value> {
+    if !value.is_array() {
+        *value = Value::Array(Vec::new());
+    }
+    value.as_array_mut().expect("value was converted to array")
+}
+
+fn push_unique_string(items: &mut Vec<Value>, value: &str) {
+    if !items.iter().any(|item| item.as_str() == Some(value)) {
+        items.push(Value::String(value.to_string()));
+    }
+}
+
+fn client_thread_state_key(thread_id: &str) -> String {
+    format!("thread-client-id-v1:local%3A{thread_id}")
+}
+
+fn client_thread_state_value(thread_id: &str) -> String {
+    format!("client-new-thread:{thread_id}")
+}
+
+fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), String> {
+    let path = home.join(".codex-global-state.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let existing_state = read_desktop_project_state(home).unwrap_or_default();
+    let mut value: Value =
+        serde_json::from_str(&fs::read_to_string(&path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let now_ms = Utc::now().timestamp_millis();
+    let root = object_mut(&mut value);
+    let use_root = root.contains_key("local-projects")
+        || root.contains_key("thread-project-assignments")
+        || root.contains_key("project-order");
+
+    for task in tasks {
+        let cwd = if task.cwd.trim().is_empty() {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        } else {
+            task.cwd.clone()
+        };
+        let (project_id, project_name, project_roots) = {
+            let matched_project = matching_desktop_project(&existing_state, &cwd, &cwd);
+            let project_id = matched_project
+                .map(|project| project.id.clone())
+                .or_else(|| {
+                    existing_state
+                        .assignments
+                        .get(&task.id)
+                        .and_then(|assignment| {
+                            existing_state
+                                .projects
+                                .contains_key(&assignment.project_id)
+                                .then(|| assignment.project_id.clone())
+                        })
+                })
+                .unwrap_or_else(|| stable_local_project_id(&cwd));
+            let project_name = matched_project
+                .map(|project| project.name.clone())
+                .unwrap_or_else(|| path_name(&cwd));
+            let project_roots = matched_project
+                .map(|project| project.root_paths.clone())
+                .filter(|roots| !roots.is_empty())
+                .unwrap_or_else(|| vec![cwd.clone()]);
+            (project_id, project_name, project_roots)
+        };
+
+        let root = object_mut(&mut value);
+        let persisted = if use_root {
+            root
+        } else {
+            object_mut(
+                root.entry("electron-persisted-atom-state")
+                    .or_insert_with(|| Value::Object(Map::new())),
+            )
+        };
+
+        let projects = object_mut(
+            persisted
+                .entry("local-projects")
+                .or_insert_with(|| Value::Object(Map::new())),
+        );
+        projects.insert(
+            project_id.clone(),
+            serde_json::json!({
+                "id": project_id,
+                "name": project_name,
+                "rootPaths": project_roots,
+                "createdAt": now_ms,
+                "updatedAt": now_ms
+            }),
+        );
+
+        let assignments = object_mut(
+            persisted
+                .entry("thread-project-assignments")
+                .or_insert_with(|| Value::Object(Map::new())),
+        );
+        assignments.insert(
+            task.id.clone(),
+            serde_json::json!({
+                "projectKind": "local",
+                "projectId": project_id,
+                "cwd": cwd,
+                "pendingCoreUpdate": false
+            }),
+        );
+
+        let project_order = array_mut(
+            persisted
+                .entry("project-order")
+                .or_insert_with(|| Value::Array(Vec::new())),
+        );
+        push_unique_string(project_order, &project_id);
+
+        let active_roots = array_mut(
+            persisted
+                .entry("active-workspace-roots")
+                .or_insert_with(|| Value::Array(Vec::new())),
+        );
+        push_unique_string(active_roots, &cwd);
+
+        let root = object_mut(&mut value);
+        let atom_state = object_mut(
+            root.entry("electron-persisted-atom-state")
+                .or_insert_with(|| Value::Object(Map::new())),
+        );
+        atom_state
+            .entry(client_thread_state_key(&task.id))
+            .or_insert_with(|| Value::String(client_thread_state_value(&task.id)));
+
+        let workspace_hints = object_mut(
+            root.entry("thread-workspace-root-hints")
+                .or_insert_with(|| Value::Object(Map::new())),
+        );
+        workspace_hints.insert(task.id.clone(), Value::String(cwd.clone()));
+
+        let writable_roots = object_mut(
+            root.entry("thread-writable-roots")
+                .or_insert_with(|| Value::Object(Map::new())),
+        );
+        let roots = array_mut(
+            writable_roots
+                .entry(task.id.clone())
+                .or_insert_with(|| Value::Array(Vec::new())),
+        );
+        push_unique_string(roots, &cwd);
+    }
+
+    fs::write(
+        path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn infer_project(task: &Task) -> (String, String, String, bool) {
@@ -404,6 +824,8 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
     let home = codex_home();
     let index = read_index(&home);
     let database = database_titles(&home);
+    let catalog = catalog_tasks(&home);
+    let desktop_projects = read_desktop_project_state(&home);
     let mut files = HashSet::new();
     let sessions = home.join("sessions");
     if sessions.exists() {
@@ -425,11 +847,17 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
         }
         let indexed = index.get(&task.id);
         let database_task = database.get(&task.id);
+        let catalog_task = catalog.as_ref().and_then(|items| items.get(&task.id));
         task.title = indexed
             .and_then(|item| item.get("thread_name"))
             .and_then(Value::as_str)
             .filter(|title| !title.is_empty())
             .map(str::to_string)
+            .or_else(|| {
+                catalog_task
+                    .filter(|item| item.2)
+                    .map(|item| item.0.clone())
+            })
             .or_else(|| database_task.map(|item| item.0.clone()))
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| truncate(&task.first_user_message, 96));
@@ -444,15 +872,57 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
                 .to_string();
         }
         if task.cwd.is_empty() {
-            task.cwd = database_task.map(|item| item.1.clone()).unwrap_or_default();
+            task.cwd = catalog_task
+                .filter(|item| item.2 && !item.1.is_empty())
+                .map(|item| item.1.clone())
+                .or_else(|| database_task.map(|item| item.1.clone()))
+                .unwrap_or_default();
+        } else if let Some(catalog_cwd) = catalog_task
+            .filter(|item| item.2 && !item.1.is_empty())
+            .map(|item| item.1.clone())
+        {
+            task.cwd = catalog_cwd;
         }
         task.archived = database_task.map(|item| item.2).unwrap_or(false);
+        let catalog_visible = catalog
+            .as_ref()
+            .map(|items| items.get(&task.id).map(|item| item.2).unwrap_or(false))
+            .unwrap_or(true);
+        task.codex_visible = catalog_visible;
         (
             task.project_key,
             task.project_name,
             task.project_path,
             task.project_exists,
         ) = infer_project(&task);
+        if let Some(project_state) = desktop_projects.as_ref() {
+            if let Some(assignment) = project_state.assignments.get(&task.id) {
+                if let Some(project) = project_state.projects.get(&assignment.project_id) {
+                    apply_desktop_project(&mut task, project);
+                    task.codex_visible = !task.archived;
+                } else {
+                    let path = if assignment.cwd.trim().is_empty() {
+                        task.cwd.clone()
+                    } else {
+                        assignment.cwd.clone()
+                    };
+                    task.project_key = assignment.project_id.clone();
+                    task.project_name = path_name(&path);
+                    task.project_path = path.clone();
+                    task.project_exists = Path::new(&path).exists();
+                    task.project_pinned = false;
+                    task.codex_visible = false;
+                }
+            } else if let Some(project) =
+                matching_desktop_project(project_state, &task.cwd, &task.project_path)
+            {
+                apply_desktop_project(&mut task, project);
+                task.codex_visible =
+                    !task.archived && project_state.client_threads.contains(&task.id);
+            } else {
+                task.codex_visible = false;
+            }
+        }
         task.browser_file = home
             .join("browser")
             .join("sessions")
@@ -646,6 +1116,102 @@ fn register_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
     Ok(())
 }
 
+fn register_catalog_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
+    let catalog = home.join("sqlite").join("codex-dev.db");
+    if !catalog.exists() {
+        return Ok(());
+    }
+    let mut connection = Connection::open(catalog).map_err(|error| error.to_string())?;
+    let has_catalog: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_thread_catalog')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !has_catalog {
+        return Ok(());
+    }
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO local_thread_catalog_hosts (host_id, host_kind) VALUES ('local', 'local')",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO local_thread_catalog_metadata (id, catalog_revision) VALUES (1, 0)",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO local_thread_catalog_sync_state (host_id, observation_sequence, initial_build_complete) VALUES ('local', 0, 1)",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+
+    let current: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(observation_sequence), 0) FROM local_thread_catalog",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    for (index, task) in tasks.iter().enumerate() {
+        let created_at = parse_time(&task.created_at).timestamp_millis() as f64 / 1000.0;
+        let updated_at = parse_time(&task.updated_at).timestamp_millis() as f64 / 1000.0;
+        let source = if task.source.trim().is_empty() {
+            "vscode"
+        } else {
+            task.source.trim()
+        };
+        let model_provider = if task.model_provider.trim().is_empty() {
+            "openai"
+        } else {
+            task.model_provider.trim()
+        };
+        let title = if task.title.trim().is_empty() {
+            truncate(&task.first_user_message, 96)
+        } else {
+            task.title.clone()
+        };
+        transaction
+            .execute(
+                "INSERT INTO local_thread_catalog (host_id, thread_id, display_title, source_created_at, source_updated_at, cwd, source_kind, source_detail, model_provider, git_branch, observation_sequence, missing_candidate) VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, 0) ON CONFLICT(host_id, thread_id) DO UPDATE SET display_title=excluded.display_title, source_created_at=excluded.source_created_at, source_updated_at=excluded.source_updated_at, cwd=excluded.cwd, source_kind=excluded.source_kind, source_detail=excluded.source_detail, model_provider=excluded.model_provider, git_branch=excluded.git_branch, observation_sequence=excluded.observation_sequence, missing_candidate=0",
+                params![
+                    task.id,
+                    title,
+                    created_at,
+                    updated_at,
+                    task.cwd,
+                    source,
+                    model_provider,
+                    task.git_branch,
+                    current + index as i64 + 1
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .execute(
+            "UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + 1 WHERE id = 1",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE local_thread_catalog_sync_state SET observation_sequence = MAX(observation_sequence, ?1) WHERE host_id = 'local'",
+            params![current + tasks.len() as i64],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn list_tasks() -> Result<TaskList, String> {
     let home = codex_home();
@@ -744,6 +1310,9 @@ fn import_archive(
     archive_path: String,
     options: Option<ImportOptions>,
 ) -> Result<serde_json::Value, String> {
+    if is_codex_desktop_running() {
+        return Err("检测到 Codex/ChatGPT 桌面端正在运行。请先完全退出 Codex，再执行导入或恢复，避免侧边栏状态被运行中的客户端覆盖。".to_string());
+    }
     let source = PathBuf::from(&archive_path);
     let manifest = archive_manifest(&source)?;
     let home = codex_home();
@@ -897,8 +1466,9 @@ fn import_archive(
     }
     backups.extend(
         [
-        backup_database(&home.join("state_5.sqlite"), &stamp),
-        backup_database(&home.join("sqlite").join("codex-dev.db"), &stamp),
+            backup_database(&home.join("state_5.sqlite"), &stamp),
+            backup_database(&home.join("sqlite").join("codex-dev.db"), &stamp),
+            backup_database(&home.join(".codex-global-state.json"), &stamp),
         ]
         .into_iter()
         .flatten(),
@@ -910,6 +1480,8 @@ fn import_archive(
         .collect::<Vec<_>>();
     append_index(&home, &registered)?;
     register_threads(&home, &registered)?;
+    register_catalog_threads(&home, &registered)?;
+    register_desktop_project_state(&home, &registered)?;
     Ok(
         serde_json::json!({"imported": imported.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "restored": restored.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "skipped": skipped, "backups": backups, "codexHome": home}),
     )
@@ -917,7 +1489,8 @@ fn import_archive(
 
 #[tauri::command]
 fn get_environment() -> serde_json::Value {
-    serde_json::json!({"codexHome": codex_home(), "platform": env::consts::OS, "version": env!("CARGO_PKG_VERSION")})
+    let codex_processes = codex_desktop_processes();
+    serde_json::json!({"codexHome": codex_home(), "platform": env::consts::OS, "version": env!("CARGO_PKG_VERSION"), "codexRunning": !codex_processes.is_empty(), "codexProcesses": codex_processes})
 }
 
 pub fn run() {
@@ -973,6 +1546,8 @@ mod tests {
             size: 0,
             archived: false,
             project_exists: true,
+            codex_visible: true,
+            project_pinned: false,
             file_path: PathBuf::new(),
             browser_file: PathBuf::new(),
         }

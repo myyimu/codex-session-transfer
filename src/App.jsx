@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
   ArrowClockwise,
@@ -60,6 +60,15 @@ function projectMissing(task) {
   return Boolean(task.cwd) && task.projectExists === false;
 }
 
+function taskHiddenInCodex(task) {
+  return Boolean(task.cwd) && task.codexVisible === false;
+}
+
+function compactPath(value) {
+  const path = String(value || "");
+  return path.replace(/^\/Users\/([^/]+)/, "~");
+}
+
 function buildProjects(tasks) {
   const groups = new Map();
   tasks.forEach((task) => {
@@ -69,19 +78,30 @@ function buildProjects(tasks) {
       name: projectName(task),
       path: task.projectPath || task.cwd || "",
       count: 0,
-      missing: false,
+      missing: true,
+      hidden: true,
+      pinned: false,
       updatedAt: "",
     };
     current.count += 1;
-    current.missing ||= projectMissing(task);
+    current.missing &&= projectMissing(task);
+    current.hidden &&= taskHiddenInCodex(task);
+    current.pinned ||= Boolean(task.projectPinned);
     if (!current.path && task.cwd) current.path = task.cwd;
     if ((task.updatedAt || "") > current.updatedAt) current.updatedAt = task.updatedAt || "";
     groups.set(key, current);
   });
-  return [...groups.values()].sort((left, right) => {
+  const projects = [...groups.values()];
+  const nameCounts = projects.reduce((counts, item) => counts.set(item.name, (counts.get(item.name) || 0) + 1), new Map());
+  projects.forEach((item) => {
+    item.displayName = nameCounts.get(item.name) > 1 && item.path ? `${item.name} · ${compactPath(item.path)}` : item.name;
+  });
+  return projects.sort((left, right) => {
+    if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
     if (left.missing !== right.missing) return left.missing ? 1 : -1;
+    if (left.hidden !== right.hidden) return left.hidden ? 1 : -1;
     if (right.count !== left.count) return right.count - left.count;
-    return left.name.localeCompare(right.name, "zh-CN");
+    return left.displayName.localeCompare(right.displayName, "zh-CN");
   });
 }
 
@@ -113,7 +133,8 @@ function TaskRow({ task, selected, onToggle }) {
         <span className="task-title-line">
           <strong>{task.title}</strong>
           {task.archived && <span className="status-chip neutral">已归档</span>}
-          {projectMissing(task) && <span className="status-chip warning">项目已删除</span>}
+          {projectMissing(task) && <span className="status-chip warning">项目路径不存在</span>}
+          {taskHiddenInCodex(task) && <span className="status-chip warning">未在 Codex 侧栏显示</span>}
         </span>
         <span className="task-meta">
           <span><Clock size={13} />{formatDate(task.updatedAt)}</span>
@@ -133,7 +154,7 @@ function ProjectPicker({ tasks, projects, value, onChange }) {
   const rootRef = useRef(null);
   const selectedProject = projects.find((item) => item.key === value);
   const label = selectedProject
-    ? `${selectedProject.name} · ${selectedProject.missing ? "已删除 · " : ""}${selectedProject.count}`
+    ? `${selectedProject.displayName || selectedProject.name} · ${selectedProject.pinned ? "置顶 · " : ""}${selectedProject.missing ? "路径不存在 · " : selectedProject.hidden ? "未在侧栏 · " : ""}${selectedProject.count}`
     : `全部项目 · ${tasks.length}`;
 
   useEffect(() => {
@@ -192,8 +213,8 @@ function ProjectPicker({ tasks, projects, value, onChange }) {
               role="option"
               aria-selected={value === item.key}
             >
-              <span>{item.name}</span>
-              {item.missing && <em>已删除</em>}
+              <span>{item.displayName || item.name}</span>
+              {(item.pinned || item.missing || item.hidden) && <em>{item.pinned ? "置顶" : item.missing ? "路径不存在" : "未在侧栏"}</em>}
               <strong>{item.count}</strong>
             </button>
           ))}
@@ -207,7 +228,7 @@ function ImportProjectPicker({ projects, value, onChange }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef(null);
   const selected = projects.find((item) => item.path === value);
-  const label = selected ? selected.name : "保持压缩包中的项目";
+  const label = selected ? (selected.displayName || selected.name) : "保持压缩包中的项目";
 
   useEffect(() => {
     if (!open) return undefined;
@@ -265,7 +286,7 @@ function ImportProjectPicker({ projects, value, onChange }) {
               role="option"
               aria-selected={value === item.path}
             >
-              <span>{item.name}</span>
+              <span>{item.displayName || item.name}</span>
               <strong>{item.count}</strong>
             </button>
           ))}
@@ -434,6 +455,7 @@ function ImportView({ environment, showToast }) {
   const [dragging, setDragging] = useState(false);
   const [working, setWorking] = useState(false);
   const [result, setResult] = useState(null);
+  const codexRunning = Boolean(environment?.codexRunning);
 
   useEffect(() => {
     bridge.listTasks().then((next) => setLocalTasks(next.tasks || [])).catch(() => setLocalTasks([]));
@@ -495,7 +517,7 @@ function ImportView({ environment, showToast }) {
   const importableCount = archive?.tasks.filter((task) => !task.conflict).length || 0;
   const conflictCount = archive?.tasks.filter((task) => task.conflict).length || 0;
   const actionCount = importableCount + (restoreExisting ? conflictCount : 0);
-  const localProjects = useMemo(() => buildProjects(localTasks).filter((item) => !item.missing && item.path), [localTasks]);
+  const localProjects = useMemo(() => buildProjects(localTasks).filter((item) => !item.missing && !item.hidden && item.path), [localTasks]);
   const targetName = targetCwd ? (localProjects.find((item) => item.path === targetCwd)?.name || filename(targetCwd)) : "";
 
   return (
@@ -563,6 +585,16 @@ function ImportView({ environment, showToast }) {
             </div>
           )}
 
+          {codexRunning && (
+            <div className="result-strip warning-strip">
+              <ShieldCheck size={20} weight="duotone" />
+              <span>
+                <strong>请先完全退出 Codex</strong>
+                <small>导入会修改本地侧栏状态；Codex 正在运行时可能把恢复结果覆盖掉</small>
+              </span>
+            </div>
+          )}
+
           <div className="setting-row project-target-row">
             <span className="setting-icon"><FolderOpen size={19} /></span>
             <span>
@@ -597,9 +629,9 @@ function ImportView({ environment, showToast }) {
           <strong>{archive ? (restoreExisting ? `${importableCount} 个新任务，${conflictCount} 个可恢复` : `${importableCount} 个新任务可导入`) : "等待选择压缩包"}</strong>
           <span>{environment?.codexHome}</span>
         </div>
-        <button className="primary-button rose-button" disabled={!archive || !actionCount || working} onClick={runImport}>
+        <button className="primary-button rose-button" disabled={!archive || !actionCount || working || codexRunning} onClick={runImport}>
           <TrayArrowDown size={18} weight="bold" />
-          {working ? "正在导入…" : "导入到 Codex"}
+          {working ? "正在导入…" : codexRunning ? "请先退出 Codex" : "导入到 Codex"}
         </button>
       </footer>
     </section>
@@ -611,9 +643,15 @@ export function App() {
   const [environment, setEnvironment] = useState(null);
   const [toast, setToast] = useState(null);
 
-  useEffect(() => {
-    bridge.getEnvironment().then(setEnvironment);
+  const refreshEnvironment = useCallback(() => {
+    bridge.getEnvironment().then(setEnvironment).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    refreshEnvironment();
+    const timer = window.setInterval(refreshEnvironment, 3000);
+    return () => window.clearInterval(timer);
+  }, [refreshEnvironment]);
 
   const showToast = (type, title, message) => {
     setToast({ type, title, message });
@@ -653,7 +691,10 @@ export function App() {
 
         <div className="sidebar-footer">
           <span className="online-dot" />
-          <span><strong>Codex 数据已连接</strong><small>v{environment?.version || "0.1.0"}</small></span>
+          <span>
+            <strong>{environment?.demo ? "浏览器演示数据" : environment?.codexRunning ? "Codex 正在运行" : "可安全导入"}</strong>
+            <small>{environment?.demo ? "真实测试请看桌面 app" : `v${environment?.version || "0.1.0"}`}</small>
+          </span>
         </div>
       </aside>
 

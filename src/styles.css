@@ -825,6 +825,16 @@ h1 {
   background: rgba(255, 255, 255, 0.76);
 }
 
+.warning-strip {
+  border-color: rgba(196, 71, 105, 0.26);
+  background: rgba(255, 239, 245, 0.82);
+}
+
+.warning-strip svg,
+.warning-strip strong {
+  color: #a44761;
+}
+
 .archive-summary {
   min-height: 58px;
   gap: 11px;

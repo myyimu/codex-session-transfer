@@ -2,7 +2,9 @@
 set -euo pipefail
 
 npx tauri build --bundles app
+version="$(node -p "require('./package.json').version")"
+arch="$(uname -m)"
 mkdir -p release
 ditto -c -k --sequesterRsrc --keepParent \
   "src-tauri/target/release/bundle/macos/Codex 会话迁移.app" \
-  "release/Codex-Session-Transfer-0.1.7-aarch64.zip"
+  "release/Codex-Session-Transfer-${version}-${arch}.zip"
