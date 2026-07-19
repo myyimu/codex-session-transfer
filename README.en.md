@@ -26,6 +26,7 @@ Codex Session Transfer is designed for:
 - **Import tasks**: preview an archive and import it into the current Codex data directory.
 - **Duplicate handling**: skip existing task IDs by default, or restore existing local history back into the Codex task list.
 - **Target project selection**: choose which local project imported or restored tasks should appear under.
+- **Third-party routed session adaptation**: sessions created through `cc switch` or another third-party API route are imported as normal Codex sessions and continue with the new computer's current Codex default model.
 - **Path adaptation**: map old missing project paths to same-name folders under `~/work`, `~/Projects`, and `~/Documents`.
 - **Running-app protection**: import is blocked while the Codex/ChatGPT desktop main process is running, preventing the client from overwriting restored sidebar state.
 - **Local backups**: backup Codex SQLite databases and global state before importing.
@@ -61,6 +62,17 @@ After selecting an archive, each task receives an import status:
 You can also choose a target project so imported or restored tasks appear under the intended Codex project group.
 
 ![Import settings](./docs/screenshots/readme/import-settings.png)
+
+## Third-Party API Routed Sessions
+
+If some tasks on the old computer were created through `cc switch` or another third-party API route, the app migrates them as Codex history sessions instead of migrating the third-party service configuration.
+
+- The exported ZIP keeps the original session content and task history.
+- During import or restore, the task is registered as a normal local Codex session on the new computer.
+- When you continue the task in Codex, it uses the new computer's current Codex default model instead of the old third-party API provider.
+- The app does not migrate third-party API keys, route settings, proxy settings, or external model service accounts.
+
+This is intended for bringing history back into Codex and continuing from there. If you want the new computer to keep using the same third-party route, configure that route separately on the new computer.
 
 ## Usage
 
