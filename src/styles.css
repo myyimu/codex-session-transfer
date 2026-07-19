@@ -18,8 +18,7 @@ body {
 }
 
 button,
-input,
-select {
+input {
   font: inherit;
 }
 
@@ -68,6 +67,7 @@ button {
   border-right: 1px solid rgba(65, 91, 101, 0.12);
   background: rgba(255, 255, 255, 0.76);
   backdrop-filter: blur(24px) saturate(135%);
+  -webkit-app-region: no-drag;
 }
 
 .brand {
@@ -138,6 +138,13 @@ nav button {
   color: #426070;
   text-align: left;
   cursor: pointer;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-app-region: no-drag;
+}
+
+nav button > * {
+  pointer-events: none;
 }
 
 nav button strong {
@@ -307,7 +314,7 @@ h1 {
 }
 
 .search-field,
-.project-field {
+.project-trigger {
   height: 40px;
   display: flex;
   align-items: center;
@@ -324,23 +331,36 @@ h1 {
   min-width: 0;
 }
 
-.project-field {
+.project-picker {
+  min-width: 0;
+  position: relative;
+  z-index: 4;
+}
+
+.project-trigger {
+  width: 100%;
   min-width: 0;
   color: #23576d;
   border-color: rgba(29, 137, 166, 0.34);
   background: rgba(231, 252, 255, 0.95);
+  cursor: pointer;
 }
 
 .search-field:focus-within,
-.project-field:focus-within {
+.project-picker.is-open .project-trigger,
+.project-trigger:focus-visible {
   border-color: rgba(41, 133, 145, 0.48);
   box-shadow: 0 0 0 3px rgba(60, 154, 165, 0.1);
+  outline: 0;
 }
 
-.search-field input,
-.project-field select {
+.project-trigger > span,
+.search-field input {
   min-width: 0;
   flex: 1;
+}
+
+.search-field input {
   border: 0;
   outline: 0;
   color: #183545;
@@ -348,9 +368,80 @@ h1 {
   font-size: 12px;
 }
 
-.project-field select {
+.project-trigger > span {
+  overflow: hidden;
+  color: #183545;
+  font-size: 12px;
+  font-weight: 650;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  max-height: min(310px, calc(100vh - 260px));
+  overflow-y: auto;
+  display: grid;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid rgba(29, 137, 166, 0.32);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 18px 42px rgba(45, 108, 143, 0.2);
+  backdrop-filter: blur(18px) saturate(140%);
+}
+
+.project-option {
+  min-width: 0;
+  min-height: 32px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #24475a;
   cursor: pointer;
-  appearance: none;
+}
+
+.project-option:hover,
+.project-option.is-active {
+  border-color: rgba(36, 154, 190, 0.24);
+  background: rgba(222, 249, 255, 0.86);
+}
+
+.project-option span {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 650;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-option em {
+  min-height: 20px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 7px;
+  border-radius: 5px;
+  background: #fde9f0;
+  color: #a44761;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.project-option strong {
+  color: #31586d;
+  font-size: 11px;
+  line-height: 16px;
 }
 
 .search-field input::placeholder {

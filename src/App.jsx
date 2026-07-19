@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
   ArrowClockwise,
+  CaretDown,
   Check,
   CheckSquare,
   Clock,
@@ -99,6 +100,102 @@ function TaskRow({ task, selected, onToggle }) {
         <span>轮对话</span>
       </span>
     </label>
+  );
+}
+
+function ProjectPicker({ tasks, projects, value, onChange }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
+  const selectedProject = projects.find((item) => item.key === value);
+  const label = selectedProject
+    ? `${selectedProject.name} · ${selectedProject.missing ? "已删除 · " : ""}${selectedProject.count}`
+    : `全部项目 · ${tasks.length}`;
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const close = (event) => {
+      if (!rootRef.current?.contains(event.target)) setOpen(false);
+    };
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  const choose = (next) => {
+    onChange(next);
+    setOpen(false);
+  };
+
+  return (
+    <div className={`project-picker ${open ? "is-open" : ""}`} ref={rootRef}>
+      <button
+        type="button"
+        className="project-trigger"
+        onClick={() => setOpen((current) => !current)}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        title="按项目筛选任务"
+      >
+        <FolderSimple size={18} weight="duotone" />
+        <span>{label}</span>
+        <CaretDown size={14} weight="bold" />
+      </button>
+      {open && (
+        <div className="project-menu" role="listbox" aria-label="按项目筛选">
+          <button
+            type="button"
+            className={`project-option ${value === "all" ? "is-active" : ""}`}
+            onClick={() => choose("all")}
+            role="option"
+            aria-selected={value === "all"}
+          >
+            <span>全部项目</span>
+            <strong>{tasks.length}</strong>
+          </button>
+          {projects.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              className={`project-option ${item.missing ? "is-missing" : ""} ${value === item.key ? "is-active" : ""}`}
+              onClick={() => choose(item.key)}
+              role="option"
+              aria-selected={value === item.key}
+            >
+              <span>{item.name}</span>
+              {item.missing && <em>已删除</em>}
+              <strong>{item.count}</strong>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NavButton({ active, icon: Icon, title, subtitle, onSelect }) {
+  const handlePointerDown = (event) => {
+    if (event.button === undefined || event.button === 0) {
+      event.preventDefault();
+      onSelect();
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      className={active ? "active" : ""}
+      onClick={onSelect}
+      onPointerDown={handlePointerDown}
+    >
+      <Icon size={20} weight={active ? "fill" : "regular"} />
+      <span><strong>{title}</strong><small>{subtitle}</small></span>
+    </button>
   );
 }
 
@@ -214,17 +311,7 @@ function ExportView({ environment, showToast }) {
               <button onClick={() => setQuery("")} aria-label="清空搜索" title="清空搜索"><X size={15} /></button>
             )}
           </label>
-          <label className="project-field" title="按项目筛选任务">
-            <FolderSimple size={18} weight="duotone" />
-            <select value={project} onChange={(event) => setProject(event.target.value)} aria-label="按项目筛选">
-              <option value="all">全部项目 · {tasks.length}</option>
-              {projects.map((item) => (
-                <option key={item.key} value={item.key}>
-                  {item.missing ? `${item.name} · 已删除 · ${item.count}` : `${item.name} · ${item.count}`}
-                </option>
-              ))}
-            </select>
-          </label>
+          <ProjectPicker tasks={tasks} projects={projects} value={project} onChange={setProject} />
         </div>
         <div className="toolbar-actions">
           <button className="text-button" onClick={toggleVisible} disabled={!filtered.length}>
@@ -428,14 +515,20 @@ export function App() {
         </div>
 
         <nav aria-label="主要功能">
-          <button className={mode === "export" ? "active" : ""} onClick={() => setMode("export")}>
-            <DownloadSimple size={20} weight={mode === "export" ? "fill" : "regular"} />
-            <span><strong>导出任务</strong><small>打包这台电脑的会话</small></span>
-          </button>
-          <button className={mode === "import" ? "active" : ""} onClick={() => setMode("import")}>
-            <CloudArrowDown size={20} weight={mode === "import" ? "fill" : "regular"} />
-            <span><strong>导入任务</strong><small>恢复到新的电脑</small></span>
-          </button>
+          <NavButton
+            active={mode === "export"}
+            icon={DownloadSimple}
+            title="导出任务"
+            subtitle="打包这台电脑的会话"
+            onSelect={() => setMode("export")}
+          />
+          <NavButton
+            active={mode === "import"}
+            icon={CloudArrowDown}
+            title="导入任务"
+            subtitle="恢复到新的电脑"
+            onSelect={() => setMode("import")}
+          />
         </nav>
 
         <div className="privacy-note">
