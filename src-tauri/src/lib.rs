@@ -742,6 +742,36 @@ fn catalog_visibility(
         .and_then(|items| items.get(task_id).map(|item| item.2))
 }
 
+#[cfg(target_os = "windows")]
+fn missing_desktop_project_visible(archived: bool) -> bool {
+    !archived
+}
+
+#[cfg(not(target_os = "windows"))]
+fn missing_desktop_project_visible(_archived: bool) -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn matched_desktop_project_visible(
+    _task_id: &str,
+    archived: bool,
+    _catalog_visible: Option<bool>,
+    _project_state: &DesktopProjectState,
+) -> bool {
+    !archived
+}
+
+#[cfg(not(target_os = "windows"))]
+fn matched_desktop_project_visible(
+    task_id: &str,
+    archived: bool,
+    catalog_visible: Option<bool>,
+    project_state: &DesktopProjectState,
+) -> bool {
+    !archived && catalog_visible.unwrap_or_else(|| project_state.client_threads.contains(task_id))
+}
+
 fn value_array_strings(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -1366,13 +1396,18 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
                     task.project_path = path.clone();
                     task.project_exists = Path::new(&path).exists();
                     task.project_pinned = false;
-                    task.codex_visible = !task.archived;
+                    task.codex_visible = missing_desktop_project_visible(task.archived);
                 }
             } else if let Some(project) =
                 matching_desktop_project(project_state, &task.cwd, &task.project_path)
             {
                 apply_desktop_project(&mut task, project);
-                task.codex_visible = !task.archived;
+                task.codex_visible = matched_desktop_project_visible(
+                    &task.id,
+                    task.archived,
+                    catalog_visible,
+                    project_state,
+                );
             } else {
                 task.codex_visible = !task.archived
                     && catalog_visible
@@ -2279,6 +2314,18 @@ mod tests {
             lines[2]["payload"]["thread_settings"]["model"].as_str(),
             Some("gpt-5.5")
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn missing_desktop_project_is_hidden_on_macos_like_state() {
+        assert!(!super::missing_desktop_project_visible(false));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn missing_desktop_project_stays_visible_on_windows_compat_state() {
+        assert!(super::missing_desktop_project_visible(false));
     }
 
     #[test]

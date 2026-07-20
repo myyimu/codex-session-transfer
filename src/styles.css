@@ -753,9 +753,8 @@ h1 {
   padding: 10px 12px 10px 16px;
   border: 1px solid rgba(40, 113, 151, 0.32);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.92);
+  background: #fff;
   box-shadow: 0 16px 34px rgba(64, 126, 166, 0.18);
-  backdrop-filter: blur(20px) saturate(135%);
 }
 
 .action-bar > div {
@@ -923,12 +922,13 @@ h1 {
   align-items: center;
   border: 1px solid rgba(48, 76, 87, 0.1);
   border-radius: 7px;
-  background: rgba(255, 255, 255, 0.76);
+  background: #fff;
+  box-shadow: 0 10px 24px rgba(50, 91, 112, 0.1);
 }
 
 .warning-strip {
   border-color: rgba(196, 71, 105, 0.26);
-  background: rgba(255, 239, 245, 0.82);
+  background: #fff2f6;
 }
 
 .warning-strip svg,
@@ -985,6 +985,11 @@ h1 {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid rgba(48, 76, 87, 0.1);
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 12px 28px rgba(50, 91, 112, 0.11);
 }
 
 .import-row {
@@ -1103,7 +1108,7 @@ h1 {
   padding: 3px;
   border: 1px solid rgba(172, 97, 119, 0.18);
   border-radius: 7px;
-  background: rgba(248, 236, 241, 0.74);
+  background: #fbedf2;
 }
 
 .segmented-control button {
@@ -1152,7 +1157,7 @@ h1 {
   padding: 8px 10px 8px 12px;
   color: #34765a;
   border-color: rgba(61, 131, 95, 0.14);
-  background: rgba(236, 248, 241, 0.82);
+  background: #eef9f3;
 }
 
 .toast {
