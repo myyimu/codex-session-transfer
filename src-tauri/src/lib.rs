@@ -2,6 +2,8 @@ use chrono::{DateTime, Datelike, Local, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -16,6 +18,8 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 const ARCHIVE_SCHEMA: &str = "codex-session-transfer/v1";
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -263,10 +267,11 @@ fn codex_model_settings(home: &Path) -> CodexModelSettings {
 fn codex_desktop_processes() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("tasklist")
+        let mut command = Command::new("tasklist");
+        command
             .args(["/FO", "CSV", "/NH"])
-            .output()
-            .ok();
+            .creation_flags(CREATE_NO_WINDOW);
+        let output = command.output().ok();
         let text = output
             .as_ref()
             .map(|item| String::from_utf8_lossy(&item.stdout).to_string())
@@ -728,6 +733,15 @@ fn catalog_tasks(home: &Path) -> Option<HashMap<String, (String, String, bool)>>
     Some(result)
 }
 
+fn catalog_visibility(
+    catalog: &Option<HashMap<String, (String, String, bool)>>,
+    task_id: &str,
+) -> Option<bool> {
+    catalog
+        .as_ref()
+        .and_then(|items| items.get(task_id).map(|item| item.2))
+}
+
 fn value_array_strings(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -879,6 +893,47 @@ fn is_path_in_root(path: &str, root: &str) -> bool {
     path == root || path.starts_with(root)
 }
 
+fn path_segments(path: &str) -> Vec<String> {
+    path.trim_end_matches(['/', '\\'])
+        .split(['/', '\\'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect()
+}
+
+fn usable_project_name(name: &str) -> Option<String> {
+    let name = name.trim().to_ascii_lowercase();
+    if name.len() < 3 || is_generic_workspace_name(&name) {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn desktop_project_name_matches_path(
+    project: &DesktopProject,
+    cwd: &str,
+    inferred_path: &str,
+) -> bool {
+    let mut names = project
+        .root_paths
+        .iter()
+        .filter_map(|path| usable_project_name(&path_name(path)))
+        .collect::<HashSet<_>>();
+    if let Some(name) = usable_project_name(&project.name) {
+        names.insert(name);
+    }
+    if names.is_empty() {
+        return false;
+    }
+    let segments = path_segments(cwd)
+        .into_iter()
+        .chain(path_segments(inferred_path))
+        .collect::<HashSet<_>>();
+    names.iter().any(|name| segments.contains(name))
+}
+
 fn project_paths_exist(paths: &[String]) -> bool {
     paths.iter().any(|path| Path::new(path).exists())
 }
@@ -916,6 +971,27 @@ fn matching_desktop_project<'a>(
                 .map(|root| root.len())
                 .max()
                 .unwrap_or(0)
+        })
+        .or_else(|| {
+            let candidates = state
+                .projects
+                .values()
+                .filter(|project| desktop_project_name_matches_path(project, cwd, inferred_path))
+                .collect::<Vec<_>>();
+            match candidates.as_slice() {
+                [project] => Some(*project),
+                _ => {
+                    let pinned = candidates
+                        .iter()
+                        .copied()
+                        .filter(|project| project.pinned)
+                        .collect::<Vec<_>>();
+                    match pinned.as_slice() {
+                        [project] => Some(*project),
+                        _ => None,
+                    }
+                }
+            }
         })
 }
 
@@ -1196,7 +1272,7 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
             .map(str::to_string)
             .or_else(|| {
                 catalog_task
-                    .filter(|item| item.2)
+                    .filter(|item| !item.0.is_empty())
                     .map(|item| item.0.clone())
             })
             .or_else(|| database_task.map(|item| item.title.clone()))
@@ -1214,12 +1290,12 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
         }
         if task.cwd.is_empty() {
             task.cwd = catalog_task
-                .filter(|item| item.2 && !item.1.is_empty())
+                .filter(|item| !item.1.is_empty())
                 .map(|item| item.1.clone())
                 .or_else(|| database_task.map(|item| item.cwd.clone()))
                 .unwrap_or_default();
         } else if let Some(catalog_cwd) = catalog_task
-            .filter(|item| item.2 && !item.1.is_empty())
+            .filter(|item| !item.1.is_empty())
             .map(|item| item.1.clone())
         {
             task.cwd = catalog_cwd;
@@ -1266,11 +1342,8 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
             }
         }
         task.archived = database_task.map(|item| item.archived).unwrap_or(false);
-        let catalog_visible = catalog
-            .as_ref()
-            .map(|items| items.get(&task.id).map(|item| item.2).unwrap_or(false))
-            .unwrap_or(true);
-        task.codex_visible = catalog_visible;
+        let catalog_visible = catalog_visibility(&catalog, &task.id);
+        task.codex_visible = catalog_visible.unwrap_or(true);
         (
             task.project_key,
             task.project_name,
@@ -1293,16 +1366,17 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
                     task.project_path = path.clone();
                     task.project_exists = Path::new(&path).exists();
                     task.project_pinned = false;
-                    task.codex_visible = false;
+                    task.codex_visible = !task.archived;
                 }
             } else if let Some(project) =
                 matching_desktop_project(project_state, &task.cwd, &task.project_path)
             {
                 apply_desktop_project(&mut task, project);
-                task.codex_visible =
-                    !task.archived && project_state.client_threads.contains(&task.id);
+                task.codex_visible = !task.archived;
             } else {
-                task.codex_visible = false;
+                task.codex_visible = !task.archived
+                    && catalog_visible
+                        .unwrap_or_else(|| project_state.client_threads.contains(&task.id));
             }
         }
         task.browser_file = home
@@ -1791,6 +1865,50 @@ fn export_tasks(task_ids: Vec<String>, destination: String) -> Result<serde_json
 }
 
 #[tauri::command]
+fn restore_local_tasks(task_ids: Vec<String>) -> Result<serde_json::Value, String> {
+    if is_codex_desktop_running() {
+        return Err("检测到 Codex/ChatGPT 桌面端正在运行。请先完全退出 Codex，再恢复本地会话，避免侧边栏状态被运行中的客户端覆盖。".to_string());
+    }
+    let requested: HashSet<_> = task_ids.into_iter().collect();
+    let home = codex_home();
+    let mut selected: Vec<_> = list_local_tasks()?
+        .into_iter()
+        .filter(|task| requested.contains(&task.id))
+        .collect();
+    if selected.is_empty() {
+        return Err("请至少选择一个任务".to_string());
+    }
+    for task in &mut selected {
+        task.archived = false;
+        if task.updated_at.is_empty() {
+            task.updated_at = Utc::now().to_rfc3339();
+        }
+        if task.created_at.is_empty() {
+            task.created_at = task.updated_at.clone();
+        }
+        if task.title.is_empty() {
+            task.title = truncate(&task.first_user_message, 96);
+        }
+    }
+    let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+    let backups = [
+        backup_database(&home.join("state_5.sqlite"), &stamp),
+        backup_database(&home.join("sqlite").join("codex-dev.db"), &stamp),
+        backup_database(&home.join(".codex-global-state.json"), &stamp),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    append_index(&home, &selected)?;
+    register_threads(&home, &selected)?;
+    register_catalog_threads(&home, &selected)?;
+    register_desktop_project_state(&home, &selected)?;
+    Ok(
+        serde_json::json!({"restored": selected.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "backups": backups, "codexHome": home}),
+    )
+}
+
+#[tauri::command]
 fn inspect_archive(archive_path: String) -> Result<ArchiveInspection, String> {
     let manifest = archive_manifest(Path::new(&archive_path))?;
     let model_settings = codex_model_settings(&codex_home());
@@ -2059,6 +2177,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_tasks,
             export_tasks,
+            restore_local_tasks,
             inspect_archive,
             import_archive,
             get_environment

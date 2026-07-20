@@ -76,6 +76,13 @@ function compactPath(value) {
   return path.replace(/^\/Users\/([^/]+)/, "~");
 }
 
+function projectMatchesSearch(project, query) {
+  const needle = query.trim().toLocaleLowerCase();
+  if (!needle) return true;
+  return [project.displayName, project.name, project.path, project.key]
+    .some((value) => String(value || "").toLocaleLowerCase().includes(needle));
+}
+
 function buildProjects(tasks) {
   const groups = new Map();
   tasks.forEach((task) => {
@@ -129,6 +136,10 @@ function Toast({ toast, onClose }) {
 }
 
 function TaskRow({ task, selected, onToggle }) {
+  const title = task.title || "未命名任务";
+  const cwd = task.cwd || "未记录工作目录";
+  const model = modelLabel(task);
+
   return (
     <label className={`task-row ${selected ? "is-selected" : ""}`}>
       <input type="checkbox" checked={selected} onChange={() => onToggle(task.id)} />
@@ -138,15 +149,15 @@ function TaskRow({ task, selected, onToggle }) {
       <span className="task-mark"><Archive size={20} weight="duotone" /></span>
       <span className="task-copy">
         <span className="task-title-line">
-          <strong>{task.title}</strong>
-          {task.archived && <span className="status-chip neutral">已归档</span>}
-          {projectMissing(task) && <span className="status-chip warning">项目路径不存在</span>}
-          {taskHiddenInCodex(task) && <span className="status-chip warning">未在 Codex 侧栏显示</span>}
-          {modelLabel(task) && <span className="status-chip neutral">{modelLabel(task)}</span>}
+          <strong title={title}>{title}</strong>
+          {task.archived && <span className="status-chip neutral" title="已归档">已归档</span>}
+          {projectMissing(task) && <span className="status-chip warning" title="项目路径不存在">项目路径不存在</span>}
+          {taskHiddenInCodex(task) && <span className="status-chip warning" title="未在 Codex 侧栏显示">未在 Codex 侧栏显示</span>}
+          {model && <span className="status-chip neutral" title={model}>{model}</span>}
         </span>
         <span className="task-meta">
           <span><Clock size={13} />{formatDate(task.updatedAt)}</span>
-          <span><Path size={13} />{task.cwd || "未记录工作目录"}</span>
+          <span title={cwd}><Path size={13} />{cwd}</span>
         </span>
       </span>
       <span className="task-stats">
@@ -159,8 +170,13 @@ function TaskRow({ task, selected, onToggle }) {
 
 function ProjectPicker({ tasks, projects, value, onChange }) {
   const [open, setOpen] = useState(false);
+  const [projectQuery, setProjectQuery] = useState("");
   const rootRef = useRef(null);
   const selectedProject = projects.find((item) => item.key === value);
+  const filteredProjects = useMemo(
+    () => projects.filter((item) => projectMatchesSearch(item, projectQuery)),
+    [projectQuery, projects],
+  );
   const label = selectedProject
     ? `${selectedProject.displayName || selectedProject.name} · ${selectedProject.pinned ? "置顶 · " : ""}${selectedProject.missing ? "路径不存在 · " : selectedProject.hidden ? "未在侧栏 · " : ""}${selectedProject.count}`
     : `全部项目 · ${tasks.length}`;
@@ -184,6 +200,7 @@ function ProjectPicker({ tasks, projects, value, onChange }) {
   const choose = (next) => {
     onChange(next);
     setOpen(false);
+    setProjectQuery("");
   };
 
   return (
@@ -194,38 +211,61 @@ function ProjectPicker({ tasks, projects, value, onChange }) {
         onClick={() => setOpen((current) => !current)}
         aria-expanded={open}
         aria-haspopup="listbox"
-        title="按项目筛选任务"
+        title={label}
       >
         <FolderSimple size={18} weight="duotone" />
-        <span>{label}</span>
+        <span title={label}>{label}</span>
         <CaretDown size={14} weight="bold" />
       </button>
       {open && (
         <div className="project-menu" role="listbox" aria-label="按项目筛选">
-          <button
-            type="button"
-            className={`project-option ${value === "all" ? "is-active" : ""}`}
-            onClick={() => choose("all")}
-            role="option"
-            aria-selected={value === "all"}
-          >
-            <span>全部项目</span>
-            <strong>{tasks.length}</strong>
-          </button>
-          {projects.map((item) => (
+          <label className="project-menu-search">
+            <MagnifyingGlass size={14} />
+            <input
+              value={projectQuery}
+              onChange={(event) => setProjectQuery(event.target.value)}
+              placeholder="搜索项目"
+              autoFocus
+            />
+            {projectQuery && (
+              <button type="button" onClick={() => setProjectQuery("")} aria-label="清空项目搜索" title="清空项目搜索">
+                <X size={13} />
+              </button>
+            )}
+          </label>
+          <div className="project-options">
             <button
-              key={item.key}
               type="button"
-              className={`project-option ${item.missing ? "is-missing" : ""} ${value === item.key ? "is-active" : ""}`}
-              onClick={() => choose(item.key)}
+              className={`project-option ${value === "all" ? "is-active" : ""}`}
+              onClick={() => choose("all")}
               role="option"
-              aria-selected={value === item.key}
+              aria-selected={value === "all"}
+              title={`全部项目 · ${tasks.length}`}
             >
-              <span>{item.displayName || item.name}</span>
-              {(item.pinned || item.missing || item.hidden) && <em>{item.pinned ? "置顶" : item.missing ? "路径不存在" : "未在侧栏"}</em>}
-              <strong>{item.count}</strong>
+              <span>全部项目</span>
+              <strong>{tasks.length}</strong>
             </button>
-          ))}
+            {filteredProjects.map((item) => {
+              const name = item.displayName || item.name;
+              const status = item.pinned ? "置顶" : item.missing ? "路径不存在" : item.hidden ? "未在侧栏" : "";
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  className={`project-option ${item.missing ? "is-missing" : ""} ${value === item.key ? "is-active" : ""}`}
+                  onClick={() => choose(item.key)}
+                  role="option"
+                  aria-selected={value === item.key}
+                  title={`${name}${status ? ` · ${status}` : ""} · ${item.count}`}
+                >
+                  <span title={name}>{name}</span>
+                  {status && <em title={status}>{status}</em>}
+                  <strong>{item.count}</strong>
+                </button>
+              );
+            })}
+            {!filteredProjects.length && <div className="project-empty">没有匹配项目</div>}
+          </div>
         </div>
       )}
     </div>
@@ -234,8 +274,13 @@ function ProjectPicker({ tasks, projects, value, onChange }) {
 
 function ImportProjectPicker({ projects, value, onChange }) {
   const [open, setOpen] = useState(false);
+  const [projectQuery, setProjectQuery] = useState("");
   const rootRef = useRef(null);
   const selected = projects.find((item) => item.path === value);
+  const filteredProjects = useMemo(
+    () => projects.filter((item) => projectMatchesSearch(item, projectQuery)),
+    [projectQuery, projects],
+  );
   const label = selected ? (selected.displayName || selected.name) : "保持压缩包中的项目";
 
   useEffect(() => {
@@ -257,6 +302,7 @@ function ImportProjectPicker({ projects, value, onChange }) {
   const choose = (next) => {
     onChange(next);
     setOpen(false);
+    setProjectQuery("");
   };
 
   return (
@@ -267,37 +313,59 @@ function ImportProjectPicker({ projects, value, onChange }) {
         onClick={() => setOpen((current) => !current)}
         aria-expanded={open}
         aria-haspopup="listbox"
-        title="选择恢复到哪个项目"
+        title={label}
       >
         <FolderSimple size={18} weight="duotone" />
-        <span>{label}</span>
+        <span title={label}>{label}</span>
         <CaretDown size={14} weight="bold" />
       </button>
       {open && (
         <div className="project-menu" role="listbox" aria-label="选择目标项目">
-          <button
-            type="button"
-            className={`project-option ${value ? "" : "is-active"}`}
-            onClick={() => choose("")}
-            role="option"
-            aria-selected={!value}
-          >
-            <span>保持压缩包中的项目</span>
-            <strong>默认</strong>
-          </button>
-          {projects.map((item) => (
+          <label className="project-menu-search">
+            <MagnifyingGlass size={14} />
+            <input
+              value={projectQuery}
+              onChange={(event) => setProjectQuery(event.target.value)}
+              placeholder="搜索项目"
+              autoFocus
+            />
+            {projectQuery && (
+              <button type="button" onClick={() => setProjectQuery("")} aria-label="清空项目搜索" title="清空项目搜索">
+                <X size={13} />
+              </button>
+            )}
+          </label>
+          <div className="project-options">
             <button
-              key={item.key}
               type="button"
-              className={`project-option ${value === item.path ? "is-active" : ""}`}
-              onClick={() => choose(item.path)}
+              className={`project-option ${value ? "" : "is-active"}`}
+              onClick={() => choose("")}
               role="option"
-              aria-selected={value === item.path}
+              aria-selected={!value}
+              title="保持压缩包中的项目"
             >
-              <span>{item.displayName || item.name}</span>
-              <strong>{item.count}</strong>
+              <span>保持压缩包中的项目</span>
+              <strong>默认</strong>
             </button>
-          ))}
+            {filteredProjects.map((item) => {
+              const name = item.displayName || item.name;
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  className={`project-option ${value === item.path ? "is-active" : ""}`}
+                  onClick={() => choose(item.path)}
+                  role="option"
+                  aria-selected={value === item.path}
+                  title={`${name} · ${item.count}`}
+                >
+                  <span title={name}>{name}</span>
+                  <strong>{item.count}</strong>
+                </button>
+              );
+            })}
+            {!filteredProjects.length && <div className="project-empty">没有匹配项目</div>}
+          </div>
         </div>
       )}
     </div>
@@ -325,13 +393,14 @@ function NavButton({ active, icon: Icon, title, subtitle, onSelect }) {
   );
 }
 
-function ExportView({ environment, showToast }) {
+function ExportView({ environment, showToast, refreshEnvironment }) {
   const [tasks, setTasks] = useState([]);
   const [query, setQuery] = useState("");
   const [project, setProject] = useState("all");
   const [selected, setSelected] = useState(new Set());
   const [loading, setLoading] = useState(true);
-  const [working, setWorking] = useState(false);
+  const [operation, setOperation] = useState("");
+  const codexRunning = Boolean(environment?.codexRunning);
 
   const load = async () => {
     setLoading(true);
@@ -381,7 +450,7 @@ function ExportView({ environment, showToast }) {
   };
 
   const exportSelected = async () => {
-    setWorking(true);
+    setOperation("export");
     try {
       const result = await bridge.exportTasks([...selected]);
       if (!result.canceled) {
@@ -390,7 +459,25 @@ function ExportView({ environment, showToast }) {
     } catch (error) {
       showToast("error", "导出失败", error.message);
     } finally {
-      setWorking(false);
+      setOperation("");
+    }
+  };
+
+  const restoreSelected = async () => {
+    setOperation("restore");
+    try {
+      const result = await bridge.restoreLocalTasks([...selected]);
+      const count = result.restored?.length || 0;
+      showToast("success", `已恢复 ${count} 个本地会话`, result.codexHome);
+      setSelected(new Set());
+      setQuery("");
+      setProject("all");
+      await load();
+      refreshEnvironment?.();
+    } catch (error) {
+      showToast("error", "恢复失败", error.message);
+    } finally {
+      setOperation("");
     }
   };
 
@@ -423,9 +510,9 @@ function ExportView({ environment, showToast }) {
             <CheckSquare size={17} weight={allVisibleSelected ? "fill" : "regular"} />
             {allVisibleSelected ? "取消全选" : "全选当前结果"}
           </button>
-          <button className="primary-button toolbar-export" disabled={!selected.size || working} onClick={exportSelected}>
+          <button className="primary-button toolbar-export" disabled={!selected.size || operation} onClick={exportSelected}>
             <Export size={17} weight="bold" />
-            {working ? "正在打包…" : selected.size ? `导出 ${selected.size} 个任务` : "导出已选任务"}
+            {operation === "export" ? "正在打包…" : selected.size ? `导出 ${selected.size} 个任务` : "导出已选任务"}
           </button>
         </div>
       </div>
@@ -443,12 +530,23 @@ function ExportView({ environment, showToast }) {
       <footer className="action-bar">
         <div>
           <strong>{selected.size ? `已选择 ${selected.size} 个任务` : "尚未选择任务"}</strong>
-          <span>{selected.size ? `原始会话约 ${formatBytes(selectedBytes)}` : environment?.codexHome}</span>
+          <span title={selected.size ? `原始会话约 ${formatBytes(selectedBytes)}` : environment?.codexHome}>{selected.size ? `原始会话约 ${formatBytes(selectedBytes)}` : environment?.codexHome}</span>
         </div>
-        <button className="primary-button" disabled={!selected.size || working} onClick={exportSelected}>
-          <Export size={18} weight="bold" />
-          {working ? "正在打包…" : "导出压缩包"}
-        </button>
+        <div className="action-buttons">
+          <button className="primary-button" disabled={!selected.size || operation} onClick={exportSelected}>
+            <Export size={18} weight="bold" />
+            {operation === "export" ? "正在打包…" : "导出压缩包"}
+          </button>
+          <button
+            className="secondary-button"
+            disabled={!selected.size || operation || codexRunning}
+            onClick={restoreSelected}
+            title={codexRunning ? "请先完全退出 Codex，再恢复本地会话" : "直接把选中的本地会话注册回 Codex 侧边栏"}
+          >
+            <ArrowClockwise size={18} weight="bold" />
+            {operation === "restore" ? "正在恢复…" : "恢复到 Codex"}
+          </button>
+        </div>
       </footer>
     </section>
   );
@@ -556,8 +654,8 @@ function ImportView({ environment, showToast }) {
           <div className="archive-summary">
             <span className="archive-icon"><FileArchive size={26} weight="duotone" /></span>
             <span>
-              <strong>{filename(archive.path)}</strong>
-              <small>{archive.tasks.length} 个任务 · 打包于 {formatDate(archive.createdAt)}</small>
+              <strong title={filename(archive.path)}>{filename(archive.path)}</strong>
+              <small title={`${archive.tasks.length} 个任务 · 打包于 ${formatDate(archive.createdAt)}`}>{archive.tasks.length} 个任务 · 打包于 {formatDate(archive.createdAt)}</small>
             </span>
             <button className="text-button compact" onClick={choose}>重新选择</button>
           </div>
@@ -569,11 +667,11 @@ function ImportView({ environment, showToast }) {
                   {task.conflict ? <ArrowClockwise size={15} /> : <Check size={15} weight="bold" />}
                 </span>
                 <span className="task-copy">
-                  <strong>
-                    {task.title}
-                    {modelLabel(task) && <span className="status-chip neutral">{modelLabel(task)}</span>}
+                  <strong title={task.title || "未命名任务"}>
+                    {task.title || "未命名任务"}
+                    {modelLabel(task) && <span className="status-chip neutral" title={modelLabel(task)}>{modelLabel(task)}</span>}
                   </strong>
-                  <span>{task.cwd || "未记录工作目录"}</span>
+                  <span title={task.cwd || "未记录工作目录"}>{task.cwd || "未记录工作目录"}</span>
                 </span>
                 <span className={`status-chip ${task.conflict ? "neutral" : "ready"}`}>
                   {task.conflict ? (restoreExisting ? "将恢复" : "已存在，将跳过") : "可导入"}
@@ -610,7 +708,7 @@ function ImportView({ environment, showToast }) {
             <span className="setting-icon"><FolderOpen size={19} /></span>
             <span>
               <strong>导入到项目</strong>
-              <small>{targetCwd ? `恢复到 ${targetName || targetCwd}` : "默认保留压缩包记录的项目路径"}</small>
+              <small title={targetCwd ? `恢复到 ${targetName || targetCwd}` : "默认保留压缩包记录的项目路径"}>{targetCwd ? `恢复到 ${targetName || targetCwd}` : "默认保留压缩包记录的项目路径"}</small>
             </span>
             <ImportProjectPicker projects={localProjects} value={targetCwd} onChange={setTargetCwd} />
           </div>
@@ -628,7 +726,7 @@ function ImportView({ environment, showToast }) {
           {result && (
             <div className="result-strip">
               <ShieldCheck size={20} weight="duotone" />
-              <span><strong>导入完成</strong><small>{result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}</small></span>
+              <span><strong>导入完成</strong><small title={result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}>{result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}</small></span>
               <button className="icon-button" onClick={() => bridge.revealPath(environment.codexHome)} title="打开 Codex 数据目录" aria-label="打开 Codex 数据目录"><FolderOpen size={18} /></button>
             </div>
           )}
@@ -638,7 +736,7 @@ function ImportView({ environment, showToast }) {
       <footer className="action-bar">
         <div>
           <strong>{archive ? (restoreExisting ? `${importableCount} 个新任务，${conflictCount} 个可恢复` : `${importableCount} 个新任务可导入`) : "等待选择压缩包"}</strong>
-          <span>{environment?.codexHome}</span>
+          <span title={environment?.codexHome}>{environment?.codexHome}</span>
         </div>
         <button className="primary-button rose-button" disabled={!archive || !actionCount || working || codexRunning} onClick={runImport}>
           <TrayArrowDown size={18} weight="bold" />
@@ -703,14 +801,14 @@ export function App() {
         <div className="sidebar-footer">
           <span className="online-dot" />
           <span>
-            <strong>{environment?.demo ? "浏览器演示数据" : environment?.codexRunning ? "Codex 正在运行" : "可安全导入"}</strong>
-            <small>{environment?.demo ? "真实测试请看桌面 app" : `v${environment?.version || "0.1.0"}`}</small>
+            <strong title={environment?.demo ? "浏览器演示数据" : environment?.codexRunning ? "Codex 正在运行" : "可安全导入"}>{environment?.demo ? "浏览器演示数据" : environment?.codexRunning ? "Codex 正在运行" : "可安全导入"}</strong>
+            <small title={environment?.demo ? "真实测试请看桌面 app" : `v${environment?.version || "0.1.0"}`}>{environment?.demo ? "真实测试请看桌面 app" : `v${environment?.version || "0.1.0"}`}</small>
           </span>
         </div>
       </aside>
 
       {mode === "export" ? (
-        <ExportView environment={environment} showToast={showToast} />
+        <ExportView environment={environment} showToast={showToast} refreshEnvironment={refreshEnvironment} />
       ) : (
         <ImportView environment={environment} showToast={showToast} />
       )}

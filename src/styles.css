@@ -384,8 +384,8 @@ h1 {
   left: 0;
   right: 0;
   max-height: min(310px, calc(100vh - 260px));
-  overflow-y: auto;
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 4px;
   padding: 6px;
   border: 1px solid rgba(29, 137, 166, 0.32);
@@ -393,6 +393,58 @@ h1 {
   background: rgba(255, 255, 255, 0.96);
   box-shadow: 0 18px 42px rgba(45, 108, 143, 0.2);
   backdrop-filter: blur(18px) saturate(140%);
+}
+
+.project-menu-search {
+  min-width: 0;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px;
+  color: #557282;
+  border: 1px solid rgba(37, 105, 137, 0.18);
+  border-radius: 6px;
+  background: rgba(245, 252, 254, 0.94);
+}
+
+.project-menu-search:focus-within {
+  border-color: rgba(41, 133, 145, 0.42);
+  box-shadow: 0 0 0 2px rgba(60, 154, 165, 0.08);
+}
+
+.project-menu-search input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  color: #183545;
+  background: transparent;
+  font-size: 11px;
+}
+
+.project-menu-search input::placeholder {
+  color: #718996;
+}
+
+.project-menu-search button {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #557282;
+  cursor: pointer;
+}
+
+.project-options {
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 4px;
 }
 
 .project-option {
@@ -442,6 +494,13 @@ h1 {
   color: #31586d;
   font-size: 11px;
   line-height: 16px;
+}
+
+.project-empty {
+  padding: 10px 8px;
+  color: #6f8792;
+  font-size: 11px;
+  text-align: center;
 }
 
 .search-field input::placeholder {
@@ -721,6 +780,15 @@ h1 {
   white-space: nowrap;
 }
 
+.action-bar > .action-buttons {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px;
+}
+
 .primary-button {
   min-width: 142px;
   height: 38px;
@@ -736,6 +804,7 @@ h1 {
   color: #fff;
   font-size: 12px;
   font-weight: 700;
+  white-space: nowrap;
   box-shadow: 0 9px 20px rgba(0, 114, 149, 0.34);
   cursor: pointer;
 }
@@ -747,6 +816,38 @@ h1 {
 .primary-button:disabled {
   border-color: #cad3d5;
   background: #cad3d5;
+  box-shadow: none;
+  cursor: default;
+}
+
+.secondary-button {
+  min-width: 136px;
+  height: 38px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 14px;
+  border: 1px solid rgba(0, 125, 159, 0.36);
+  border-radius: 7px;
+  background: rgba(232, 251, 255, 0.96);
+  color: #12637c;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  box-shadow: 0 7px 16px rgba(0, 114, 149, 0.12);
+  cursor: pointer;
+}
+
+.secondary-button:hover:not(:disabled) {
+  background: rgba(213, 246, 253, 0.98);
+}
+
+.secondary-button:disabled {
+  border-color: #cad3d5;
+  background: #eef3f4;
+  color: #7c8f97;
   box-shadow: none;
   cursor: default;
 }
@@ -946,7 +1047,7 @@ h1 {
 
 .project-target-row {
   position: relative;
-  z-index: 5;
+  z-index: 20;
 }
 
 .setting-icon {
@@ -1028,6 +1129,7 @@ h1 {
 .import-project-picker {
   width: min(260px, 36vw);
   flex: 0 0 auto;
+  z-index: 21;
 }
 
 .import-project-picker .project-trigger {
@@ -1037,7 +1139,11 @@ h1 {
 
 .import-project-picker .project-menu {
   min-width: 280px;
+  top: auto;
+  bottom: calc(100% + 8px);
   left: auto;
+  right: 0;
+  z-index: 30;
 }
 
 .result-strip {
@@ -1137,5 +1243,14 @@ h1 {
 
   .toolbar-actions {
     width: 100%;
+  }
+
+  .action-bar {
+    flex-wrap: wrap;
+  }
+
+  .action-bar > .action-buttons {
+    width: 100%;
+    justify-content: flex-end;
   }
 }

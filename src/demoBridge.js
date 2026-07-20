@@ -36,6 +36,14 @@ export const demoBridge = {
     await new Promise((resolve) => setTimeout(resolve, 650));
     return { canceled: false, count: taskIds.length, path: "/Users/yimu/Downloads/codex-tasks-demo.zip", size: 4200000 };
   },
+  async restoreLocalTasks(taskIds) {
+    await new Promise((resolve) => setTimeout(resolve, 520));
+    return {
+      restored: demoTasks.filter((task) => taskIds.includes(task.id)),
+      backups: ["state_5.sqlite.backup-demo"],
+      codexHome: "/Users/yimu/.codex",
+    };
+  },
   async chooseArchive() {
     await new Promise((resolve) => setTimeout(resolve, 280));
     archive = {
