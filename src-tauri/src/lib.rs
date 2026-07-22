@@ -331,11 +331,7 @@ fn truncate(value: &str, limit: usize) -> String {
 fn is_codex_context_text(value: &str) -> bool {
     let value = clean_text(value);
     let lower = value.to_ascii_lowercase();
-    lower.starts_with("<environment_context")
-        || lower.starts_with("<recommended_plugins")
-        || lower.contains("<cwd>")
-        || lower.contains("</cwd>")
-        || lower.contains("here is a list of plugins that are available")
+    lower.starts_with("<environment_context") || lower.starts_with("<recommended_plugins")
 }
 
 fn is_bad_title(value: &str) -> bool {
@@ -1494,6 +1490,34 @@ fn archive_path(id: &str, file: &str) -> String {
     format!("tasks/{id}/{file}")
 }
 
+fn is_safe_task_id(id: &str) -> bool {
+    id.len() >= 8
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn session_meta_id<R: BufRead>(reader: R) -> Result<String, String> {
+    for line in reader.lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let id = record
+            .get("payload")
+            .and_then(|payload| payload.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "压缩包会话缺少 ID".to_string())?;
+        return Ok(id.to_string());
+    }
+    Err("压缩包会话缺少 session_meta".to_string())
+}
+
 fn archive_manifest(path: &Path) -> Result<Manifest, String> {
     let file = File::open(path).map_err(|_| "找不到所选压缩包".to_string())?;
     let mut zip = ZipArchive::new(file).map_err(|_| "这不是有效的 ZIP 压缩包".to_string())?;
@@ -1516,13 +1540,34 @@ fn archive_manifest(path: &Path) -> Result<Manifest, String> {
         serde_json::from_str(&contents).map_err(|_| "压缩包 manifest 无效".to_string())?;
     if manifest.schema != ARCHIVE_SCHEMA
         || manifest.tasks.iter().any(|task| {
-            task.task.id.len() < 8
+            !is_safe_task_id(&task.task.id)
                 || !task
                     .session_file
                     .starts_with(&format!("tasks/{}/", task.task.id))
+                || task
+                    .browser_file
+                    .as_deref()
+                    .is_some_and(|file| !file.starts_with(&format!("tasks/{}/", task.task.id)))
         })
     {
         return Err("这不是有效的 Codex 会话迁移压缩包".to_string());
+    }
+    let mut ids = HashSet::new();
+    for task in &manifest.tasks {
+        if !ids.insert(task.task.id.as_str()) {
+            return Err("压缩包包含重复会话 ID".to_string());
+        }
+        let session = zip
+            .by_name(&task.session_file)
+            .map_err(|_| "压缩包缺少会话文件".to_string())?;
+        let session_id = session_meta_id(BufReader::new(session))?;
+        if session_id != task.task.id {
+            return Err("压缩包会话 ID 与 manifest 不一致".to_string());
+        }
+        if let Some(browser_file) = &task.browser_file {
+            zip.by_name(browser_file)
+                .map_err(|_| "压缩包缺少浏览器配置".to_string())?;
+        }
     }
     Ok(manifest)
 }
@@ -1570,15 +1615,47 @@ fn ensure_project_directory(cwd: &str) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|error| format!("无法创建项目文件夹 {cwd}: {error}"))
 }
 
-fn replace_value(value: &mut Value, from: &str, to: &str) {
+fn is_path_field(name: &str) -> bool {
+    matches!(
+        name,
+        "cwd"
+            | "root"
+            | "rootPath"
+            | "rootPaths"
+            | "workspaceRoot"
+            | "workspace_root"
+            | "writableRoots"
+            | "writable_roots"
+    )
+}
+
+fn replace_path_value(value: &mut Value, from: &str, to: &str) {
     match value {
         Value::String(text) => *text = text.replace(from, to),
         Value::Array(items) => items
             .iter_mut()
-            .for_each(|item| replace_value(item, from, to)),
-        Value::Object(items) => items
-            .values_mut()
-            .for_each(|item| replace_value(item, from, to)),
+            .for_each(|item| replace_path_value(item, from, to)),
+        Value::Object(items) => items.iter_mut().for_each(|(name, item)| {
+            if is_path_field(name) {
+                replace_path_value(item, from, to);
+            }
+        }),
+        _ => {}
+    }
+}
+
+fn rewrite_path_fields(value: &mut Value, from: &str, to: &str) {
+    match value {
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| rewrite_path_fields(item, from, to)),
+        Value::Object(items) => items.iter_mut().for_each(|(name, item)| {
+            if is_path_field(name) {
+                replace_path_value(item, from, to);
+            } else {
+                rewrite_path_fields(item, from, to);
+            }
+        }),
         _ => {}
     }
 }
@@ -1591,10 +1668,10 @@ fn rewrite_session_cwd(contents: &str, from: &str, to: &str) -> String {
         .lines()
         .map(|line| match serde_json::from_str::<Value>(line) {
             Ok(mut value) => {
-                replace_value(&mut value, from, to);
-                serde_json::to_string(&value).unwrap_or_else(|_| line.replace(from, to))
+                rewrite_path_fields(&mut value, from, to);
+                serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
             }
-            Err(_) => line.replace(from, to),
+            Err(_) => line.to_string(),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1742,6 +1819,89 @@ fn backup_database(path: &Path, stamp: &str) -> Option<String> {
     let target = PathBuf::from(format!("{}.backup-{stamp}", path.display()));
     fs::copy(path, &target).ok()?;
     Some(target.to_string_lossy().to_string())
+}
+
+struct ImportTransaction {
+    backups: Vec<String>,
+    backed_paths: HashSet<PathBuf>,
+    created_files: Vec<PathBuf>,
+    state_files: Vec<(PathBuf, bool)>,
+    committed: bool,
+}
+
+impl ImportTransaction {
+    fn new(home: &Path) -> Self {
+        let state_files = [
+            home.join("session_index.jsonl"),
+            home.join("state_5.sqlite"),
+            home.join("sqlite").join("codex-dev.db"),
+            home.join(".codex-global-state.json"),
+        ]
+        .into_iter()
+        .map(|path| {
+            let exists = path.exists();
+            (path, exists)
+        })
+        .collect();
+        Self {
+            backups: Vec::new(),
+            backed_paths: HashSet::new(),
+            created_files: Vec::new(),
+            state_files,
+            committed: false,
+        }
+    }
+
+    fn backup(&mut self, path: &Path, stamp: &str) -> Result<(), String> {
+        if !path.exists() || !self.backed_paths.insert(path.to_path_buf()) {
+            return Ok(());
+        }
+        let target = PathBuf::from(format!("{}.backup-{stamp}", path.display()));
+        fs::copy(path, &target).map_err(|error| format!("无法备份 {}: {error}", path.display()))?;
+        self.backups.push(target.to_string_lossy().to_string());
+        Ok(())
+    }
+
+    fn write_file(
+        &mut self,
+        path: &Path,
+        contents: impl AsRef<[u8]>,
+        stamp: &str,
+    ) -> Result<(), String> {
+        let existed = path.exists();
+        self.backup(path, stamp)?;
+        if !existed {
+            self.created_files.push(path.to_path_buf());
+        }
+        fs::write(path, contents).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn commit(mut self) -> Vec<String> {
+        self.committed = true;
+        std::mem::take(&mut self.backups)
+    }
+}
+
+impl Drop for ImportTransaction {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for path in self.created_files.iter().rev() {
+            fs::remove_file(path).ok();
+        }
+        for backup in self.backups.iter().rev() {
+            if let Some((original, _)) = backup.rsplit_once(".backup-") {
+                fs::copy(backup, original).ok();
+            }
+        }
+        for (path, existed) in &self.state_files {
+            if !existed {
+                fs::remove_file(path).ok();
+            }
+        }
+    }
 }
 
 fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
@@ -2208,10 +2368,10 @@ fn import_archive(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+    let mut transaction = ImportTransaction::new(&home);
     let mut imported = Vec::new();
     let mut restored = Vec::new();
     let mut skipped = Vec::new();
-    let mut backups = Vec::new();
     for entry in manifest.tasks {
         let mut archive_task = entry.task;
         let mut content = String::new();
@@ -2278,9 +2438,7 @@ fn import_archive(
                 }
                 if cwd_changed || normalize_existing {
                     if let Ok(mut contents) = fs::read_to_string(&task.file_path) {
-                        if let Some(backup) = backup_database(&task.file_path, &stamp) {
-                            backups.push(backup);
-                        }
+                        transaction.backup(&task.file_path, &stamp)?;
                         if cwd_changed {
                             contents = rewrite_session_cwd(&contents, &original_cwd, &task.cwd);
                             contents = rewrite_session_meta_cwd(&contents, &task.cwd);
@@ -2288,7 +2446,7 @@ fn import_archive(
                         if normalize_existing {
                             contents = rewrite_session_model_context(&contents, &model_settings);
                         }
-                        fs::write(&task.file_path, contents).map_err(|error| error.to_string())?;
+                        transaction.write_file(&task.file_path, contents, &stamp)?;
                     }
                 }
                 ensure_project_directory(&task.cwd)?;
@@ -2338,20 +2496,18 @@ fn import_archive(
             session_content = rewrite_session_model_context(&session_content, &model_settings);
             normalize_task_to_codex_model(&mut task, &model_settings);
         }
-        fs::write(&rollout_path, session_content).map_err(|error| error.to_string())?;
+        transaction.write_file(&rollout_path, session_content, &stamp)?;
         if let Some(browser_file) = entry.browser_file {
             let mut contents = Vec::new();
             zip.by_name(&browser_file)
                 .map_err(|_| "压缩包缺少浏览器配置".to_string())?
                 .read_to_end(&mut contents)
                 .map_err(|error| error.to_string())?;
-            fs::write(
-                home.join("browser")
-                    .join("sessions")
-                    .join(format!("{}.toml", task.id)),
-                contents,
-            )
-            .map_err(|error| error.to_string())?;
+            let browser_path = home
+                .join("browser")
+                .join("sessions")
+                .join(format!("{}.toml", task.id));
+            transaction.write_file(&browser_path, contents, &stamp)?;
         }
         task.cwd = if local_cwd.is_empty() {
             dirs::home_dir()
@@ -2384,19 +2540,15 @@ fn import_archive(
         imported.push(task);
     }
     if imported.is_empty() && restored.is_empty() {
+        let backups = transaction.commit();
         return Ok(
-            serde_json::json!({"imported": [], "restored": [], "skipped": skipped, "backups": [], "codexHome": home}),
+            serde_json::json!({"imported": [], "restored": [], "skipped": skipped, "backups": backups, "codexHome": home}),
         );
     }
-    backups.extend(
-        [
-            backup_database(&home.join("state_5.sqlite"), &stamp),
-            backup_database(&home.join("sqlite").join("codex-dev.db"), &stamp),
-            backup_database(&home.join(".codex-global-state.json"), &stamp),
-        ]
-        .into_iter()
-        .flatten(),
-    );
+    transaction.backup(&home.join("session_index.jsonl"), &stamp)?;
+    transaction.backup(&home.join("state_5.sqlite"), &stamp)?;
+    transaction.backup(&home.join("sqlite").join("codex-dev.db"), &stamp)?;
+    transaction.backup(&home.join(".codex-global-state.json"), &stamp)?;
     let registered = imported
         .iter()
         .chain(restored.iter())
@@ -2406,6 +2558,7 @@ fn import_archive(
     register_threads(&home, &registered)?;
     register_catalog_threads(&home, &registered)?;
     register_desktop_project_state(&home, &registered)?;
+    let backups = transaction.commit();
     Ok(
         serde_json::json!({"imported": imported.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "restored": restored.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "skipped": skipped, "backups": backups, "codexHome": home}),
     )
@@ -2443,18 +2596,152 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        infer_project, register_threads, repository_name, rewrite_session_cwd,
-        rewrite_session_model_context, session_details, sort_tasks_by_project_order,
-        CodexModelSettings, Task,
+        archive_manifest, infer_project, is_codex_context_text, is_safe_task_id, register_threads,
+        repository_name, rewrite_session_cwd, rewrite_session_model_context, session_details,
+        sort_tasks_by_project_order, ArchiveTask, CodexModelSettings, ImportTransaction, Manifest,
+        Task, ARCHIVE_SCHEMA,
     };
     use rusqlite::Connection;
     use serde_json::Value;
-    use std::{env, fs, path::PathBuf};
+    use std::{env, fs, io::Write, path::PathBuf};
+    use zip::{write::SimpleFileOptions, ZipWriter};
 
     #[test]
-    fn rewrite_session_cwd_updates_nested_json() {
-        let source = "{\"payload\":{\"cwd\":\"/old\",\"values\":[\"/old/file\"]}}\n";
-        assert!(rewrite_session_cwd(source, "/old", "/new").contains("/new/file"));
+    fn rewrite_session_cwd_only_updates_structured_path_fields() {
+        let source = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/old\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/old/work\",\"writable_roots\":[\"/old\",\"/other\"]}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Use /old/file in this command\"}}\n"
+        );
+        let rewritten = rewrite_session_cwd(source, "/old", "/new");
+        let lines = rewritten
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines[0]["payload"]["cwd"].as_str(), Some("/new"));
+        assert_eq!(lines[1]["payload"]["cwd"].as_str(), Some("/new/work"));
+        assert_eq!(
+            lines[1]["payload"]["writable_roots"][0].as_str(),
+            Some("/new")
+        );
+        assert_eq!(
+            lines[2]["payload"]["message"].as_str(),
+            Some("Use /old/file in this command")
+        );
+    }
+
+    #[test]
+    fn context_title_filter_keeps_normal_messages_that_mention_cwd() {
+        assert!(!is_codex_context_text("请解释 <cwd> 在命令行里代表什么"));
+        assert!(is_codex_context_text(
+            "<environment_context> <cwd>/tmp/project</cwd> </environment_context>"
+        ));
+    }
+
+    #[test]
+    fn archive_manifest_rejects_missing_declared_browser_file() {
+        let path = env::temp_dir().join(format!(
+            "codex-session-transfer-missing-browser-{}.zip",
+            std::process::id()
+        ));
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let mut task = task_with("测试任务", "/tmp/project", "");
+        task.id = "missing-browser-task".to_string();
+        let manifest = Manifest {
+            schema: ARCHIVE_SCHEMA.to_string(),
+            created_at: "2026-07-22T12:00:00Z".to_string(),
+            source_platform: "macos".to_string(),
+            tasks: vec![ArchiveTask {
+                task,
+                session_file: "tasks/missing-browser-task/session.jsonl".to_string(),
+                browser_file: Some("tasks/missing-browser-task/browser.toml".to_string()),
+            }],
+        };
+        zip.start_file("manifest.json", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(serde_json::to_string(&manifest).unwrap().as_bytes())
+            .unwrap();
+        zip.start_file(
+            "tasks/missing-browser-task/session.jsonl",
+            SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(b"{}\n").unwrap();
+        zip.finish().unwrap();
+
+        let result = archive_manifest(&path);
+        fs::remove_file(path).ok();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn archive_manifest_rejects_session_id_mismatch() {
+        let path = env::temp_dir().join(format!(
+            "codex-session-transfer-id-mismatch-{}.zip",
+            std::process::id()
+        ));
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let mut task = task_with("测试任务", "/tmp/project", "");
+        task.id = "manifest-task-id".to_string();
+        let manifest = Manifest {
+            schema: ARCHIVE_SCHEMA.to_string(),
+            created_at: "2026-07-22T12:00:00Z".to_string(),
+            source_platform: "macos".to_string(),
+            tasks: vec![ArchiveTask {
+                task,
+                session_file: "tasks/manifest-task-id/session.jsonl".to_string(),
+                browser_file: None,
+            }],
+        };
+        zip.start_file("manifest.json", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(serde_json::to_string(&manifest).unwrap().as_bytes())
+            .unwrap();
+        zip.start_file(
+            "tasks/manifest-task-id/session.jsonl",
+            SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(br#"{"type":"session_meta","payload":{"id":"session-task-id"}}"#)
+            .unwrap();
+        zip.finish().unwrap();
+
+        let result = archive_manifest(&path);
+        fs::remove_file(path).ok();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn safe_task_ids_reject_path_separators() {
+        assert!(is_safe_task_id("019f5acb-2182-70e3-832f-36994b7d12b"));
+        assert!(!is_safe_task_id("task/../../outside"));
+        assert!(!is_safe_task_id(r"task\\outside"));
+    }
+
+    #[test]
+    fn import_transaction_restores_changed_files_and_removes_new_files() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-transaction-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        let existing = home.join("session_index.jsonl");
+        let created = home.join("new-session.jsonl");
+        fs::write(&existing, "before").unwrap();
+        {
+            let mut transaction = ImportTransaction::new(&home);
+            transaction.write_file(&existing, "after", "test").unwrap();
+            transaction.write_file(&created, "new", "test").unwrap();
+        }
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "before");
+        assert!(!created.exists());
+        fs::remove_dir_all(&home).ok();
     }
 
     #[test]

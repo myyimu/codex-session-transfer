@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "codex-session-transfer"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "chrono",
  "dirs",
