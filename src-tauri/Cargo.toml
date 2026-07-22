@@ -1,6 +1,6 @@
 [package]
 name = "codex-session-transfer"
-version = "0.1.13"
+version = "0.1.14"
 description = "Portable Codex session export and import utility"
 authors = ["yimu"]
 edition = "2021"

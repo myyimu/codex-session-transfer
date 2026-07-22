@@ -861,9 +861,9 @@ fn read_desktop_project_state(home: &Path) -> Option<DesktopProjectState> {
 }
 
 fn path_name(path: &str) -> String {
-    Path::new(path.trim_end_matches(['/', '\\']))
-        .file_name()
-        .and_then(|value| value.to_str())
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
         .unwrap_or_default()
         .to_string()
 }
@@ -1471,21 +1471,33 @@ fn resolve_local_cwd(cwd: &str) -> String {
     if cwd.is_empty() || Path::new(cwd).exists() {
         return cwd.to_string();
     }
-    let name = Path::new(cwd.trim_end_matches(['/', '\\']))
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
+    let name = path_name(cwd);
     let home = dirs::home_dir().unwrap_or_default();
     for candidate in [
-        home.join("work").join(name),
-        home.join("Projects").join(name),
-        home.join("Documents").join(name),
+        home.join("work").join(&name),
+        home.join("Projects").join(&name),
+        home.join("Documents").join(&name),
     ] {
         if candidate.exists() {
             return candidate.to_string_lossy().to_string();
         }
     }
     cwd.to_string()
+}
+
+fn ensure_project_directory(cwd: &str) -> Result<(), String> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return Ok(());
+    }
+    let path = Path::new(cwd);
+    if path.exists() {
+        if path.is_dir() {
+            return Ok(());
+        }
+        return Err(format!("项目路径已存在但不是文件夹：{cwd}"));
+    }
+    fs::create_dir_all(path).map_err(|error| format!("无法创建项目文件夹 {cwd}: {error}"))
 }
 
 fn replace_value(value: &mut Value, from: &str, to: &str) {
@@ -1915,6 +1927,7 @@ fn restore_local_tasks(task_ids: Vec<String>) -> Result<serde_json::Value, Strin
     }
     for task in &mut selected {
         task.archived = false;
+        ensure_project_directory(&task.cwd)?;
         if task.updated_at.is_empty() {
             task.updated_at = Utc::now().to_rfc3339();
         }
@@ -2079,6 +2092,7 @@ fn import_archive(
                         task.cwd = cwd.to_string();
                     }
                 }
+                ensure_project_directory(&task.cwd)?;
                 task.archived = false;
                 (
                     task.project_key,
@@ -2116,6 +2130,7 @@ fn import_archive(
         } else {
             task.cwd.clone()
         };
+        ensure_project_directory(&local_cwd)?;
         let mut session_content = rewrite_session_cwd(&content, &task.cwd, &local_cwd);
         if target_cwd.is_some() {
             session_content = rewrite_session_meta_cwd(&session_content, &local_cwd);
@@ -2465,6 +2480,30 @@ mod tests {
             repository_name("git@github.com:myyimu/ai-novel-diagnosis.git"),
             "ai-novel-diagnosis"
         );
+    }
+
+    #[test]
+    fn path_name_handles_windows_separators() {
+        assert_eq!(
+            super::path_name(r"E:\github项目集合\codex-session-transfer"),
+            "codex-session-transfer"
+        );
+    }
+
+    #[test]
+    fn ensure_project_directory_creates_missing_folder() {
+        let path = env::temp_dir()
+            .join(format!(
+                "codex-session-transfer-project-{}",
+                std::process::id()
+            ))
+            .join("missing-project");
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        super::ensure_project_directory(&path.to_string_lossy()).unwrap();
+        assert!(path.is_dir());
+
+        fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
