@@ -147,6 +147,7 @@ struct ThreadProjectAssignment {
 struct DatabaseTask {
     title: String,
     cwd: String,
+    first_user_message: String,
     archived: bool,
     source: String,
     model_provider: String,
@@ -173,6 +174,7 @@ struct CodexModelSettings {
 #[derive(Clone, Debug, Default)]
 struct DesktopProjectState {
     projects: HashMap<String, DesktopProject>,
+    project_order: Vec<String>,
     assignments: HashMap<String, ThreadProjectAssignment>,
     client_threads: HashSet<String>,
 }
@@ -324,6 +326,41 @@ fn truncate(value: &str, limit: usize) -> String {
             .take(limit.saturating_sub(1))
             .collect::<String>()
     )
+}
+
+fn is_codex_context_text(value: &str) -> bool {
+    let value = clean_text(value);
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("<environment_context")
+        || lower.starts_with("<recommended_plugins")
+        || lower.contains("<cwd>")
+        || lower.contains("</cwd>")
+        || lower.contains("here is a list of plugins that are available")
+}
+
+fn is_bad_title(value: &str) -> bool {
+    let value = clean_text(value);
+    if value.is_empty() {
+        return true;
+    }
+    is_codex_context_text(&value)
+}
+
+fn meaningful_user_text(value: &str) -> Option<String> {
+    let value = clean_text(value);
+    if value.is_empty() || is_codex_context_text(&value) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn normalize_task_title(task: &mut Task) {
+    if is_bad_title(&task.title) {
+        task.title = meaningful_user_text(&task.first_user_message)
+            .map(|message| truncate(&message, 96))
+            .unwrap_or_default();
+    }
 }
 
 fn value_string(value: Option<&Value>) -> String {
@@ -630,11 +667,13 @@ fn session_details(path: &Path) -> Result<Task, String> {
         if role == Some("user")
             || payload.get("type").and_then(Value::as_str) == Some("user_message")
         {
-            task.user_message_count += 1;
-            if task.first_user_message.is_empty() {
-                task.first_user_message = clean_text(&text);
+            if let Some(text) = meaningful_user_text(&text) {
+                task.user_message_count += 1;
+                if task.first_user_message.is_empty() {
+                    task.first_user_message = text.clone();
+                }
+                task.preview = text;
             }
-            task.preview = clean_text(&text);
         }
     }
     task.updated_at = fs::metadata(path)
@@ -669,7 +708,7 @@ fn database_tasks(home: &Path) -> HashMap<String, DatabaseTask> {
         return result;
     };
     let Ok(mut statement) = connection.prepare(
-        "SELECT id, COALESCE(title, ''), COALESCE(cwd, ''), COALESCE(archived, 0), COALESCE(source, ''), COALESCE(model_provider, ''), COALESCE(model, ''), COALESCE(reasoning_effort, ''), COALESCE(sandbox_policy, ''), COALESCE(approval_mode, ''), COALESCE(cli_version, ''), COALESCE(thread_source, ''), COALESCE(agent_path, ''), COALESCE(agent_nickname, ''), COALESCE(agent_role, ''), COALESCE(memory_mode, ''), COALESCE(history_mode, '') FROM threads",
+        "SELECT id, COALESCE(title, ''), COALESCE(cwd, ''), COALESCE(first_user_message, ''), COALESCE(archived, 0), COALESCE(source, ''), COALESCE(model_provider, ''), COALESCE(model, ''), COALESCE(reasoning_effort, ''), COALESCE(sandbox_policy, ''), COALESCE(approval_mode, ''), COALESCE(cli_version, ''), COALESCE(thread_source, ''), COALESCE(agent_path, ''), COALESCE(agent_nickname, ''), COALESCE(agent_role, ''), COALESCE(memory_mode, ''), COALESCE(history_mode, '') FROM threads",
     ) else {
         return result;
     };
@@ -679,20 +718,21 @@ fn database_tasks(home: &Path) -> HashMap<String, DatabaseTask> {
             DatabaseTask {
                 title: row.get::<_, String>(1)?,
                 cwd: row.get::<_, String>(2)?,
-                archived: row.get::<_, bool>(3)?,
-                source: row.get::<_, String>(4)?,
-                model_provider: row.get::<_, String>(5)?,
-                model: row.get::<_, String>(6)?,
-                reasoning_effort: row.get::<_, String>(7)?,
-                sandbox_policy: row.get::<_, String>(8)?,
-                approval_mode: row.get::<_, String>(9)?,
-                cli_version: row.get::<_, String>(10)?,
-                thread_source: row.get::<_, String>(11)?,
-                agent_path: row.get::<_, String>(12)?,
-                agent_nickname: row.get::<_, String>(13)?,
-                agent_role: row.get::<_, String>(14)?,
-                memory_mode: row.get::<_, String>(15)?,
-                history_mode: row.get::<_, String>(16)?,
+                first_user_message: row.get::<_, String>(3)?,
+                archived: row.get::<_, bool>(4)?,
+                source: row.get::<_, String>(5)?,
+                model_provider: row.get::<_, String>(6)?,
+                model: row.get::<_, String>(7)?,
+                reasoning_effort: row.get::<_, String>(8)?,
+                sandbox_policy: row.get::<_, String>(9)?,
+                approval_mode: row.get::<_, String>(10)?,
+                cli_version: row.get::<_, String>(11)?,
+                thread_source: row.get::<_, String>(12)?,
+                agent_path: row.get::<_, String>(13)?,
+                agent_nickname: row.get::<_, String>(14)?,
+                agent_role: row.get::<_, String>(15)?,
+                memory_mode: row.get::<_, String>(16)?,
+                history_mode: row.get::<_, String>(17)?,
             },
         ))
     }) else {
@@ -799,6 +839,7 @@ fn read_desktop_project_state(home: &Path) -> Option<DesktopProjectState> {
         nested_state?
     };
     let mut result = DesktopProjectState::default();
+    result.project_order = value_array_strings(state.get("project-order"));
     let pinned_ids = value_array_strings(state.get("pinned-project-ids"))
         .into_iter()
         .collect::<HashSet<_>>();
@@ -1056,6 +1097,20 @@ fn push_unique_string(items: &mut Vec<Value>, value: &str) {
     }
 }
 
+fn sort_tasks_by_project_order(tasks: &mut [Task], project_order: &[String]) {
+    let positions = project_order
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    tasks.sort_by_key(|task| {
+        positions
+            .get(task.project_key.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+}
+
 fn client_thread_state_key(thread_id: &str) -> String {
     format!("thread-client-id-v1:local%3A{thread_id}")
 }
@@ -1113,6 +1168,7 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
                 .unwrap_or_else(|| vec![cwd.clone()]);
             (project_id, project_name, project_roots)
         };
+        let project_already_exists = existing_state.projects.contains_key(&project_id);
 
         let root = object_mut(&mut value);
         let persisted = if use_root {
@@ -1161,6 +1217,15 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
                 .or_insert_with(|| Value::Array(Vec::new())),
         );
         push_unique_string(project_order, &project_id);
+
+        if task.project_pinned && !project_already_exists {
+            let pinned_projects = array_mut(
+                persisted
+                    .entry("pinned-project-ids")
+                    .or_insert_with(|| Value::Array(Vec::new())),
+            );
+            push_unique_string(pinned_projects, &project_id);
+        }
 
         let active_roots = array_mut(
             persisted
@@ -1298,16 +1363,17 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
         task.title = indexed
             .and_then(|item| item.get("thread_name"))
             .and_then(Value::as_str)
-            .filter(|title| !title.is_empty())
+            .filter(|title| !is_bad_title(title))
             .map(str::to_string)
             .or_else(|| {
                 catalog_task
-                    .filter(|item| !item.0.is_empty())
+                    .filter(|item| !is_bad_title(&item.0))
                     .map(|item| item.0.clone())
             })
             .or_else(|| database_task.map(|item| item.title.clone()))
-            .filter(|title| !title.is_empty())
+            .filter(|title| !is_bad_title(title))
             .unwrap_or_else(|| truncate(&task.first_user_message, 96));
+        normalize_task_title(&mut task);
         if task.title.is_empty() {
             task.title = format!("未命名任务 {}", &task.id[..task.id.len().min(8)]);
         }
@@ -1473,14 +1539,18 @@ fn resolve_local_cwd(cwd: &str) -> String {
     }
     let name = path_name(cwd);
     let home = dirs::home_dir().unwrap_or_default();
+    let fallback = home.join("work").join(&name);
     for candidate in [
-        home.join("work").join(&name),
+        fallback.clone(),
         home.join("Projects").join(&name),
         home.join("Documents").join(&name),
     ] {
         if candidate.exists() {
             return candidate.to_string_lossy().to_string();
         }
+    }
+    if !name.is_empty() {
+        return fallback.to_string_lossy().to_string();
     }
     cwd.to_string()
 }
@@ -1840,6 +1910,105 @@ fn register_catalog_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
     Ok(())
 }
 
+fn rewrite_index_titles(home: &Path, tasks: &[Task]) -> Result<(), String> {
+    let path = home.join("session_index.jsonl");
+    if !path.exists() {
+        return Ok(());
+    }
+    let titles = tasks
+        .iter()
+        .map(|task| (task.id.clone(), task.title.clone()))
+        .collect::<HashMap<_, _>>();
+    let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+            lines.push(line.to_string());
+            continue;
+        };
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            if let Some(title) = titles.get(id) {
+                if !title.trim().is_empty() {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("thread_name".to_string(), Value::String(title.clone()));
+                    }
+                }
+            }
+        }
+        lines.push(serde_json::to_string(&value).unwrap_or_else(|_| line.to_string()));
+    }
+    fs::write(path, format!("{}\n", lines.join("\n"))).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn repair_bad_titles() -> Result<serde_json::Value, String> {
+    if is_codex_desktop_running() {
+        return Err("检测到 Codex/ChatGPT 桌面端正在运行。请先完全退出 Codex，再修复异常标题，避免运行中的客户端覆盖修复结果。".to_string());
+    }
+    let home = codex_home();
+    let index = read_index(&home);
+    let database = database_tasks(&home);
+    let catalog = catalog_tasks(&home);
+    let mut affected_ids = HashSet::new();
+    for (id, item) in &index {
+        if item
+            .get("thread_name")
+            .and_then(Value::as_str)
+            .is_some_and(is_bad_title)
+        {
+            affected_ids.insert(id.clone());
+        }
+    }
+    for (id, task) in &database {
+        if is_bad_title(&task.title) || is_codex_context_text(&task.first_user_message) {
+            affected_ids.insert(id.clone());
+        }
+    }
+    if let Some(catalog) = &catalog {
+        for (id, item) in catalog {
+            if is_bad_title(&item.0) {
+                affected_ids.insert(id.clone());
+            }
+        }
+    }
+
+    let mut tasks = list_local_tasks()?;
+    for task in &mut tasks {
+        normalize_task_title(task);
+        if task.title.is_empty() {
+            task.title = format!("未命名任务 {}", &task.id[..task.id.len().min(8)]);
+        }
+    }
+    let selected = tasks
+        .into_iter()
+        .filter(|task| affected_ids.contains(&task.id) && !task.title.trim().is_empty())
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Ok(
+            serde_json::json!({"repaired": [], "count": 0, "backups": [], "codexHome": home}),
+        );
+    }
+
+    let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+    let backups = [
+        backup_database(&home.join("session_index.jsonl"), &stamp),
+        backup_database(&home.join("state_5.sqlite"), &stamp),
+        backup_database(&home.join("sqlite").join("codex-dev.db"), &stamp),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    rewrite_index_titles(&home, &selected)?;
+    register_threads(&home, &selected)?;
+    register_catalog_threads(&home, &selected)?;
+    Ok(serde_json::json!({
+        "count": selected.len(),
+        "repaired": selected.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd})).collect::<Vec<_>>(),
+        "backups": backups,
+        "codexHome": home
+    }))
+}
+
 #[tauri::command]
 fn list_tasks() -> Result<TaskList, String> {
     let home = codex_home();
@@ -1852,12 +2021,15 @@ fn list_tasks() -> Result<TaskList, String> {
 #[tauri::command]
 fn export_tasks(task_ids: Vec<String>, destination: String) -> Result<serde_json::Value, String> {
     let requested: HashSet<_> = task_ids.into_iter().collect();
-    let selected: Vec<_> = list_local_tasks()?
+    let mut selected: Vec<_> = list_local_tasks()?
         .into_iter()
         .filter(|task| requested.contains(&task.id))
         .collect();
     if selected.is_empty() {
         return Err("请至少选择一个任务".to_string());
+    }
+    if let Some(state) = read_desktop_project_state(&codex_home()) {
+        sort_tasks_by_project_order(&mut selected, &state.project_order);
     }
     let destination = PathBuf::from(destination);
     if let Some(parent) = destination.parent() {
@@ -1937,6 +2109,10 @@ fn restore_local_tasks(task_ids: Vec<String>) -> Result<serde_json::Value, Strin
         if task.title.is_empty() {
             task.title = truncate(&task.first_user_message, 96);
         }
+        normalize_task_title(task);
+        if task.title.is_empty() {
+            task.title = format!("未命名任务 {}", &task.id[..task.id.len().min(8)]);
+        }
     }
     let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
     let backups = [
@@ -1980,6 +2156,10 @@ fn inspect_archive(archive_path: String) -> Result<ArchiveInspection, String> {
                     if file.read_to_string(&mut contents).is_ok() {
                         hydrate_task_from_session_content(&mut task, &contents);
                     }
+                }
+                normalize_task_title(&mut task);
+                if task.title.is_empty() {
+                    task.title = format!("未命名任务 {}", &task.id[..task.id.len().min(8)]);
                 }
                 if task.model_provider.trim() == "custom" {
                     normalize_task_to_codex_model(&mut task, &model_settings);
@@ -2040,6 +2220,7 @@ fn import_archive(
             .read_to_string(&mut content)
             .map_err(|error| error.to_string())?;
         hydrate_task_from_session_content(&mut archive_task, &content);
+        normalize_task_title(&mut archive_task);
         let normalize_to_codex = archive_task.model_provider.trim() == "custom";
         if normalize_to_codex {
             normalize_task_to_codex_model(&mut archive_task, &model_settings);
@@ -2050,14 +2231,19 @@ fn import_archive(
                 let mut task = existing_task.clone();
                 let normalize_existing =
                     normalize_to_codex || task.model_provider.trim() == "custom";
-                if task.title.is_empty() {
-                    task.title = archive_task.title;
+                let original_cwd = task.cwd.clone();
+                if is_bad_title(&task.title) && !is_bad_title(&archive_task.title) {
+                    task.title = archive_task.title.clone();
                 }
-                if task.first_user_message.is_empty() {
-                    task.first_user_message = archive_task.first_user_message;
+                if meaningful_user_text(&task.first_user_message).is_none()
+                    && meaningful_user_text(&archive_task.first_user_message).is_some()
+                {
+                    task.first_user_message = archive_task.first_user_message.clone();
                 }
-                if task.preview.is_empty() {
-                    task.preview = archive_task.preview;
+                if meaningful_user_text(&task.preview).is_none()
+                    && meaningful_user_text(&archive_task.preview).is_some()
+                {
+                    task.preview = archive_task.preview.clone();
                 }
                 replace_if_present(&mut task.source, &archive_task.source);
                 replace_if_present(&mut task.model_provider, &archive_task.model_provider);
@@ -2075,21 +2261,34 @@ fn import_archive(
                 if normalize_existing {
                     normalize_task_to_codex_model(&mut task, &model_settings);
                 }
-                if target_cwd.is_some() || normalize_existing {
+                normalize_task_title(&mut task);
+                let resolved_cwd = target_cwd
+                    .as_deref()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        if adapt_paths {
+                            resolve_local_cwd(&task.cwd)
+                        } else {
+                            task.cwd.clone()
+                        }
+                    });
+                let cwd_changed = resolved_cwd != task.cwd;
+                if cwd_changed {
+                    task.cwd = resolved_cwd;
+                }
+                if cwd_changed || normalize_existing {
                     if let Ok(mut contents) = fs::read_to_string(&task.file_path) {
                         if let Some(backup) = backup_database(&task.file_path, &stamp) {
                             backups.push(backup);
                         }
-                        if let Some(cwd) = target_cwd.as_deref() {
-                            contents = rewrite_session_meta_cwd(&contents, cwd);
+                        if cwd_changed {
+                            contents = rewrite_session_cwd(&contents, &original_cwd, &task.cwd);
+                            contents = rewrite_session_meta_cwd(&contents, &task.cwd);
                         }
                         if normalize_existing {
                             contents = rewrite_session_model_context(&contents, &model_settings);
                         }
                         fs::write(&task.file_path, contents).map_err(|error| error.to_string())?;
-                    }
-                    if let Some(cwd) = target_cwd.as_deref() {
-                        task.cwd = cwd.to_string();
                     }
                 }
                 ensure_project_directory(&task.cwd)?;
@@ -2172,6 +2371,10 @@ fn import_archive(
         if task.title.is_empty() {
             task.title = truncate(&task.first_user_message, 96);
         }
+        normalize_task_title(&mut task);
+        if task.title.is_empty() {
+            task.title = format!("未命名任务 {}", &task.id[..task.id.len().min(8)]);
+        }
         (
             task.project_key,
             task.project_name,
@@ -2228,6 +2431,7 @@ pub fn run() {
             list_tasks,
             export_tasks,
             restore_local_tasks,
+            repair_bad_titles,
             inspect_archive,
             import_archive,
             get_environment
@@ -2240,7 +2444,8 @@ pub fn run() {
 mod tests {
     use super::{
         infer_project, register_threads, repository_name, rewrite_session_cwd,
-        rewrite_session_model_context, session_details, CodexModelSettings, Task,
+        rewrite_session_model_context, session_details, sort_tasks_by_project_order,
+        CodexModelSettings, Task,
     };
     use rusqlite::Connection;
     use serde_json::Value;
@@ -2491,6 +2696,33 @@ mod tests {
     }
 
     #[test]
+    fn sort_tasks_by_project_order_keeps_source_sidebar_order() {
+        let mut first = task_with("first", "/tmp/first", "");
+        first.id = "first-task".to_string();
+        first.project_key = "project-first".to_string();
+        let mut second = task_with("second", "/tmp/second", "");
+        second.id = "second-task".to_string();
+        second.project_key = "project-second".to_string();
+        let mut another_second = task_with("another", "/tmp/second", "");
+        another_second.id = "another-second-task".to_string();
+        another_second.project_key = "project-second".to_string();
+        let mut tasks = vec![first, second, another_second];
+
+        sort_tasks_by_project_order(
+            &mut tasks,
+            &["project-second".to_string(), "project-first".to_string()],
+        );
+
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second-task", "another-second-task", "first-task"]
+        );
+    }
+
+    #[test]
     fn ensure_project_directory_creates_missing_folder() {
         let path = env::temp_dir()
             .join(format!(
@@ -2504,6 +2736,39 @@ mod tests {
         assert!(path.is_dir());
 
         fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn resolve_local_cwd_falls_back_to_home_work_for_missing_path() {
+        let name = format!("codex-session-transfer-missing-{}", std::process::id());
+        let original = format!(r"Z:\old-drive\{name}");
+        let resolved = super::resolve_local_cwd(&original);
+
+        assert_ne!(resolved, original);
+        assert!(
+            resolved.ends_with(&format!("work/{name}"))
+                || resolved.ends_with(&format!(r"work\{name}"))
+        );
+    }
+
+    #[test]
+    fn session_details_ignores_codex_context_as_user_title_seed() {
+        let path = env::temp_dir().join(format!(
+            "codex-session-transfer-context-title-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"context-title-task","timestamp":"2026-07-22T12:00:00Z","cwd":"E:\\github项目集合","source":"vscode"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"<environment_context> <cwd>E:\\github项目集合</cwd> <shell>powershell</shell> </environment_context>"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"请帮我检查项目导入逻辑"}}"#,
+        )
+        .unwrap();
+        let task = session_details(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(task.first_user_message, "请帮我检查项目导入逻辑");
+        assert!(!task.first_user_message.contains("<cwd>"));
     }
 
     #[test]

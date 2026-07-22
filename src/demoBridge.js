@@ -44,6 +44,15 @@ export const demoBridge = {
       codexHome: "/Users/yimu/.codex",
     };
   },
+  async repairBadTitles() {
+    await new Promise((resolve) => setTimeout(resolve, 520));
+    return {
+      count: 2,
+      repaired: demoTasks.slice(0, 2),
+      backups: ["state_5.sqlite.backup-demo", "codex-dev.db.backup-demo"],
+      codexHome: "/Users/yimu/.codex",
+    };
+  },
   async chooseArchive() {
     await new Promise((resolve) => setTimeout(resolve, 280));
     archive = {

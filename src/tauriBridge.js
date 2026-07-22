@@ -17,6 +17,7 @@ export const tauriBridge = {
     return destination ? invoke("export_tasks", { taskIds, destination }) : canceled();
   },
   restoreLocalTasks: (taskIds) => invoke("restore_local_tasks", { taskIds }),
+  repairBadTitles: () => invoke("repair_bad_titles"),
   async chooseArchive() {
     const archivePath = await open({
       title: "选择 Codex 任务压缩包",

@@ -16,6 +16,7 @@ import {
   Path,
   ShieldCheck,
   TrayArrowDown,
+  Wrench,
   X,
 } from "@phosphor-icons/react";
 import { demoBridge } from "./demoBridge.js";
@@ -481,6 +482,21 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
     }
   };
 
+  const repairBadTitles = async () => {
+    setOperation("repair");
+    try {
+      const result = await bridge.repairBadTitles();
+      const count = result.count || 0;
+      showToast("success", count ? `已修复 ${count} 个异常标题` : "没有发现异常标题", result.codexHome);
+      await load();
+      refreshEnvironment?.();
+    } catch (error) {
+      showToast("error", "修复失败", error.message);
+    } finally {
+      setOperation("");
+    }
+  };
+
   return (
     <section className="workspace" aria-labelledby="export-title">
       <header className="workspace-header">
@@ -545,6 +561,15 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
           >
             <ArrowClockwise size={18} weight="bold" />
             {operation === "restore" ? "正在恢复…" : "恢复到 Codex"}
+          </button>
+          <button
+            className="secondary-button"
+            disabled={operation || codexRunning}
+            onClick={repairBadTitles}
+            title={codexRunning ? "请先完全退出 Codex，再修复异常标题" : "扫描并修复已经写入 Codex 的异常会话标题"}
+          >
+            <Wrench size={18} weight="bold" />
+            {operation === "repair" ? "正在修复…" : "修复异常标题"}
           </button>
         </div>
       </footer>
