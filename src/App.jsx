@@ -401,6 +401,7 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
   const [selected, setSelected] = useState(new Set());
   const [loading, setLoading] = useState(true);
   const [operation, setOperation] = useState("");
+  const [badTitleCount, setBadTitleCount] = useState(0);
   const codexRunning = Boolean(environment?.codexRunning);
 
   const load = async () => {
@@ -408,6 +409,7 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
     try {
       const result = await bridge.listTasks();
       setTasks(result.tasks || []);
+      setBadTitleCount(result.badTitleCount || 0);
     } catch (error) {
       showToast("error", "读取失败", error.message);
     } finally {
@@ -562,15 +564,17 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
             <ArrowClockwise size={18} weight="bold" />
             {operation === "restore" ? "正在恢复…" : "恢复到 Codex"}
           </button>
-          <button
-            className="secondary-button"
-            disabled={operation || codexRunning}
-            onClick={repairBadTitles}
-            title={codexRunning ? "请先完全退出 Codex，再修复异常标题" : "扫描并修复已经写入 Codex 的异常会话标题"}
-          >
-            <Wrench size={18} weight="bold" />
-            {operation === "repair" ? "正在修复…" : "修复异常标题"}
-          </button>
+          {badTitleCount > 0 && (
+            <button
+              className="secondary-button"
+              disabled={operation || codexRunning}
+              onClick={repairBadTitles}
+              title={codexRunning ? "请先完全退出 Codex，再修复异常标题" : `检测到 ${badTitleCount} 个异常标题，可从本地会话内容重新修复`}
+            >
+              <Wrench size={18} weight="bold" />
+              {operation === "repair" ? "正在修复…" : `修复异常标题${badTitleCount > 1 ? ` (${badTitleCount})` : ""}`}
+            </button>
+          )}
         </div>
       </footer>
     </section>

@@ -102,6 +102,7 @@ struct Manifest {
 struct TaskList {
     tasks: Vec<Task>,
     codex_home: String,
+    bad_title_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -2100,15 +2101,10 @@ fn rewrite_index_titles(home: &Path, tasks: &[Task]) -> Result<(), String> {
     fs::write(path, format!("{}\n", lines.join("\n"))).map_err(|error| error.to_string())
 }
 
-#[tauri::command]
-fn repair_bad_titles() -> Result<serde_json::Value, String> {
-    if is_codex_desktop_running() {
-        return Err("检测到 Codex/ChatGPT 桌面端正在运行。请先完全退出 Codex，再修复异常标题，避免运行中的客户端覆盖修复结果。".to_string());
-    }
-    let home = codex_home();
-    let index = read_index(&home);
-    let database = database_tasks(&home);
-    let catalog = catalog_tasks(&home);
+fn bad_title_ids(home: &Path) -> HashSet<String> {
+    let index = read_index(home);
+    let database = database_tasks(home);
+    let catalog = catalog_tasks(home);
     let mut affected_ids = HashSet::new();
     for (id, item) in &index {
         if item
@@ -2131,6 +2127,16 @@ fn repair_bad_titles() -> Result<serde_json::Value, String> {
             }
         }
     }
+    affected_ids
+}
+
+#[tauri::command]
+fn repair_bad_titles() -> Result<serde_json::Value, String> {
+    if is_codex_desktop_running() {
+        return Err("检测到 Codex/ChatGPT 桌面端正在运行。请先完全退出 Codex，再修复异常标题，避免运行中的客户端覆盖修复结果。".to_string());
+    }
+    let home = codex_home();
+    let affected_ids = bad_title_ids(&home);
 
     let mut tasks = list_local_tasks()?;
     for task in &mut tasks {
@@ -2172,8 +2178,14 @@ fn repair_bad_titles() -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn list_tasks() -> Result<TaskList, String> {
     let home = codex_home();
+    let tasks = list_local_tasks()?;
+    let affected_ids = bad_title_ids(&home);
     Ok(TaskList {
-        tasks: list_local_tasks()?,
+        bad_title_count: tasks
+            .iter()
+            .filter(|task| affected_ids.contains(&task.id))
+            .count(),
+        tasks,
         codex_home: home.to_string_lossy().to_string(),
     })
 }
