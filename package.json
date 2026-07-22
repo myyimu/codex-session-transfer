@@ -1,6 +1,6 @@
 {
   "name": "codex-session-transfer",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Local-first desktop utility for exporting, importing, syncing, and restoring selected Codex project task sessions across computers.",
   "author": "myyimu",
   "license": "MIT",
@@ -26,7 +26,7 @@
     "build:web": "vite build",
     "build": "tauri build",
     "build:mac": "bash scripts/package-mac.sh",
-    "build:win": "node scripts/build-windows.mjs",
+    "build:win": "node scripts/assert-windows.mjs && tauri build --bundles nsis && node scripts/package-windows.mjs",
     "preview": "vite preview",
     "test": "cargo test --manifest-path src-tauri/Cargo.toml",
     "check": "npm run test && npm run build:web"
