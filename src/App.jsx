@@ -152,9 +152,9 @@ function TaskRow({ task, selected, onToggle }) {
         <span className="task-title-line">
           <strong title={title}>{title}</strong>
           {task.archived && <span className="status-chip neutral" title="已归档">已归档</span>}
-          {projectMissing(task) && <span className="status-chip warning" title="项目路径不存在">项目路径不存在</span>}
+          {projectMissing(task) && <span className="status-chip warning" title="历史项目路径不存在；此项目未绑定本地文件夹">未绑定文件夹</span>}
           {taskHiddenInCodex(task) && <span className="status-chip warning" title="未在 Codex 侧栏显示">未在 Codex 侧栏显示</span>}
-          {model && <span className="status-chip neutral" title={model}>{model}</span>}
+          {model && <span className="status-chip neutral" title={`原会话模型：${model}`}>历史 {model}</span>}
         </span>
         <span className="task-meta">
           <span><Clock size={13} />{formatDate(task.updatedAt)}</span>
@@ -831,7 +831,7 @@ export function App() {
           <span className="online-dot" />
           <span>
             <strong title={environment?.demo ? "浏览器演示数据" : environment?.codexRunning ? "Codex 正在运行" : "可安全导入"}>{environment?.demo ? "浏览器演示数据" : environment?.codexRunning ? "Codex 正在运行" : "可安全导入"}</strong>
-            <small title={environment?.demo ? "真实测试请看桌面 app" : `v${environment?.version || "0.1.0"}`}>{environment?.demo ? "真实测试请看桌面 app" : `v${environment?.version || "0.1.0"}`}</small>
+            <small title={environment?.demo ? "真实测试请看桌面 app" : `当前配置：${environment?.activeModelProvider || "openai"} / ${environment?.activeModel || "未识别模型"}`}>{environment?.demo ? "真实测试请看桌面 app" : `${environment?.activeModelProvider || "openai"} / ${environment?.activeModel || "未识别模型"}`}</small>
           </span>
         </div>
       </aside>

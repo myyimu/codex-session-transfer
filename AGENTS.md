@@ -13,3 +13,6 @@ When implementing from a selected generated mock, treat that image as the source
 - Keep the visual language airy and restrained: white space, low-contrast watercolor texture, cyan for export, rose for import, and compact desktop-scale typography.
 - Export archives use the `codex-session-transfer/v1` manifest and remain standard ZIP files.
 - Imports are additive and idempotent. Existing task IDs are skipped; local Codex databases are backed up before registration.
+- API endpoint configuration is local runtime state: restored histories must adapt to the receiving Codex configuration, while the UI distinguishes current configuration from historical task metadata.
+- Read the active `model_provider` from `config.toml`; when absent, infer it from the newest local session's metadata, then rewrite restored sessions to that provider so they appear in the matching API or official sidebar.
+- When a historical project folder is missing, restore it as an unbound project; never create a placeholder folder or bind it to a same-named local folder.

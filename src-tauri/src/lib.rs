@@ -11,6 +11,8 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 use tauri::Manager;
 use walkdir::WalkDir;
@@ -195,9 +197,17 @@ fn codex_home() -> PathBuf {
 }
 
 fn simple_toml_string(contents: &str, key: &str) -> Option<String> {
+    let mut at_root = true;
     for line in contents.lines() {
         let line = line.trim();
-        if line.starts_with('#') || !line.starts_with(key) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            at_root = false;
+            continue;
+        }
+        if !at_root || !line.starts_with(key) {
             continue;
         }
         let Some((left, right)) = line.split_once('=') else {
@@ -206,7 +216,11 @@ fn simple_toml_string(contents: &str, key: &str) -> Option<String> {
         if left.trim() != key {
             continue;
         }
-        let value = right.trim().trim_matches('"').trim();
+        let value = toml_value_without_comment(right)
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim();
         if !value.is_empty() {
             return Some(value.to_string());
         }
@@ -214,54 +228,183 @@ fn simple_toml_string(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-fn model_exists_in_codex_cache(home: &Path, slug: &str) -> bool {
-    let Ok(contents) = fs::read_to_string(home.join("models_cache.json")) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&contents) else {
-        return false;
-    };
+fn toml_value_without_comment(value: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if let Some(active_quote) = quote {
+            if active_quote == '"' && character == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if character == active_quote && !escaped {
+                quote = None;
+            }
+            escaped = false;
+        } else if matches!(character, '"' | '\'') {
+            quote = Some(character);
+        } else if character == '#' {
+            return &value[..index];
+        }
+    }
     value
-        .get("models")
-        .and_then(Value::as_array)
-        .map(|models| {
-            models
-                .iter()
-                .any(|model| model.get("slug").and_then(Value::as_str) == Some(slug))
-        })
-        .unwrap_or(false)
 }
 
-fn latest_openai_model_from_database(home: &Path) -> Option<(String, String)> {
-    let connection = Connection::open_with_flags(
-        home.join("state_5.sqlite"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
-    connection
-        .query_row(
-            "SELECT COALESCE(model, ''), COALESCE(reasoning_effort, '') FROM threads WHERE model_provider = 'openai' AND COALESCE(model, '') != '' ORDER BY updated_at DESC LIMIT 1",
-            [],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .ok()
+fn latest_session_model_settings(home: &Path) -> Option<CodexModelSettings> {
+    let mut files = WalkDir::new(home.join("sessions"))
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("jsonl")
+        })
+        .map(|entry| entry.path().to_path_buf())
+        .collect::<Vec<_>>();
+    // Rollout filenames start with the creation time, so descending path order
+    // yields the newest session without being affected by restore file writes.
+    files.sort_unstable_by(|left, right| right.cmp(left));
+
+    for path in files {
+        let Ok(file) = File::open(path) else {
+            continue;
+        };
+        let mut settings = CodexModelSettings {
+            provider: String::new(),
+            model: String::new(),
+            reasoning_effort: String::new(),
+        };
+        for line in BufReader::new(file).lines().filter_map(Result::ok) {
+            let Ok(record) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let record_type = record.get("type").and_then(Value::as_str);
+            let payload = record.get("payload").unwrap_or(&Value::Null);
+            if record_type == Some("session_meta") {
+                set_if_empty(
+                    &mut settings.provider,
+                    payload.get("model_provider").and_then(Value::as_str),
+                );
+                set_if_empty(
+                    &mut settings.model,
+                    payload.get("model").and_then(Value::as_str),
+                );
+                set_if_empty(
+                    &mut settings.reasoning_effort,
+                    payload.get("reasoning_effort").and_then(Value::as_str),
+                );
+            }
+            if record_type == Some("turn_context") {
+                set_if_empty(
+                    &mut settings.model,
+                    payload.get("model").and_then(Value::as_str),
+                );
+                set_if_empty(
+                    &mut settings.reasoning_effort,
+                    payload
+                        .get("reasoning_effort")
+                        .and_then(Value::as_str)
+                        .or_else(|| payload.get("effort").and_then(Value::as_str)),
+                );
+            }
+            if payload.get("type").and_then(Value::as_str) == Some("thread_settings_applied") {
+                let thread_settings = payload.get("thread_settings").unwrap_or(&Value::Null);
+                let provider = thread_settings
+                    .get("model_provider_id")
+                    .or_else(|| thread_settings.get("model_provider"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let model = thread_settings
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let effort = thread_settings
+                    .get("reasoning_effort")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                // A provider switch is atomic: accepting only its provider would
+                // combine it with a model recorded under a different endpoint.
+                if let (Some(provider), Some(model)) = (provider, model) {
+                    settings.provider = provider.to_string();
+                    settings.model = model.to_string();
+                    replace_if_present(&mut settings.reasoning_effort, effort.unwrap_or_default());
+                } else if provider.is_none() {
+                    replace_if_present(&mut settings.model, model.unwrap_or_default());
+                    replace_if_present(&mut settings.reasoning_effort, effort.unwrap_or_default());
+                }
+            }
+        }
+        if !settings.provider.is_empty() && !settings.model.is_empty() {
+            return Some(settings);
+        }
+    }
+    None
+}
+
+fn cached_environment_model_settings(home: &Path) -> CodexModelSettings {
+    static CACHE: OnceLock<Mutex<Option<(PathBuf, Instant, CodexModelSettings)>>> = OnceLock::new();
+    const TTL: Duration = Duration::from_secs(10);
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_home, updated_at, settings)) = guard.as_ref() {
+            if cached_home == home && updated_at.elapsed() < TTL {
+                return settings.clone();
+            }
+        }
+    }
+    let settings = codex_model_settings(home);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((home.to_path_buf(), Instant::now(), settings.clone()));
+    }
+    settings
 }
 
 fn codex_model_settings(home: &Path) -> CodexModelSettings {
     let config = fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+    let config_provider = simple_toml_string(&config, "model_provider");
     let config_model = simple_toml_string(&config, "model");
     let config_effort = simple_toml_string(&config, "model_reasoning_effort");
-    let database_model = latest_openai_model_from_database(home);
-    let model = config_model
-        .filter(|model| model_exists_in_codex_cache(home, model))
-        .or_else(|| database_model.as_ref().map(|item| item.0.clone()))
-        .unwrap_or_else(|| "gpt-5.5".to_string());
-    let reasoning_effort = config_effort
-        .or_else(|| database_model.map(|item| item.1))
-        .filter(|effort| !effort.trim().is_empty())
-        .unwrap_or_else(|| "high".to_string());
+    let session_settings = config_provider
+        .is_none()
+        .then(|| latest_session_model_settings(home))
+        .flatten();
+    // A provider inferred from a session is only meaningful together with that
+    // session's model/effort.  Do not combine it with stale config defaults.
+    let session_model = || {
+        session_settings
+            .as_ref()
+            .map(|settings| settings.model.clone())
+            .filter(|model| !model.trim().is_empty())
+    };
+    let session_effort = || {
+        session_settings
+            .as_ref()
+            .map(|settings| settings.reasoning_effort.clone())
+            .filter(|effort| !effort.trim().is_empty())
+    };
+    let model = (if config_provider.is_some() {
+        config_model.or_else(session_model)
+    } else {
+        session_model().or(config_model)
+    })
+    .unwrap_or_else(|| "gpt-5.5".to_string());
+    let reasoning_effort = (if config_provider.is_some() {
+        config_effort.or_else(session_effort)
+    } else {
+        session_effort().or(config_effort)
+    })
+    .unwrap_or_else(|| "high".to_string());
     CodexModelSettings {
-        provider: "openai".to_string(),
+        provider: config_provider
+            .or_else(|| session_settings.map(|settings| settings.provider))
+            .filter(|provider| !provider.trim().is_empty())
+            .unwrap_or_else(|| "openai".to_string()),
         model,
         reasoning_effort,
     }
@@ -587,11 +730,29 @@ fn session_details(path: &Path) -> Result<Task, String> {
         file_path: path.to_path_buf(),
         browser_file: PathBuf::new(),
     };
+    let mut last_activity_at = String::new();
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         apply_session_record_metadata(&mut task, &record);
+        // Track the most recent timestamp seen across rollout records so the
+        // displayed session time reflects the last real conversation activity
+        // instead of the rollout file's modification time (which becomes the
+        // restore moment for imported sessions).
+        if let Some(timestamp) = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                record
+                    .get("payload")
+                    .and_then(|payload| payload.get("timestamp"))
+                    .and_then(Value::as_str)
+            })
+            .filter(|timestamp| !timestamp.trim().is_empty())
+        {
+            last_activity_at = timestamp.to_string();
+        }
         if record.get("type").and_then(Value::as_str) == Some("session_meta") {
             let payload = record.get("payload").unwrap_or(&Value::Null);
             if task.id.is_empty() {
@@ -673,11 +834,19 @@ fn session_details(path: &Path) -> Result<Task, String> {
             }
         }
     }
-    task.updated_at = fs::metadata(path)
-        .ok()
-        .and_then(|meta| meta.modified().ok())
-        .map(|time| DateTime::<Utc>::from(time).to_rfc3339())
-        .unwrap_or_default();
+    // Prefer the last in-content activity time; only fall back to the file
+    // modification time when the rollout carried no record timestamps.
+    task.updated_at = if last_activity_at.is_empty() {
+        fs::metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .map(|time| DateTime::<Utc>::from(time).to_rfc3339())
+            .unwrap_or_default()
+    } else {
+        DateTime::parse_from_rfc3339(&last_activity_at)
+            .map(|time| time.with_timezone(&Utc).to_rfc3339())
+            .unwrap_or(last_activity_at)
+    };
     Ok(task)
 }
 
@@ -1132,16 +1301,15 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
         || root.contains_key("project-order");
 
     for task in tasks {
-        let cwd = if task.cwd.trim().is_empty() {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        } else {
-            task.cwd.clone()
-        };
+        let cwd = task.cwd.trim().to_string();
+        let has_project_folder = Path::new(&cwd).is_dir();
+        let is_unbound = cwd.is_empty() || !has_project_folder;
         let (project_id, project_name, project_roots) = {
-            let matched_project = matching_desktop_project(&existing_state, &cwd, &cwd);
+            // A missing historical cwd represents an unbound project.  Do not
+            // attach it to an unrelated folder merely because the names match.
+            let matched_project = has_project_folder
+                .then(|| matching_desktop_project(&existing_state, &cwd, &cwd))
+                .flatten();
             let project_id = matched_project
                 .map(|project| project.id.clone())
                 .or_else(|| {
@@ -1155,14 +1323,29 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
                                 .then(|| assignment.project_id.clone())
                         })
                 })
-                .unwrap_or_else(|| stable_local_project_id(&cwd));
+                .unwrap_or_else(|| {
+                    if cwd.is_empty() {
+                        format!("unbound-{}", task.id)
+                    } else {
+                        stable_local_project_id(&cwd)
+                    }
+                });
             let project_name = matched_project
                 .map(|project| project.name.clone())
-                .unwrap_or_else(|| path_name(&cwd));
+                .unwrap_or_else(|| {
+                    if is_unbound && cwd.is_empty() {
+                        "未绑定项目".to_string()
+                    } else {
+                        path_name(&cwd)
+                    }
+                });
             let project_roots = matched_project
                 .map(|project| project.root_paths.clone())
-                .filter(|roots| !roots.is_empty())
-                .unwrap_or_else(|| vec![cwd.clone()]);
+                .unwrap_or_else(|| {
+                    has_project_folder
+                        .then(|| vec![cwd.clone()])
+                        .unwrap_or_default()
+                });
             (project_id, project_name, project_roots)
         };
         let project_already_exists = existing_state.projects.contains_key(&project_id);
@@ -1203,7 +1386,7 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
             serde_json::json!({
                 "projectKind": "local",
                 "projectId": project_id,
-                "cwd": cwd,
+                "cwd": if has_project_folder { cwd.clone() } else { String::new() },
                 "pendingCoreUpdate": false
             }),
         );
@@ -1224,12 +1407,14 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
             push_unique_string(pinned_projects, &project_id);
         }
 
-        let active_roots = array_mut(
-            persisted
-                .entry("active-workspace-roots")
-                .or_insert_with(|| Value::Array(Vec::new())),
-        );
-        push_unique_string(active_roots, &cwd);
+        if has_project_folder {
+            let active_roots = array_mut(
+                persisted
+                    .entry("active-workspace-roots")
+                    .or_insert_with(|| Value::Array(Vec::new())),
+            );
+            push_unique_string(active_roots, &cwd);
+        }
 
         let root = object_mut(&mut value);
         let atom_state = object_mut(
@@ -1244,18 +1429,26 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
             root.entry("thread-workspace-root-hints")
                 .or_insert_with(|| Value::Object(Map::new())),
         );
-        workspace_hints.insert(task.id.clone(), Value::String(cwd.clone()));
+        if has_project_folder {
+            workspace_hints.insert(task.id.clone(), Value::String(cwd.clone()));
+        } else {
+            workspace_hints.remove(&task.id);
+        }
 
         let writable_roots = object_mut(
             root.entry("thread-writable-roots")
                 .or_insert_with(|| Value::Object(Map::new())),
         );
-        let roots = array_mut(
-            writable_roots
-                .entry(task.id.clone())
-                .or_insert_with(|| Value::Array(Vec::new())),
-        );
-        push_unique_string(roots, &cwd);
+        if has_project_folder {
+            let roots = array_mut(
+                writable_roots
+                    .entry(task.id.clone())
+                    .or_insert_with(|| Value::Array(Vec::new())),
+            );
+            push_unique_string(roots, &cwd);
+        } else {
+            writable_roots.remove(&task.id);
+        }
     }
 
     fs::write(
@@ -1793,22 +1986,65 @@ fn rewrite_session_model_context(contents: &str, settings: &CodexModelSettings) 
 
 fn append_index(home: &Path, tasks: &[Task]) -> Result<(), String> {
     let path = home.join("session_index.jsonl");
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let mut ids = HashSet::new();
-    for line in existing.lines() {
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            if let Some(id) = value.get("id").and_then(Value::as_str) {
-                ids.insert(id.to_string());
+    let replacements = tasks
+        .iter()
+        .map(|task| (task.id.as_str(), task))
+        .collect::<HashMap<_, _>>();
+    let mut written = HashSet::new();
+    let mut lines = Vec::new();
+    for line in fs::read_to_string(&path).unwrap_or_default().lines() {
+        let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+            lines.push(line.to_string());
+            continue;
+        };
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            lines.push(line.to_string());
+            continue;
+        };
+        if let Some(replacement) = replacements.get(id) {
+            if written.insert(id.to_string()) {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "thread_name".to_string(),
+                        Value::String(replacement.title.clone()),
+                    );
+                    object.insert(
+                        "updated_at".to_string(),
+                        Value::String(replacement.updated_at.clone()),
+                    );
+                }
+                lines.push(value.to_string());
             }
+        } else {
+            lines.push(line.to_string());
         }
     }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| error.to_string())?;
-    for task in tasks.iter().filter(|task| !ids.contains(&task.id)) {
-        writeln!(file, "{}", serde_json::json!({"id": task.id, "thread_name": task.title, "updated_at": task.updated_at})).map_err(|error| error.to_string())?;
+    for task in tasks {
+        if written.insert(task.id.clone()) {
+            lines.push(
+                serde_json::json!({"id": task.id, "thread_name": task.title, "updated_at": task.updated_at})
+                    .to_string(),
+            );
+        }
+    }
+    fs::write(path, format!("{}\n", lines.join("\n"))).map_err(|error| error.to_string())
+}
+
+fn verify_registered_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
+    let state_exists = home.join("state_5.sqlite").exists();
+    let catalog = catalog_tasks(home);
+    let catalog_available = catalog.is_some();
+    if !state_exists && !catalog_available {
+        return Err("未找到 Codex 的任务数据库，无法确认恢复结果".to_string());
+    }
+    let database = database_tasks(home);
+    for task in tasks {
+        if state_exists && !database.get(&task.id).is_some_and(|item| !item.archived) {
+            return Err(format!("任务 {} 未成功登记到 Codex 状态库", task.id));
+        }
+        if catalog_available && !catalog_visibility(&catalog, &task.id).unwrap_or(false) {
+            return Err(format!("任务 {} 未成功登记到 Codex 侧边栏目录", task.id));
+        }
     }
     Ok(())
 }
@@ -1822,6 +2058,35 @@ fn backup_database(path: &Path, stamp: &str) -> Option<String> {
     Some(target.to_string_lossy().to_string())
 }
 
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}-{suffix}", path.display()))
+}
+
+fn codex_state_paths(home: &Path) -> Vec<PathBuf> {
+    let state = home.join("state_5.sqlite");
+    let catalog = home.join("sqlite").join("codex-dev.db");
+    vec![
+        home.join("session_index.jsonl"),
+        state.clone(),
+        sqlite_sidecar(&state, "wal"),
+        sqlite_sidecar(&state, "shm"),
+        catalog.clone(),
+        sqlite_sidecar(&catalog, "wal"),
+        sqlite_sidecar(&catalog, "shm"),
+        home.join(".codex-global-state.json"),
+    ]
+}
+
+fn checkpoint_sqlite_database(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let connection = Connection::open(path).map_err(|error| error.to_string())?;
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|error| format!("无法检查点数据库 {}: {error}", path.display()))
+}
+
 struct ImportTransaction {
     backups: Vec<String>,
     backed_paths: HashSet<PathBuf>,
@@ -1832,18 +2097,13 @@ struct ImportTransaction {
 
 impl ImportTransaction {
     fn new(home: &Path) -> Self {
-        let state_files = [
-            home.join("session_index.jsonl"),
-            home.join("state_5.sqlite"),
-            home.join("sqlite").join("codex-dev.db"),
-            home.join(".codex-global-state.json"),
-        ]
-        .into_iter()
-        .map(|path| {
-            let exists = path.exists();
-            (path, exists)
-        })
-        .collect();
+        let state_files = codex_state_paths(home)
+            .into_iter()
+            .map(|path| {
+                let exists = path.exists();
+                (path, exists)
+            })
+            .collect();
         Self {
             backups: Vec::new(),
             backed_paths: HashSet::new(),
@@ -2063,7 +2323,7 @@ fn register_catalog_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
-            "UPDATE local_thread_catalog_sync_state SET observation_sequence = MAX(observation_sequence, ?1) WHERE host_id = 'local'",
+            "UPDATE local_thread_catalog_sync_state SET observation_sequence = MAX(observation_sequence, ?1), initial_build_complete = 1 WHERE host_id = 'local'",
             params![current + tasks.len() as i64],
         )
         .map_err(|error| error.to_string())?;
@@ -2269,9 +2529,9 @@ fn restore_local_tasks(task_ids: Vec<String>) -> Result<serde_json::Value, Strin
     if selected.is_empty() {
         return Err("请至少选择一个任务".to_string());
     }
+    let model_settings = codex_model_settings(&home);
     for task in &mut selected {
         task.archived = false;
-        ensure_project_directory(&task.cwd)?;
         if task.updated_at.is_empty() {
             task.updated_at = Utc::now().to_rfc3339();
         }
@@ -2285,20 +2545,31 @@ fn restore_local_tasks(task_ids: Vec<String>) -> Result<serde_json::Value, Strin
         if task.title.is_empty() {
             task.title = format!("未命名任务 {}", &task.id[..task.id.len().min(8)]);
         }
+        // A restored task must resume with the API/model configuration that is
+        // active on this computer, rather than a provider recorded by an older
+        // API endpoint.
+        normalize_task_to_codex_model(task, &model_settings);
     }
     let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let backups = [
-        backup_database(&home.join("state_5.sqlite"), &stamp),
-        backup_database(&home.join("sqlite").join("codex-dev.db"), &stamp),
-        backup_database(&home.join(".codex-global-state.json"), &stamp),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    checkpoint_sqlite_database(&home.join("state_5.sqlite"))?;
+    checkpoint_sqlite_database(&home.join("sqlite").join("codex-dev.db"))?;
+    let mut transaction = ImportTransaction::new(&home);
+    for path in codex_state_paths(&home) {
+        transaction.backup(&path, &stamp)?;
+    }
+    for task in &selected {
+        let contents = fs::read_to_string(&task.file_path).map_err(|error| error.to_string())?;
+        let rewritten = rewrite_session_model_context(&contents, &model_settings);
+        if rewritten != contents {
+            transaction.write_file(&task.file_path, rewritten, &stamp)?;
+        }
+    }
     append_index(&home, &selected)?;
     register_threads(&home, &selected)?;
     register_catalog_threads(&home, &selected)?;
     register_desktop_project_state(&home, &selected)?;
+    verify_registered_threads(&home, &selected)?;
+    let backups = transaction.commit();
     Ok(
         serde_json::json!({"restored": selected.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "backups": backups, "codexHome": home}),
     )
@@ -2380,6 +2651,8 @@ fn import_archive(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+    checkpoint_sqlite_database(&home.join("state_5.sqlite"))?;
+    checkpoint_sqlite_database(&home.join("sqlite").join("codex-dev.db"))?;
     let mut transaction = ImportTransaction::new(&home);
     let mut imported = Vec::new();
     let mut restored = Vec::new();
@@ -2393,7 +2666,9 @@ fn import_archive(
             .map_err(|error| error.to_string())?;
         hydrate_task_from_session_content(&mut archive_task, &content);
         normalize_task_title(&mut archive_task);
-        let normalize_to_codex = archive_task.model_provider.trim() == "custom";
+        // Archives are history, not portable API configuration.  Always adapt
+        // the resumable context to the receiving Codex installation.
+        let normalize_to_codex = true;
         if normalize_to_codex {
             normalize_task_to_codex_model(&mut archive_task, &model_settings);
         }
@@ -2461,7 +2736,9 @@ fn import_archive(
                         transaction.write_file(&task.file_path, contents, &stamp)?;
                     }
                 }
-                ensure_project_directory(&task.cwd)?;
+                if target_cwd.is_some() {
+                    ensure_project_directory(&task.cwd)?;
+                }
                 task.archived = false;
                 (
                     task.project_key,
@@ -2495,11 +2772,18 @@ fn import_archive(
         let local_cwd = if let Some(cwd) = target_cwd.as_deref() {
             cwd.to_string()
         } else if adapt_paths {
-            resolve_local_cwd(&task.cwd)
+            let resolved = resolve_local_cwd(&task.cwd);
+            if Path::new(&resolved).is_dir() {
+                resolved
+            } else {
+                task.cwd.clone()
+            }
         } else {
             task.cwd.clone()
         };
-        ensure_project_directory(&local_cwd)?;
+        if target_cwd.is_some() {
+            ensure_project_directory(&local_cwd)?;
+        }
         let mut session_content = rewrite_session_cwd(&content, &task.cwd, &local_cwd);
         if target_cwd.is_some() {
             session_content = rewrite_session_meta_cwd(&session_content, &local_cwd);
@@ -2521,14 +2805,7 @@ fn import_archive(
                 .join(format!("{}.toml", task.id));
             transaction.write_file(&browser_path, contents, &stamp)?;
         }
-        task.cwd = if local_cwd.is_empty() {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        } else {
-            local_cwd
-        };
+        task.cwd = local_cwd;
         task.file_path = rollout_path;
         if task.updated_at.is_empty() {
             task.updated_at = Utc::now().to_rfc3339();
@@ -2557,10 +2834,9 @@ fn import_archive(
             serde_json::json!({"imported": [], "restored": [], "skipped": skipped, "backups": backups, "codexHome": home}),
         );
     }
-    transaction.backup(&home.join("session_index.jsonl"), &stamp)?;
-    transaction.backup(&home.join("state_5.sqlite"), &stamp)?;
-    transaction.backup(&home.join("sqlite").join("codex-dev.db"), &stamp)?;
-    transaction.backup(&home.join(".codex-global-state.json"), &stamp)?;
+    for path in codex_state_paths(&home) {
+        transaction.backup(&path, &stamp)?;
+    }
     let registered = imported
         .iter()
         .chain(restored.iter())
@@ -2570,6 +2846,7 @@ fn import_archive(
     register_threads(&home, &registered)?;
     register_catalog_threads(&home, &registered)?;
     register_desktop_project_state(&home, &registered)?;
+    verify_registered_threads(&home, &registered)?;
     let backups = transaction.commit();
     Ok(
         serde_json::json!({"imported": imported.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "restored": restored.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "skipped": skipped, "backups": backups, "codexHome": home}),
@@ -2579,7 +2856,9 @@ fn import_archive(
 #[tauri::command]
 fn get_environment() -> serde_json::Value {
     let codex_processes = codex_desktop_processes();
-    serde_json::json!({"codexHome": codex_home(), "platform": env::consts::OS, "version": env!("CARGO_PKG_VERSION"), "codexRunning": !codex_processes.is_empty(), "codexProcesses": codex_processes})
+    let home = codex_home();
+    let model_settings = cached_environment_model_settings(&home);
+    serde_json::json!({"codexHome": home, "platform": env::consts::OS, "version": env!("CARGO_PKG_VERSION"), "codexRunning": !codex_processes.is_empty(), "codexProcesses": codex_processes, "activeModelProvider": model_settings.provider, "activeModel": model_settings.model, "activeReasoningEffort": model_settings.reasoning_effort})
 }
 
 pub fn run() {
@@ -2608,10 +2887,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_manifest, infer_project, is_codex_context_text, is_safe_task_id, register_threads,
-        repository_name, rewrite_session_cwd, rewrite_session_model_context, session_details,
-        sort_tasks_by_project_order, ArchiveTask, CodexModelSettings, ImportTransaction, Manifest,
-        Task, ARCHIVE_SCHEMA,
+        append_index, archive_manifest, codex_model_settings, codex_state_paths, infer_project,
+        is_codex_context_text, is_safe_task_id, register_catalog_threads,
+        register_desktop_project_state, register_threads, repository_name, rewrite_session_cwd,
+        rewrite_session_model_context, session_details, simple_toml_string,
+        sort_tasks_by_project_order, verify_registered_threads, ArchiveTask, CodexModelSettings,
+        ImportTransaction, Manifest, Task, ARCHIVE_SCHEMA,
     };
     use rusqlite::Connection;
     use serde_json::Value;
@@ -2757,6 +3038,224 @@ mod tests {
     }
 
     #[test]
+    fn session_fallback_keeps_provider_model_and_effort_together() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-current-settings-{}",
+            std::process::id()
+        ));
+        let session_dir = home.join("sessions").join("2026").join("07").join("24");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            "model = \"gpt-stale\"\nmodel_reasoning_effort = \"low\"\n",
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-07-24T12-00-00-settings.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"custom\",\"model\":\"glm-old\",\"reasoning_effort\":\"low\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_settings\":{\"model_provider_id\":\"openai\",\"model\":\"gpt-current\",\"reasoning_effort\":\"high\"}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let settings = codex_model_settings(&home);
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(settings.provider, "openai");
+        assert_eq!(settings.model, "gpt-current");
+        assert_eq!(settings.reasoning_effort, "high");
+    }
+
+    #[test]
+    fn session_fallback_skips_incomplete_newer_session() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-incomplete-settings-{}",
+            std::process::id()
+        ));
+        let session_dir = home.join("sessions").join("2026").join("07").join("24");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-07-24T12-00-00-complete.jsonl"),
+            r#"{"type":"session_meta","payload":{"model_provider":"custom","model":"glm-5.2","reasoning_effort":"high"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-07-24T13-00-00-incomplete.jsonl"),
+            r#"{"type":"session_meta","payload":{"model_provider":"openai"}}"#,
+        )
+        .unwrap();
+
+        let settings = codex_model_settings(&home);
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(settings.provider, "custom");
+        assert_eq!(settings.model, "glm-5.2");
+        assert_eq!(settings.reasoning_effort, "high");
+    }
+
+    #[test]
+    fn session_fallback_ignores_partial_provider_switch() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-partial-provider-switch-{}",
+            std::process::id()
+        ));
+        let session_dir = home.join("sessions").join("2026").join("07").join("24");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("rollout-2026-07-24T12-00-00-partial.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"custom\",\"model\":\"glm-5.2\",\"reasoning_effort\":\"high\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_settings\":{\"model_provider_id\":\"openai\"}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let settings = codex_model_settings(&home);
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(settings.provider, "custom");
+        assert_eq!(settings.model, "glm-5.2");
+        assert_eq!(settings.reasoning_effort, "high");
+    }
+
+    #[test]
+    fn toml_reader_uses_root_key_and_ignores_comment() {
+        let config = concat!(
+            "model_provider = \"openai\" # active provider\n",
+            "[profiles.custom]\n",
+            "model_provider = \"custom\"\n"
+        );
+        assert_eq!(
+            simple_toml_string(config, "model_provider"),
+            Some("openai".to_string())
+        );
+    }
+
+    #[test]
+    fn transaction_restores_wal_sidecar_files() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-wal-rollback-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(home.join("sqlite")).unwrap();
+        let state_wal = home.join("state_5.sqlite-wal");
+        fs::write(&state_wal, "before").unwrap();
+        {
+            let mut transaction = ImportTransaction::new(&home);
+            for path in codex_state_paths(&home) {
+                transaction.backup(&path, "test").unwrap();
+            }
+            fs::write(&state_wal, "after").unwrap();
+        }
+
+        assert_eq!(fs::read_to_string(&state_wal).unwrap(), "before");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn registered_thread_verification_requires_a_codex_database() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-missing-database-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        let result = verify_registered_threads(&home, &[task_with("task", "/tmp/project", "")]);
+        fs::remove_dir_all(&home).ok();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn registered_thread_verification_allows_state_only_when_catalog_schema_is_missing() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-state-only-verification-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(home.join("sqlite")).unwrap();
+        let state = Connection::open(home.join("state_5.sqlite")).unwrap();
+        state
+            .execute_batch(
+                r#"
+                CREATE TABLE threads (
+                    id TEXT, title TEXT, cwd TEXT, first_user_message TEXT, archived INTEGER,
+                    source TEXT, model_provider TEXT, model TEXT, reasoning_effort TEXT,
+                    sandbox_policy TEXT, approval_mode TEXT, cli_version TEXT, thread_source TEXT,
+                    agent_path TEXT, agent_nickname TEXT, agent_role TEXT, memory_mode TEXT,
+                    history_mode TEXT
+                );
+                INSERT INTO threads (id, archived) VALUES ('state-only-task', 0);
+                "#,
+            )
+            .unwrap();
+        drop(state);
+        Connection::open(home.join("sqlite").join("codex-dev.db")).unwrap();
+        let mut task = task_with("task", "/tmp/project", "");
+        task.id = "state-only-task".to_string();
+
+        let result = verify_registered_threads(&home, &[task]);
+        fs::remove_dir_all(&home).ok();
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn empty_cwd_registers_an_unbound_project_without_home_directory() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-unbound-project-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join(".codex-global-state.json"), "{}").unwrap();
+        let mut task = task_with("task", "", "");
+        task.id = "unbound-task".to_string();
+
+        register_desktop_project_state(&home, &[task]).unwrap();
+        let value: Value = serde_json::from_str(
+            &fs::read_to_string(home.join(".codex-global-state.json")).unwrap(),
+        )
+        .unwrap();
+        fs::remove_dir_all(&home).ok();
+
+        let state = &value["electron-persisted-atom-state"];
+        assert_eq!(
+            state["thread-project-assignments"]["unbound-task"]["cwd"],
+            ""
+        );
+        assert_eq!(
+            state["local-projects"]["unbound-unbound-task"]["rootPaths"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn append_index_preserves_existing_metadata_fields() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-index-metadata-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("session_index.jsonl"),
+            r#"{"id":"index-task","thread_name":"before","updated_at":"old","future_field":"keep"}"#,
+        )
+        .unwrap();
+        let mut task = task_with("after", "/tmp/project", "");
+        task.id = "index-task".to_string();
+        task.updated_at = "new".to_string();
+
+        append_index(&home, &[task]).unwrap();
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(home.join("session_index.jsonl")).unwrap())
+                .unwrap();
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(value["thread_name"], "after");
+        assert_eq!(value["updated_at"], "new");
+        assert_eq!(value["future_field"], "keep");
+    }
+
+    #[test]
     fn session_details_preserves_custom_model_metadata() {
         let path = env::temp_dir().join(format!(
             "codex-session-transfer-model-metadata-{}.jsonl",
@@ -2797,6 +3296,32 @@ mod tests {
         assert_eq!(task.reasoning_effort, "high");
         assert_eq!(task.sandbox_policy, r#"{"type":"danger-full-access"}"#);
         assert_eq!(task.approval_mode, "never");
+    }
+
+    #[test]
+    fn session_details_uses_last_record_timestamp_for_updated_at() {
+        let path = env::temp_dir().join(format!(
+            "codex-session-transfer-last-activity-{}.jsonl",
+            std::process::id()
+        ));
+        // Rollout records carry their own timestamps; the final record's
+        // timestamp must win over the freshly-written file's modification time.
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","timestamp":"2026-07-20T09:00:00Z","payload":{"id":"last-activity-task","timestamp":"2026-07-20T09:00:00Z","cwd":"/tmp/project","source":"vscode"}}
+{"type":"event_msg","timestamp":"2026-07-20T09:30:00Z","payload":{"type":"user_message","message":"最后一次对话"}}"#,
+        )
+        .unwrap();
+        let task = session_details(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-07-20T09:30:00Z")
+            .unwrap()
+            .timestamp();
+        let actual = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
+            .unwrap()
+            .timestamp();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -2937,6 +3462,65 @@ mod tests {
         assert_eq!(row.4, "user");
         assert_eq!(row.5, r#"{"type":"danger-full-access"}"#);
         assert_eq!(row.6, "never");
+    }
+
+    #[test]
+    fn register_catalog_threads_marks_existing_local_catalog_ready() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-catalog-ready-{}",
+            std::process::id()
+        ));
+        let sqlite = home.join("sqlite");
+        fs::create_dir_all(&sqlite).unwrap();
+        let connection = Connection::open(sqlite.join("codex-dev.db")).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE local_thread_catalog_hosts (host_id TEXT PRIMARY KEY, host_kind TEXT NOT NULL);
+                CREATE TABLE local_thread_catalog_metadata (id INTEGER PRIMARY KEY, catalog_revision INTEGER NOT NULL);
+                CREATE TABLE local_thread_catalog_sync_state (host_id TEXT PRIMARY KEY, observation_sequence INTEGER NOT NULL, initial_build_complete INTEGER NOT NULL);
+                CREATE TABLE local_thread_catalog (
+                    host_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    display_title TEXT NOT NULL,
+                    source_created_at REAL NOT NULL,
+                    source_updated_at REAL NOT NULL,
+                    cwd TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    source_detail TEXT,
+                    model_provider TEXT NOT NULL,
+                    git_branch TEXT,
+                    observation_sequence INTEGER NOT NULL,
+                    missing_candidate INTEGER NOT NULL,
+                    PRIMARY KEY (host_id, thread_id)
+                );
+                INSERT INTO local_thread_catalog_hosts (host_id, host_kind) VALUES ('local', 'local');
+                INSERT INTO local_thread_catalog_metadata (id, catalog_revision) VALUES (1, 0);
+                INSERT INTO local_thread_catalog_sync_state (host_id, observation_sequence, initial_build_complete) VALUES ('local', 41, 0);
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut task = task_with("catalog task", "/tmp/project", "");
+        task.id = "catalog-ready-task".to_string();
+        task.created_at = "2026-07-24T00:00:00Z".to_string();
+        task.updated_at = "2026-07-24T00:01:00Z".to_string();
+        task.source = "cli".to_string();
+        task.model_provider = "openai".to_string();
+        register_catalog_threads(&home, &[task]).unwrap();
+
+        let connection = Connection::open(sqlite.join("codex-dev.db")).unwrap();
+        let state = connection
+            .query_row(
+                "SELECT observation_sequence, initial_build_complete FROM local_thread_catalog_sync_state WHERE host_id = 'local'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(state, (41, 1));
     }
 
     fn task_with(title: &str, cwd: &str, git_origin_url: &str) -> Task {

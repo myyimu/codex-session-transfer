@@ -1,6 +1,6 @@
 {
   "name": "codex-session-transfer",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "description": "Local-first desktop utility for exporting, importing, syncing, and restoring selected Codex project task sessions across computers.",
   "author": "myyimu",
   "license": "MIT",
@@ -43,5 +43,6 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.9.5"
-  }
+  },
+  "packageManager": "npm@11.18.0+sha512.4faecce0be70366d1c67b1012c4adc1246354a6cc45bf589f92003073b05518d547403df1475c542d67a4845e22b4fafcd7cac0af02c7a96cc6814f09eb003fb"
 }
