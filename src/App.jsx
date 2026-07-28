@@ -401,15 +401,26 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
   const [selected, setSelected] = useState(new Set());
   const [loading, setLoading] = useState(true);
   const [operation, setOperation] = useState("");
-  const [badTitleCount, setBadTitleCount] = useState(0);
+  const [healthReport, setHealthReport] = useState(null);
+  const [healthOpen, setHealthOpen] = useState(false);
+  const [healthSelection, setHealthSelection] = useState(new Set());
+  const [repairPlan, setRepairPlan] = useState(null);
+  const [planning, setPlanning] = useState(false);
+  const [repairReceipt, setRepairReceipt] = useState(null);
+  const [validation, setValidation] = useState(null);
+  const [validating, setValidating] = useState(false);
+  const [recentReceipt, setRecentReceipt] = useState(null);
+  const [visibleLimit, setVisibleLimit] = useState(120);
   const codexRunning = Boolean(environment?.codexRunning);
 
   const load = async () => {
     setLoading(true);
     try {
-      const result = await bridge.listTasks();
+      const result = bridge.loadTaskLibrary
+        ? await bridge.loadTaskLibrary()
+        : await bridge.listTasks();
       setTasks(result.tasks || []);
-      setBadTitleCount(result.badTitleCount || 0);
+      setHealthReport(result.health || null);
     } catch (error) {
       showToast("error", "读取失败", error.message);
     } finally {
@@ -431,9 +442,15 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
     });
   }, [project, query, tasks]);
 
+  useEffect(() => {
+    setVisibleLimit(120);
+  }, [project, query]);
+
+  const visibleTasks = useMemo(() => filtered.slice(0, visibleLimit), [filtered, visibleLimit]);
+
   const selectedTasks = tasks.filter((task) => selected.has(task.id));
   const selectedBytes = selectedTasks.reduce((sum, task) => sum + (task.size || 0), 0);
-  const allVisibleSelected = filtered.length > 0 && filtered.every((task) => selected.has(task.id));
+  const allVisibleSelected = visibleTasks.length > 0 && visibleTasks.every((task) => selected.has(task.id));
 
   const toggle = (id) => {
     setSelected((current) => {
@@ -446,8 +463,8 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
   const toggleVisible = () => {
     setSelected((current) => {
       const next = new Set(current);
-      if (allVisibleSelected) filtered.forEach((task) => next.delete(task.id));
-      else filtered.forEach((task) => next.add(task.id));
+      if (allVisibleSelected) visibleTasks.forEach((task) => next.delete(task.id));
+      else visibleTasks.forEach((task) => next.add(task.id));
       return next;
     });
   };
@@ -466,30 +483,73 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
     }
   };
 
-  const restoreSelected = async () => {
-    setOperation("restore");
+  const refreshRepairPlan = async (ids) => {
+    if (!ids.length || !bridge.buildRepairPlan) {
+      setRepairPlan(null);
+      return;
+    }
+    setPlanning(true);
     try {
-      const result = await bridge.restoreLocalTasks([...selected]);
-      const count = result.restored?.length || 0;
-      showToast("success", `已恢复 ${count} 个本地会话`, result.codexHome);
-      setSelected(new Set());
-      setQuery("");
-      setProject("all");
-      await load();
-      refreshEnvironment?.();
+      setRepairPlan(await bridge.buildRepairPlan(ids));
     } catch (error) {
-      showToast("error", "恢复失败", error.message);
+      showToast("error", "无法生成修复计划", error.message);
     } finally {
-      setOperation("");
+      setPlanning(false);
     }
   };
 
-  const repairBadTitles = async () => {
-    setOperation("repair");
+  const openHealth = async () => {
+    const candidates = healthReport?.tasks
+      ?.filter((task) => task.safeActions?.length && !task.requiresManualReview)
+      .map((task) => task.id) || [];
+    setRepairReceipt(null);
+    setHealthSelection(new Set(candidates));
+    setHealthOpen(true);
+    bridge.listOperationReceipts?.().then((items) => setRecentReceipt(items[0] || null)).catch(() => setRecentReceipt(null));
+    await refreshRepairPlan(candidates);
+  };
+
+  const validateLibrary = async () => {
+    if (!bridge.validateTaskLibrary) return;
+    setHealthOpen(true);
+    setValidating(true);
     try {
-      const result = await bridge.repairBadTitles();
-      const count = result.count || 0;
-      showToast("success", count ? `已修复 ${count} 个异常标题` : "没有发现异常标题", result.codexHome);
+      const next = await bridge.validateTaskLibrary();
+      setValidation(next);
+      showToast(next.healthy ? "success" : "error", next.healthy ? "任务库验证通过" : `发现 ${next.issueCount} 个一致性问题`, `${next.taskCount} 个本地任务已检查`);
+    } catch (error) {
+      showToast("error", "任务库验证失败", error.message);
+    } finally {
+      setValidating(false);
+    }
+  };
+
+  const openReceiptDirectory = async () => {
+    try {
+      const directory = await bridge.getOperationReceiptsDirectory?.();
+      if (directory) await bridge.revealPath(directory);
+    } catch (error) {
+      showToast("error", "无法打开回执目录", error.message);
+    }
+  };
+
+  const toggleHealthTask = (id) => {
+    const next = new Set(healthSelection);
+    next.has(id) ? next.delete(id) : next.add(id);
+    setHealthSelection(next);
+  };
+
+  const applyHealthPlan = async () => {
+    setOperation("health");
+    try {
+      const result = await bridge.applyRepairPlan([...healthSelection]);
+      const receipt = result.receipt || {};
+      setRepairReceipt(receipt);
+      showToast(
+        "success",
+        receipt.registered || receipt.titlesRepaired ? "本地任务修复完成" : "没有需要执行的修复",
+        receipt.message || receipt.codexHome,
+      );
       await load();
       refreshEnvironment?.();
     } catch (error) {
@@ -512,6 +572,23 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
         </button>
       </header>
 
+      {!loading && healthReport && (
+        <section className="health-summary" aria-label="本地任务健康摘要">
+          <span className="health-summary-copy">
+            <ShieldCheck size={19} weight="duotone" />
+            <span><strong>任务库健康检查</strong><small>只读扫描，不会自动修改本地数据</small></span>
+          </span>
+          <div className="health-summary-actions">
+            <button type="button" className="health-chip healthy" onClick={openHealth}>{healthReport.summary.healthyCount} 正常</button>
+            <button type="button" className="health-chip" onClick={openHealth}>{healthReport.summary.reregisterCount} 可重新登记</button>
+            <button type="button" className="health-chip" onClick={openHealth}>{healthReport.summary.titleRepairCount} 建议修复标题</button>
+            {healthReport.summary.manualReviewCount > 0 && <button type="button" className="health-chip warning" onClick={openHealth}>{healthReport.summary.manualReviewCount} 需人工处理</button>}
+          </div>
+          <button type="button" className="text-button compact health-open-button" onClick={validateLibrary}>验证任务库</button>
+          <button type="button" className="text-button compact health-open-button" onClick={openHealth}>查看建议</button>
+        </section>
+      )}
+
       <div className="toolbar">
         <div className="filter-row">
           <label className="search-field">
@@ -526,7 +603,7 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
         <div className="toolbar-actions">
           <button className="text-button" onClick={toggleVisible} disabled={!filtered.length}>
             <CheckSquare size={17} weight={allVisibleSelected ? "fill" : "regular"} />
-            {allVisibleSelected ? "取消全选" : "全选当前结果"}
+            {allVisibleSelected ? "取消已显示任务" : `全选已显示 ${visibleTasks.length} 条`}
           </button>
           <button className="primary-button toolbar-export" disabled={!selected.size || operation} onClick={exportSelected}>
             <Export size={17} weight="bold" />
@@ -540,9 +617,14 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
         {!loading && !filtered.length && (
           <div className="empty-state"><MagnifyingGlass size={28} /><strong>没有找到匹配的任务</strong><span>换一个关键词试试</span></div>
         )}
-        {!loading && filtered.map((task) => (
+        {!loading && visibleTasks.map((task) => (
           <TaskRow key={task.id} task={task} selected={selected.has(task.id)} onToggle={toggle} />
         ))}
+        {!loading && filtered.length > visibleTasks.length && (
+          <button className="text-button load-more-tasks" onClick={() => setVisibleLimit((current) => current + 120)}>
+            显示更多任务（剩余 {filtered.length - visibleTasks.length} 个）
+          </button>
+        )}
       </div>
 
       <footer className="action-bar">
@@ -557,26 +639,66 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
           </button>
           <button
             className="secondary-button"
-            disabled={!selected.size || operation || codexRunning}
-            onClick={restoreSelected}
-            title={codexRunning ? "请先完全退出 Codex，再恢复本地会话" : "直接把选中的本地会话注册回 Codex 侧边栏"}
+            disabled={operation || !healthReport}
+            onClick={openHealth}
+            title="查看本地任务健康检查与可安全执行的修复建议"
           >
-            <ArrowClockwise size={18} weight="bold" />
-            {operation === "restore" ? "正在恢复…" : "恢复到 Codex"}
+            <Wrench size={18} weight="bold" />
+            {operation === "health" ? "正在修复…" : "检查并修复"}
           </button>
-          {badTitleCount > 0 && (
-            <button
-              className="secondary-button"
-              disabled={operation || codexRunning}
-              onClick={repairBadTitles}
-              title={codexRunning ? "请先完全退出 Codex，再修复异常标题" : `检测到 ${badTitleCount} 个异常标题，可从本地会话内容重新修复`}
-            >
-              <Wrench size={18} weight="bold" />
-              {operation === "repair" ? "正在修复…" : `修复异常标题${badTitleCount > 1 ? ` (${badTitleCount})` : ""}`}
-            </button>
-          )}
         </div>
       </footer>
+
+      {healthOpen && (
+        <div className="health-drawer-backdrop" role="presentation" onMouseDown={() => setHealthOpen(false)}>
+          <aside className="health-drawer" role="dialog" aria-modal="true" aria-label="本地任务修复建议" onMouseDown={(event) => event.stopPropagation()}>
+            <header className="health-drawer-header">
+              <span><Wrench size={20} weight="duotone" /><span><strong>本地任务修复建议</strong><small>先预览影响，再创建快照并执行</small></span></span>
+              <button className="icon-button" onClick={() => setHealthOpen(false)} aria-label="关闭修复建议" title="关闭"><X size={17} /></button>
+            </header>
+
+            {validation && (
+              <div className={`validation-result ${validation.healthy ? "is-healthy" : "is-warning"}`}>
+                <ShieldCheck size={19} weight="duotone" />
+                <span><strong>{validation.healthy ? "任务库验证通过" : `发现 ${validation.issueCount} 个一致性问题`}</strong><small>{validation.integrity?.map((item) => `${item.name}: ${item.status}`).join(" · ")}</small>{validation.issues?.slice(0, 2).map((item) => <small key={`${item.code}-${item.id}`}>{item.title || item.id}：{item.detail}</small>)}</span>
+              </div>
+            )}
+            {recentReceipt && !repairReceipt && (
+              <p className="recent-receipt">最近维护：{recentReceipt.kind === "import" ? "导入" : "修复"} · {formatDate(recentReceipt.createdAt)} · 回执当前文件达到 1 MiB 后轮换，最多保留 8 份历史文件</p>
+            )}
+
+            {repairReceipt ? (
+              <div className="repair-receipt">
+                <ShieldCheck size={20} weight="duotone" />
+                <span><strong>操作回执</strong><small>{repairReceipt.registered || 0} 个重新登记 · {repairReceipt.titlesRepaired || 0} 个标题修复 · {repairReceipt.skipped || 0} 个跳过</small><small title={repairReceipt.codexHome}>{repairReceipt.message || repairReceipt.codexHome}</small>{repairReceipt.backups?.length > 0 && <small title={repairReceipt.backups.join("\n")}>快照：{repairReceipt.backups[0]}{repairReceipt.backups.length > 1 ? ` 等 ${repairReceipt.backups.length} 份` : ""}</small>}{repairReceipt.receiptWarning && <small>{repairReceipt.receiptWarning}</small>}</span>
+                {repairReceipt.receiptPath && <button className="icon-button" onClick={() => bridge.revealPath(repairReceipt.receiptPath)} title="打开维护回执" aria-label="打开维护回执"><FolderOpen size={17} /></button>}
+              </div>
+            ) : (
+              <>
+                <p className="health-drawer-note">只会重新登记会话并修复已确认的异常标题；不会覆盖 JSONL 正文、创建项目文件夹或改写长期记忆。</p>
+                <div className="repair-plan-list">
+                  {planning && <div className="repair-plan-empty"><ArrowClockwise size={20} className="spin" />正在生成修复计划…</div>}
+                  {!planning && repairPlan?.items.map((item) => (
+                    <label className={`repair-plan-item ${item.canApply ? "" : "is-blocked"}`} key={item.id}>
+                      <input type="checkbox" checked={healthSelection.has(item.id)} disabled={!item.canApply} onChange={() => toggleHealthTask(item.id)} />
+                      <span><strong title={item.title}>{item.title}</strong><small>{item.actions?.includes("reregister") ? "重新登记到 Codex 侧栏" : ""}{item.actions?.includes("repair_title") ? `${item.actions?.includes("reregister") ? " · " : ""}修复异常标题` : ""}</small><small title={item.cwd}>{item.reason}</small></span>
+                    </label>
+                  ))}
+                  {!planning && !repairPlan?.items.length && <div className="repair-plan-empty">没有发现可安全修复的任务</div>}
+                </div>
+                {repairPlan && <p className="health-snapshot-note">{repairPlan.snapshotNote}</p>}
+              </>
+            )}
+
+            <footer className="health-drawer-footer">
+              <span>{repairReceipt ? "重新打开 Codex 后检查任务是否重新出现" : validating ? "正在验证任务库…" : `${repairPlan?.actionableCount || 0} 个任务可安全修复`}</span>
+              <button className="secondary-button compact-validation-button" onClick={openReceiptDirectory}>打开回执目录</button>
+              {!repairReceipt && <button className="secondary-button compact-validation-button" disabled={validating} onClick={validateLibrary}>{validating ? "正在验证…" : "验证任务库"}</button>}
+              {!repairReceipt && <button className="primary-button" disabled={!healthSelection.size || planning || operation || codexRunning} onClick={applyHealthPlan}>{codexRunning ? "请先退出 Codex" : operation === "health" ? "正在创建快照…" : "创建快照并修复"}</button>}
+            </footer>
+          </aside>
+        </div>
+      )}
     </section>
   );
 }
@@ -585,6 +707,7 @@ function ImportView({ environment, showToast }) {
   const [archive, setArchive] = useState(null);
   const [adaptPaths, setAdaptPaths] = useState(true);
   const [restoreExisting, setRestoreExisting] = useState(false);
+  const [mergeTaskIds, setMergeTaskIds] = useState(new Set());
   const [targetCwd, setTargetCwd] = useState("");
   const [localTasks, setLocalTasks] = useState([]);
   const [dragging, setDragging] = useState(false);
@@ -603,6 +726,7 @@ function ImportView({ environment, showToast }) {
         setArchive(next);
         setResult(null);
         setRestoreExisting(false);
+        setMergeTaskIds(new Set());
       }
     } catch (error) {
       showToast("error", "无法读取压缩包", error.message);
@@ -624,6 +748,7 @@ function ImportView({ environment, showToast }) {
       setArchive(next);
       setResult(null);
       setRestoreExisting(false);
+      setMergeTaskIds(new Set());
     } catch (error) {
       showToast("error", "无法读取压缩包", error.message);
     }
@@ -632,15 +757,16 @@ function ImportView({ environment, showToast }) {
   const runImport = async () => {
     setWorking(true);
     try {
-      const next = await bridge.importArchive(archive.path, { adaptPaths, restoreExisting, targetCwd });
+      const next = await bridge.importArchive(archive.path, { adaptPaths, restoreExisting, mergeTaskIds: [...mergeTaskIds], targetCwd });
       const importedCount = next.imported?.length || 0;
       const restoredCount = next.restored?.length || 0;
+      const mergedCount = next.merged?.length || 0;
       const skippedCount = next.skipped?.length || 0;
       setResult(next);
       showToast(
         "success",
         importedCount || restoredCount ? `已处理 ${importedCount + restoredCount} 个任务` : "没有需要导入的任务",
-        skippedCount ? `${skippedCount} 个重复任务已跳过` : "重启 Codex 后即可看到",
+        mergedCount ? `${mergedCount} 个任务已追加本机续聊记录` : skippedCount ? `${skippedCount} 个重复任务已跳过` : "重启 Codex 后即可看到",
       );
     } catch (error) {
       showToast("error", "导入失败", error.message);
@@ -651,9 +777,17 @@ function ImportView({ environment, showToast }) {
 
   const importableCount = archive?.tasks.filter((task) => !task.conflict).length || 0;
   const conflictCount = archive?.tasks.filter((task) => task.conflict).length || 0;
+  const mergeableCount = archive?.tasks.filter((task) => task.conflict && task.mergePreview?.canMerge).length || 0;
   const actionCount = importableCount + (restoreExisting ? conflictCount : 0);
   const localProjects = useMemo(() => buildProjects(localTasks).filter((item) => !item.missing && !item.hidden && item.path), [localTasks]);
   const targetName = targetCwd ? (localProjects.find((item) => item.path === targetCwd)?.name || filename(targetCwd)) : "";
+  const toggleMergeTask = (taskId) => {
+    setMergeTaskIds((current) => {
+      const next = new Set(current);
+      next.has(taskId) ? next.delete(taskId) : next.add(taskId);
+      return next;
+    });
+  };
 
   return (
     <section className="workspace import-workspace" aria-labelledby="import-title">
@@ -703,8 +837,14 @@ function ImportView({ environment, showToast }) {
                   <span title={task.cwd || "未记录工作目录"}>{task.cwd || "未记录工作目录"}</span>
                 </span>
                 <span className={`status-chip ${task.conflict ? "neutral" : "ready"}`}>
-                  {task.conflict ? (restoreExisting ? "将恢复" : "已存在，将跳过") : "可导入"}
+                  {task.conflict ? (restoreExisting ? (mergeTaskIds.has(task.id) ? `将合并 ${task.mergePreview?.appendRecordCount || 0} 条续聊` : "将恢复") : "已存在，将跳过") : "可导入"}
                 </span>
+                {task.conflict && restoreExisting && task.mergePreview && (
+                  <label className={`import-merge-toggle ${task.mergePreview.canMerge ? "" : "is-disabled"}`} title={task.mergePreview.reason}>
+                    <input type="checkbox" checked={mergeTaskIds.has(task.id)} disabled={!task.mergePreview.canMerge} onChange={() => toggleMergeTask(task.id)} />
+                    <span>{task.mergePreview.canMerge ? "合并续聊" : "不可合并"}</span>
+                  </label>
+                )}
               </div>
             ))}
           </div>
@@ -714,7 +854,7 @@ function ImportView({ environment, showToast }) {
               <span className="setting-icon"><ArrowClockwise size={19} /></span>
               <span>
                 <strong>重复任务处理</strong>
-                <small>{conflictCount} 个任务本地历史已存在，但可重新恢复到 Codex 列表</small>
+                <small>{conflictCount} 个任务本地历史已存在；可重新登记，其中 {mergeableCount} 个可安全比较续聊</small>
               </span>
               <span className="segmented-control" role="group" aria-label="重复任务处理">
                 <button type="button" className={!restoreExisting ? "is-active" : ""} onClick={() => setRestoreExisting(false)}>跳过</button>
@@ -755,7 +895,8 @@ function ImportView({ environment, showToast }) {
           {result && (
             <div className="result-strip">
               <ShieldCheck size={20} weight="duotone" />
-              <span><strong>导入完成</strong><small title={result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}>{result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}</small></span>
+              <span><strong>导入完成</strong><small title={result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}>{result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}</small>{result.backups?.length > 0 && <small title={result.backups.join("\n")}>快照：{result.backups[0]}{result.backups.length > 1 ? ` 等 ${result.backups.length} 份` : ""}</small>}{result.receiptWarning && <small>{result.receiptWarning}</small>}</span>
+              {result.receiptPath && <button className="icon-button" onClick={() => bridge.revealPath(result.receiptPath)} title="打开维护回执" aria-label="打开维护回执"><FileArchive size={18} /></button>}
               <button className="icon-button" onClick={() => bridge.revealPath(environment.codexHome)} title="打开 Codex 数据目录" aria-label="打开 Codex 数据目录"><FolderOpen size={18} /></button>
             </div>
           )}
@@ -764,7 +905,7 @@ function ImportView({ environment, showToast }) {
 
       <footer className="action-bar">
         <div>
-          <strong>{archive ? (restoreExisting ? `${importableCount} 个新任务，${conflictCount} 个可恢复` : `${importableCount} 个新任务可导入`) : "等待选择压缩包"}</strong>
+          <strong>{archive ? (restoreExisting ? `${importableCount} 个新任务，${conflictCount} 个可恢复，${mergeTaskIds.size} 个将合并续聊` : `${importableCount} 个新任务可导入`) : "等待选择压缩包"}</strong>
           <span title={environment?.codexHome}>{environment?.codexHome}</span>
         </div>
         <button className="primary-button rose-button" disabled={!archive || !actionCount || working || codexRunning} onClick={runImport}>
@@ -782,12 +923,25 @@ export function App() {
   const [toast, setToast] = useState(null);
 
   const refreshEnvironment = useCallback(() => {
-    bridge.getEnvironment().then(setEnvironment).catch(() => {});
+    bridge.getEnvironment().then((next) => {
+      setEnvironment((current) => {
+        if (
+          current
+          && current.codexRunning === next.codexRunning
+          && current.activeModelProvider === next.activeModelProvider
+          && current.activeModel === next.activeModel
+          && current.codexHome === next.codexHome
+        ) {
+          return current;
+        }
+        return next;
+      });
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
     refreshEnvironment();
-    const timer = window.setInterval(refreshEnvironment, 3000);
+    const timer = window.setInterval(refreshEnvironment, 12000);
     return () => window.clearInterval(timer);
   }, [refreshEnvironment]);
 

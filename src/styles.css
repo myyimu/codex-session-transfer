@@ -995,7 +995,7 @@ h1 {
 .import-row {
   min-height: 54px;
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) auto;
+  grid-template-columns: 28px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 10px;
   padding: 8px 12px;
@@ -1257,5 +1257,324 @@ h1 {
   .action-bar > .action-buttons {
     width: 100%;
     justify-content: flex-end;
+  }
+}
+
+.import-merge-toggle {
+  min-width: 64px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #9a6075;
+  font-size: 9px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.import-merge-toggle input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: #ac6177;
+}
+
+.import-merge-toggle.is-disabled {
+  color: #9aa3a6;
+  cursor: not-allowed;
+}
+
+.health-summary {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 0 0 14px;
+  padding: 9px 12px;
+  border: 1px solid rgba(64, 145, 166, 0.16);
+  border-radius: 10px;
+  background: rgba(246, 253, 255, 0.78);
+  box-shadow: 0 8px 24px rgba(58, 126, 152, 0.06);
+}
+
+.health-summary-copy,
+.health-summary-copy > span,
+.health-drawer-header > span,
+.health-drawer-header > span > span,
+.repair-receipt,
+.repair-receipt > span {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.health-summary-copy,
+.health-drawer-header > span,
+.repair-receipt {
+  gap: 9px;
+}
+
+.validation-result {
+  display: flex;
+  gap: 9px;
+  margin: 14px 20px 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(67, 137, 95, 0.14);
+  border-radius: 8px;
+  background: #eff9f3;
+}
+
+.validation-result.is-warning {
+  color: #916833;
+  border-color: rgba(170, 122, 48, 0.18);
+  background: #fff8e9;
+}
+
+.validation-result > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.validation-result strong,
+.validation-result small,
+.recent-receipt {
+  color: #667b84;
+  font-size: 10px;
+  line-height: 15px;
+}
+
+.validation-result strong {
+  color: #315e4b;
+  font-size: 11px;
+}
+
+.validation-result.is-warning strong {
+  color: #875c25;
+}
+
+.recent-receipt {
+  margin: 10px 20px 0;
+}
+
+.compact-validation-button {
+  min-height: 32px;
+  padding-inline: 10px;
+  font-size: 10px;
+}
+
+.health-summary-copy > span,
+.health-drawer-header > span > span,
+.repair-receipt > span {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.health-summary-copy strong,
+.health-drawer-header strong,
+.repair-receipt strong {
+  color: #244653;
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.health-summary-copy small,
+.health-drawer-header small,
+.repair-receipt small {
+  color: #6a818a;
+  font-size: 10px;
+  line-height: 14px;
+}
+
+.health-summary-actions {
+  min-width: 0;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.health-chip {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  color: #27718a;
+  border: 1px solid rgba(62, 139, 164, 0.16);
+  border-radius: 999px;
+  background: #edfaff;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.health-chip.healthy {
+  color: #428063;
+  border-color: rgba(67, 137, 95, 0.14);
+  background: #eff9f3;
+}
+
+.health-chip.warning {
+  color: #936b31;
+  border-color: rgba(169, 123, 48, 0.2);
+  background: #fff8e9;
+}
+
+.health-open-button {
+  flex: 0 0 auto;
+}
+
+.health-drawer-backdrop {
+  position: fixed;
+  z-index: 40;
+  inset: 0;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(22, 44, 53, 0.18);
+  backdrop-filter: blur(2px);
+}
+
+.health-drawer {
+  width: min(460px, calc(100vw - 28px));
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid rgba(69, 109, 120, 0.16);
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: -20px 0 52px rgba(30, 66, 78, 0.16);
+}
+
+.health-drawer-header,
+.health-drawer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 18px 20px;
+}
+
+.health-drawer-header {
+  border-bottom: 1px solid rgba(74, 110, 120, 0.1);
+}
+
+.health-drawer-note,
+.health-snapshot-note {
+  margin: 14px 20px;
+  color: #667b84;
+  font-size: 11px;
+  line-height: 18px;
+}
+
+.health-snapshot-note {
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: #f3fafc;
+}
+
+.repair-plan-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 12px;
+}
+
+.repair-plan-item {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 9px;
+  padding: 12px 8px;
+  border-bottom: 1px solid rgba(79, 113, 124, 0.09);
+  cursor: pointer;
+}
+
+.repair-plan-item input {
+  width: 15px;
+  height: 15px;
+  margin: 2px 0 0;
+  accent-color: #3b9bb9;
+}
+
+.repair-plan-item > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.repair-plan-item strong {
+  overflow: hidden;
+  color: #2c4751;
+  font-size: 12px;
+  line-height: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repair-plan-item small {
+  overflow: hidden;
+  color: #758890;
+  font-size: 10px;
+  line-height: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repair-plan-item.is-blocked {
+  opacity: 0.58;
+  cursor: not-allowed;
+}
+
+.repair-plan-empty {
+  min-height: 126px;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  color: #71858e;
+  font-size: 11px;
+  text-align: center;
+}
+
+.repair-receipt {
+  margin: 16px 20px;
+  padding: 12px;
+  color: #35795b;
+  border: 1px solid rgba(67, 137, 95, 0.14);
+  border-radius: 8px;
+  background: #eff9f3;
+}
+
+.health-drawer-footer {
+  min-height: 70px;
+  margin-top: auto;
+  border-top: 1px solid rgba(74, 110, 120, 0.1);
+  background: rgba(251, 254, 255, 0.92);
+}
+
+.health-drawer-footer > span {
+  color: #6c818a;
+  font-size: 10px;
+  line-height: 15px;
+}
+
+.load-more-tasks {
+  width: calc(100% - 2px);
+  min-height: 42px;
+  justify-content: center;
+  margin: 8px 1px 2px;
+  color: #267e99;
+  border: 1px dashed rgba(49, 141, 169, 0.22);
+  border-radius: 8px;
+  background: rgba(244, 252, 255, 0.7);
+  font-size: 11px;
+}
+
+@media (max-width: 1060px) {
+  .health-summary {
+    flex-wrap: wrap;
+  }
+
+  .health-summary-actions {
+    order: 3;
+    flex-basis: 100%;
   }
 }

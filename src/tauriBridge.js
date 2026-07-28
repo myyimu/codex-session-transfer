@@ -8,6 +8,13 @@ function canceled() {
 
 export const tauriBridge = {
   listTasks: () => invoke("list_tasks"),
+  loadTaskLibrary: () => invoke("load_task_library"),
+  getTaskHealth: () => invoke("get_task_health"),
+  buildRepairPlan: (taskIds) => invoke("build_repair_plan", { taskIds }),
+  applyRepairPlan: (taskIds) => invoke("apply_repair_plan", { taskIds }),
+  validateTaskLibrary: () => invoke("validate_task_library"),
+  listOperationReceipts: () => invoke("list_operation_receipts"),
+  getOperationReceiptsDirectory: () => invoke("get_operation_receipts_directory"),
   async exportTasks(taskIds) {
     const destination = await save({
       title: "导出 Codex 任务",

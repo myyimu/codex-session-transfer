@@ -7,12 +7,12 @@ use std::os::windows::process::CommandExt;
 use std::{
     collections::{HashMap, HashSet},
     env,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tauri::Manager;
 use walkdir::WalkDir;
@@ -107,6 +107,79 @@ struct TaskList {
     bad_title_count: usize,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskHealthIssue {
+    code: String,
+    level: String,
+    title: String,
+    detail: String,
+    recommended_action: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskHealthItem {
+    id: String,
+    title: String,
+    cwd: String,
+    issues: Vec<TaskHealthIssue>,
+    safe_actions: Vec<String>,
+    requires_manual_review: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskHealthSummary {
+    healthy_count: usize,
+    reregister_count: usize,
+    title_repair_count: usize,
+    manual_review_count: usize,
+    unbound_project_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskHealthReport {
+    summary: TaskHealthSummary,
+    tasks: Vec<TaskHealthItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskLibrary {
+    tasks: Vec<Task>,
+    codex_home: String,
+    health: TaskHealthReport,
+}
+
+#[derive(Clone)]
+struct SessionDetailsCacheEntry {
+    size: u64,
+    modified_at: Option<SystemTime>,
+    task: Task,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairPlanItem {
+    id: String,
+    title: String,
+    cwd: String,
+    actions: Vec<String>,
+    can_apply: bool,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepairPlan {
+    items: Vec<RepairPlanItem>,
+    actionable_count: usize,
+    manual_review_count: usize,
+    snapshot_note: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ArchiveInspection {
@@ -122,6 +195,25 @@ struct InspectedTask {
     #[serde(flatten)]
     task: Task,
     conflict: bool,
+    merge_preview: Option<SessionMergePreview>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionMergePreview {
+    can_merge: bool,
+    archive_record_count: usize,
+    local_record_count: usize,
+    append_record_count: usize,
+    archive_last_activity: String,
+    local_last_activity: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug)]
+struct SessionMergeResult {
+    preview: SessionMergePreview,
+    contents: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +221,7 @@ struct InspectedTask {
 struct ImportOptions {
     adapt_paths: Option<bool>,
     restore_existing: Option<bool>,
+    merge_task_ids: Option<Vec<String>>,
     target_cwd: Option<String>,
 }
 
@@ -693,6 +786,18 @@ fn hydrate_task_from_session_content(task: &mut Task, contents: &str) {
 }
 
 fn session_details(path: &Path) -> Result<Task, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let size = metadata.len();
+    let modified_at = metadata.modified().ok();
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, SessionDetailsCacheEntry>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some(entry) = cache.get(path) {
+            if entry.size == size && entry.modified_at == modified_at {
+                return Ok(entry.task.clone());
+            }
+        }
+    }
     let file = File::open(path).map_err(|error| error.to_string())?;
     let mut task = Task {
         id: String::new(),
@@ -722,7 +827,7 @@ fn session_details(path: &Path) -> Result<Task, String> {
         preview: String::new(),
         message_count: 0,
         user_message_count: 0,
-        size: fs::metadata(path).map_err(|error| error.to_string())?.len(),
+        size,
         archived: false,
         project_exists: true,
         codex_visible: true,
@@ -847,7 +952,131 @@ fn session_details(path: &Path) -> Result<Task, String> {
             .map(|time| time.with_timezone(&Utc).to_rfc3339())
             .unwrap_or(last_activity_at)
     };
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= 10_000 {
+            cache.clear();
+        }
+        cache.insert(
+            path.to_path_buf(),
+            SessionDetailsCacheEntry {
+                size,
+                modified_at,
+                task: task.clone(),
+            },
+        );
+    }
     Ok(task)
+}
+
+fn record_timestamp(record: &Value) -> Option<DateTime<Utc>> {
+    record
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            record
+                .get("payload")
+                .and_then(|payload| payload.get("timestamp"))
+                .and_then(Value::as_str)
+        })
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn safe_merge_session_jsonl(archive: &str, local: &str) -> SessionMergeResult {
+    let archive_lines = archive
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let local_lines = local
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let base_preview = |can_merge: bool, append_record_count: usize, archive_last: Option<DateTime<Utc>>, local_last: Option<DateTime<Utc>>, reason: &str| {
+        SessionMergePreview {
+            can_merge,
+            archive_record_count: archive_lines.len(),
+            local_record_count: local_lines.len(),
+            append_record_count,
+            archive_last_activity: archive_last.map(|time| time.to_rfc3339()).unwrap_or_default(),
+            local_last_activity: local_last.map(|time| time.to_rfc3339()).unwrap_or_default(),
+            reason: reason.to_string(),
+        }
+    };
+    if archive_lines.is_empty() || local_lines.is_empty() {
+        return SessionMergeResult {
+            preview: base_preview(false, 0, None, None, "归档或本机会话为空，无法安全比较。"),
+            contents: String::new(),
+        };
+    }
+
+    let mut archive_last: Option<DateTime<Utc>> = None;
+    for line in &archive_lines {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            return SessionMergeResult {
+                preview: base_preview(false, 0, None, None, "归档会话包含无法解析的记录，已停止合并。"),
+                contents: String::new(),
+            };
+        };
+        if let Some(timestamp) = record_timestamp(&record) {
+            archive_last = Some(archive_last.map_or(timestamp, |last| last.max(timestamp)));
+        }
+    }
+    let Some(archive_last) = archive_last else {
+        return SessionMergeResult {
+            preview: base_preview(false, 0, None, None, "归档会话没有可比较的时间戳，无法安全追加。"),
+            contents: String::new(),
+        };
+    };
+
+    let archive_records = archive_lines.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut local_last: Option<DateTime<Utc>> = None;
+    let mut last_appended_timestamp: Option<DateTime<Utc>> = None;
+    let mut appended = Vec::new();
+    for line in &local_lines {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            return SessionMergeResult {
+                preview: base_preview(false, 0, Some(archive_last), local_last, "本机会话包含无法解析的记录，已停止合并。"),
+                contents: String::new(),
+            };
+        };
+        let Some(timestamp) = record_timestamp(&record) else {
+            if !archive_records.contains(line.as_str()) {
+                return SessionMergeResult {
+                    preview: base_preview(false, 0, Some(archive_last), local_last, "本机续聊包含无法安全排序的无时间戳记录，已停止自动合并。"),
+                    contents: String::new(),
+                };
+            }
+            continue;
+        };
+        local_last = Some(local_last.map_or(timestamp, |last| last.max(timestamp)));
+        if timestamp > archive_last && !archive_records.contains(line.as_str()) {
+            if last_appended_timestamp.is_some_and(|last| timestamp < last) {
+                return SessionMergeResult {
+                    preview: base_preview(false, 0, Some(archive_last), local_last, "本机续聊的新增记录时间顺序倒退，已停止自动合并。"),
+                    contents: String::new(),
+                };
+            }
+            last_appended_timestamp = Some(timestamp);
+            appended.push(line.clone());
+        }
+    }
+    if appended.is_empty() {
+        return SessionMergeResult {
+            preview: base_preview(false, 0, Some(archive_last), local_last, "本机没有时间晚于归档末尾的可追加记录。"),
+            contents: String::new(),
+        };
+    }
+
+    let mut merged = archive_lines.clone();
+    merged.extend(appended.iter().cloned());
+    SessionMergeResult {
+        preview: base_preview(true, appended.len(), Some(archive_last), local_last, "将以归档为基线，追加本机较新的记录。"),
+        contents: format!("{}\n", merged.join("\n")),
+    }
 }
 
 fn read_index(home: &Path) -> HashMap<String, Value> {
@@ -1522,11 +1751,12 @@ fn infer_project(task: &Task) -> (String, String, String, bool) {
     )
 }
 
-fn list_local_tasks() -> Result<Vec<Task>, String> {
+fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), String> {
     let home = codex_home();
     let index = read_index(&home);
     let database = database_tasks(&home);
     let catalog = catalog_tasks(&home);
+    let affected_title_ids = bad_title_ids_from_metadata(&index, &database, &catalog);
     let desktop_projects = read_desktop_project_state(&home);
     let mut files = HashSet::new();
     let sessions = home.join("sessions");
@@ -1677,7 +1907,11 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
         tasks.push(task);
     }
     tasks.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-    Ok(tasks)
+    Ok((tasks, affected_title_ids))
+}
+
+fn list_local_tasks() -> Result<Vec<Task>, String> {
+    Ok(list_local_tasks_with_title_ids()?.0)
 }
 
 fn archive_path(id: &str, file: &str) -> String {
@@ -2165,6 +2399,207 @@ impl Drop for ImportTransaction {
     }
 }
 
+fn receipt_path(home: &Path) -> PathBuf {
+    home.join("session-transfer").join("receipts.jsonl")
+}
+
+const MAX_CURRENT_RECEIPT_BYTES: u64 = 1024 * 1024;
+const MAX_ROTATED_RECEIPTS: usize = 8;
+
+fn prune_rotated_operation_receipts(parent: &Path) -> Result<(), String> {
+    let mut archives = fs::read_dir(parent)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("receipts-") || !name.ends_with(".jsonl") {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((modified, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    archives.sort_by(|left, right| left.0.cmp(&right.0));
+    let excess = archives.len().saturating_sub(MAX_ROTATED_RECEIPTS);
+    for (_, path) in archives.into_iter().take(excess) {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn append_operation_receipt(home: &Path, kind: &str, result: &Value) -> Result<String, String> {
+    let path = receipt_path(home);
+    let parent = path.parent().ok_or_else(|| "无法创建维护回执目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    if fs::metadata(&path)
+        .map(|metadata| metadata.len() >= MAX_CURRENT_RECEIPT_BYTES)
+        .unwrap_or(false)
+    {
+        let stamp = Utc::now().format("%Y%m%d%H%M%S%3f").to_string();
+        let mut suffix = 0usize;
+        let mut rotated = parent.join(format!("receipts-{stamp}.jsonl"));
+        while rotated.exists() {
+            suffix += 1;
+            rotated = parent.join(format!("receipts-{stamp}-{suffix}.jsonl"));
+        }
+        fs::rename(&path, rotated).map_err(|error| error.to_string())?;
+        prune_rotated_operation_receipts(parent)?;
+    }
+    let receipt = serde_json::json!({
+        "createdAt": Utc::now().to_rfc3339(),
+        "kind": kind,
+        "result": result,
+    });
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| error.to_string())?;
+    writeln!(file, "{}", serde_json::to_string(&receipt).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidationIntegrity {
+    name: String,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidationIssue {
+    id: String,
+    title: String,
+    code: String,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskLibraryValidation {
+    checked_at: String,
+    task_count: usize,
+    issue_count: usize,
+    healthy: bool,
+    integrity: Vec<ValidationIntegrity>,
+    issues: Vec<ValidationIssue>,
+}
+
+fn sqlite_integrity(path: &Path, name: &str) -> ValidationIntegrity {
+    if !path.exists() {
+        return ValidationIntegrity {
+            name: name.to_string(),
+            status: "missing".to_string(),
+        };
+    }
+    let status = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|connection| connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)))
+        .unwrap_or_else(|error| format!("error: {error}"));
+    ValidationIntegrity {
+        name: name.to_string(),
+        status,
+    }
+}
+
+#[tauri::command]
+fn validate_task_library() -> Result<TaskLibraryValidation, String> {
+    let home = codex_home();
+    let tasks = list_local_tasks()?;
+    let index = read_index(&home);
+    let database = database_tasks(&home);
+    let session_ids = tasks.iter().map(|task| task.id.clone()).collect::<HashSet<_>>();
+    let mut issues = Vec::new();
+
+    for task in &tasks {
+        if !index.contains_key(&task.id) {
+            issues.push(ValidationIssue {
+                id: task.id.clone(),
+                title: task.title.clone(),
+                code: "index_missing".to_string(),
+                detail: "会话文件存在，但 session_index.jsonl 没有对应任务。".to_string(),
+            });
+        }
+        if !database.contains_key(&task.id) {
+            issues.push(ValidationIssue {
+                id: task.id.clone(),
+                title: task.title.clone(),
+                code: "state_missing".to_string(),
+                detail: "会话文件存在，但任务状态数据库没有对应记录。".to_string(),
+            });
+        }
+    }
+
+    let mut missing_session_ids = HashSet::new();
+    for (id, item) in &index {
+        if !session_ids.contains(id) && missing_session_ids.insert(id.clone()) {
+            issues.push(ValidationIssue {
+                id: id.clone(),
+                title: item
+                    .get("thread_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未命名任务")
+                    .to_string(),
+                code: "session_missing".to_string(),
+                detail: "索引存在，但没有找到对应的本地会话文件。".to_string(),
+            });
+        }
+    }
+    for (id, task) in &database {
+        if !session_ids.contains(id) && missing_session_ids.insert(id.clone()) {
+            issues.push(ValidationIssue {
+                id: id.clone(),
+                title: task.title.clone(),
+                code: "session_missing".to_string(),
+                detail: "任务状态存在，但没有找到对应的本地会话文件。".to_string(),
+            });
+        }
+    }
+
+    let integrity = vec![
+        sqlite_integrity(&home.join("state_5.sqlite"), "state_5.sqlite"),
+        sqlite_integrity(&home.join("sqlite").join("codex-dev.db"), "codex-dev.db"),
+    ];
+    let healthy = issues.is_empty() && integrity.iter().all(|item| item.status == "ok");
+    let issue_count = issues.len();
+    issues.truncate(50);
+    Ok(TaskLibraryValidation {
+        checked_at: Utc::now().to_rfc3339(),
+        task_count: tasks.len(),
+        issue_count,
+        healthy,
+        integrity,
+        issues,
+    })
+}
+
+#[tauri::command]
+fn list_operation_receipts() -> Result<Vec<Value>, String> {
+    let path = receipt_path(&codex_home());
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Ok(Vec::new());
+    };
+    Ok(contents
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .take(12)
+        .collect())
+}
+
+#[tauri::command]
+fn get_operation_receipts_directory() -> String {
+    receipt_path(&codex_home())
+        .parent()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
 fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     if value.trim().is_empty() {
         fallback
@@ -2361,12 +2796,13 @@ fn rewrite_index_titles(home: &Path, tasks: &[Task]) -> Result<(), String> {
     fs::write(path, format!("{}\n", lines.join("\n"))).map_err(|error| error.to_string())
 }
 
-fn bad_title_ids(home: &Path) -> HashSet<String> {
-    let index = read_index(home);
-    let database = database_tasks(home);
-    let catalog = catalog_tasks(home);
+fn bad_title_ids_from_metadata(
+    index: &HashMap<String, Value>,
+    database: &HashMap<String, DatabaseTask>,
+    catalog: &Option<HashMap<String, (String, String, bool)>>,
+) -> HashSet<String> {
     let mut affected_ids = HashSet::new();
-    for (id, item) in &index {
+    for (id, item) in index {
         if item
             .get("thread_name")
             .and_then(Value::as_str)
@@ -2375,12 +2811,12 @@ fn bad_title_ids(home: &Path) -> HashSet<String> {
             affected_ids.insert(id.clone());
         }
     }
-    for (id, task) in &database {
+    for (id, task) in database {
         if is_bad_title(&task.title) || is_codex_context_text(&task.first_user_message) {
             affected_ids.insert(id.clone());
         }
     }
-    if let Some(catalog) = &catalog {
+    if let Some(catalog) = catalog {
         for (id, item) in catalog {
             if is_bad_title(&item.0) {
                 affected_ids.insert(id.clone());
@@ -2388,6 +2824,271 @@ fn bad_title_ids(home: &Path) -> HashSet<String> {
         }
     }
     affected_ids
+}
+
+fn bad_title_ids(home: &Path) -> HashSet<String> {
+    let index = read_index(home);
+    let database = database_tasks(home);
+    let catalog = catalog_tasks(home);
+    bad_title_ids_from_metadata(&index, &database, &catalog)
+}
+
+fn task_health_issues(task: &Task, affected_title_ids: &HashSet<String>) -> Vec<TaskHealthIssue> {
+    let mut issues = Vec::new();
+    if !task.file_path.is_file() {
+        issues.push(TaskHealthIssue {
+            code: "session_file_missing".to_string(),
+            level: "manual".to_string(),
+            title: "会话文件不可读取".to_string(),
+            detail: "找不到对应的本地 JSONL 会话文件，无法安全写入或重新登记。".to_string(),
+            recommended_action: String::new(),
+        });
+    }
+    if task.archived || !task.codex_visible {
+        issues.push(TaskHealthIssue {
+            code: "not_registered".to_string(),
+            level: "repairable".to_string(),
+            title: "任务未在 Codex 侧栏显示".to_string(),
+            detail: "会话文件仍在本机；可以重新登记任务，并取消归档或隐藏状态。".to_string(),
+            recommended_action: "reregister".to_string(),
+        });
+    }
+    if affected_title_ids.contains(&task.id) {
+        issues.push(TaskHealthIssue {
+            code: "bad_title".to_string(),
+            level: "repairable".to_string(),
+            title: "任务标题需要修复".to_string(),
+            detail: "索引或任务状态中保留了系统上下文标题；将从有效首条用户消息重新生成标题。".to_string(),
+            recommended_action: "repair_title".to_string(),
+        });
+    }
+    if !task.project_exists {
+        issues.push(TaskHealthIssue {
+            code: "unbound_project".to_string(),
+            level: "info".to_string(),
+            title: "历史项目路径不存在".to_string(),
+            detail: "任务会保留为未绑定项目；本次修复不会创建同名文件夹或绑定错误路径。".to_string(),
+            recommended_action: "keep_unbound".to_string(),
+        });
+    }
+    issues
+}
+
+fn task_health_item(task: &Task, affected_title_ids: &HashSet<String>) -> TaskHealthItem {
+    let issues = task_health_issues(task, affected_title_ids);
+    let mut safe_actions = Vec::new();
+    for issue in &issues {
+        if issue.level == "repairable" && !issue.recommended_action.is_empty() {
+            safe_actions.push(issue.recommended_action.clone());
+        }
+    }
+    safe_actions.sort();
+    safe_actions.dedup();
+    let requires_manual_review = issues.iter().any(|issue| issue.level == "manual");
+    TaskHealthItem {
+        id: task.id.clone(),
+        title: task.title.clone(),
+        cwd: task.cwd.clone(),
+        issues,
+        safe_actions,
+        requires_manual_review,
+    }
+}
+
+fn build_repair_plan_for(task_ids: &[String]) -> Result<RepairPlan, String> {
+    let requested: HashSet<_> = task_ids.iter().cloned().collect();
+    if requested.is_empty() {
+        return Err("请至少选择一个需要修复的任务".to_string());
+    }
+    let home = codex_home();
+    let affected_title_ids = bad_title_ids(&home);
+    let tasks = list_local_tasks()?;
+    let mut items = Vec::new();
+    for task in tasks.into_iter().filter(|task| requested.contains(&task.id)) {
+        let health = task_health_item(&task, &affected_title_ids);
+        let can_apply = !health.requires_manual_review && !health.safe_actions.is_empty();
+        let reason = if health.requires_manual_review {
+            "会话文件不完整，需人工处理；本工具不会猜测性写入。".to_string()
+        } else if health.safe_actions.is_empty() {
+            "当前任务不需要安全修复。".to_string()
+        } else {
+            "执行前将创建 Codex 本地状态快照。".to_string()
+        };
+        items.push(RepairPlanItem {
+            id: task.id,
+            title: task.title,
+            cwd: task.cwd,
+            actions: health.safe_actions,
+            can_apply,
+            reason,
+        });
+    }
+    let missing_count = requested.len().saturating_sub(items.len());
+    for id in requested {
+        if !items.iter().any(|item| item.id == id) {
+            items.push(RepairPlanItem {
+                id,
+                title: "未找到本地任务".to_string(),
+                cwd: String::new(),
+                actions: Vec::new(),
+                can_apply: false,
+                reason: "本机没有找到可对应的会话文件；不会执行写入。".to_string(),
+            });
+        }
+    }
+    Ok(RepairPlan {
+        actionable_count: items.iter().filter(|item| item.can_apply).count(),
+        manual_review_count: items.iter().filter(|item| !item.can_apply).count(),
+        snapshot_note: if missing_count > 0 {
+            "可执行任务会先备份 Codex 数据库、索引和全局状态；缺失任务会被跳过。".to_string()
+        } else {
+            "执行前会备份 Codex 数据库、索引和全局状态。".to_string()
+        },
+        items,
+    })
+}
+
+#[tauri::command]
+fn get_task_health() -> Result<TaskHealthReport, String> {
+    let home = codex_home();
+    let affected_title_ids = bad_title_ids(&home);
+    let tasks = list_local_tasks()?;
+    let items = tasks
+        .iter()
+        .map(|task| task_health_item(task, &affected_title_ids))
+        .collect::<Vec<_>>();
+    Ok(TaskHealthReport {
+        summary: TaskHealthSummary {
+            healthy_count: items.iter().filter(|item| item.issues.is_empty()).count(),
+            reregister_count: items
+                .iter()
+                .filter(|item| item.safe_actions.iter().any(|action| action == "reregister"))
+                .count(),
+            title_repair_count: items
+                .iter()
+                .filter(|item| item.safe_actions.iter().any(|action| action == "repair_title"))
+                .count(),
+            manual_review_count: items.iter().filter(|item| item.requires_manual_review).count(),
+            unbound_project_count: items
+                .iter()
+                .filter(|item| item.issues.iter().any(|issue| issue.code == "unbound_project"))
+                .count(),
+        },
+        tasks: items,
+    })
+}
+
+fn task_health_report(tasks: &[Task], affected_title_ids: &HashSet<String>) -> TaskHealthReport {
+    let items = tasks
+        .iter()
+        .map(|task| task_health_item(task, affected_title_ids))
+        .collect::<Vec<_>>();
+    TaskHealthReport {
+        summary: TaskHealthSummary {
+            healthy_count: items.iter().filter(|item| item.issues.is_empty()).count(),
+            reregister_count: items
+                .iter()
+                .filter(|item| item.safe_actions.iter().any(|action| action == "reregister"))
+                .count(),
+            title_repair_count: items
+                .iter()
+                .filter(|item| item.safe_actions.iter().any(|action| action == "repair_title"))
+                .count(),
+            manual_review_count: items.iter().filter(|item| item.requires_manual_review).count(),
+            unbound_project_count: items
+                .iter()
+                .filter(|item| item.issues.iter().any(|issue| issue.code == "unbound_project"))
+                .count(),
+        },
+        tasks: items,
+    }
+}
+
+#[tauri::command]
+fn load_task_library() -> Result<TaskLibrary, String> {
+    let home = codex_home();
+    let (tasks, affected_title_ids) = list_local_tasks_with_title_ids()?;
+    Ok(TaskLibrary {
+        health: task_health_report(&tasks, &affected_title_ids),
+        tasks,
+        codex_home: home.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn build_repair_plan(task_ids: Vec<String>) -> Result<RepairPlan, String> {
+    build_repair_plan_for(&task_ids)
+}
+
+#[tauri::command]
+fn apply_repair_plan(task_ids: Vec<String>) -> Result<serde_json::Value, String> {
+    let plan = build_repair_plan_for(&task_ids)?;
+    let executable_ids = plan
+        .items
+        .iter()
+        .filter(|item| item.can_apply)
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let registered_count = plan
+        .items
+        .iter()
+        .filter(|item| item.can_apply && item.actions.iter().any(|action| action == "reregister"))
+        .count();
+    let title_repair_count = plan
+        .items
+        .iter()
+        .filter(|item| item.can_apply && item.actions.iter().any(|action| action == "repair_title"))
+        .count();
+
+    if executable_ids.is_empty() {
+        return Ok(serde_json::json!({
+            "receipt": {
+                "scanned": plan.items.len(),
+                "registered": 0,
+                "titlesRepaired": 0,
+                "skipped": plan.manual_review_count,
+                "backups": [],
+                "codexHome": codex_home(),
+                "message": "没有可安全执行的修复；请查看人工处理原因。"
+            },
+            "plan": plan
+        }));
+    }
+
+    let result = restore_local_tasks(executable_ids)?;
+    let backups = result.get("backups").cloned().unwrap_or_else(|| serde_json::json!([]));
+    let codex_home_value = result
+        .get("codexHome")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!(codex_home()));
+    let mut response = serde_json::json!({
+        "receipt": {
+            "scanned": plan.items.len(),
+            "registered": registered_count,
+            "titlesRepaired": title_repair_count,
+            "skipped": plan.manual_review_count,
+            "backups": backups,
+            "codexHome": codex_home_value,
+            "message": "修复已完成。重新打开 Codex 后可检查任务是否重新出现。"
+        },
+        "plan": plan,
+        "result": result
+    });
+    let operation_receipt = append_operation_receipt(&codex_home(), "repair", &response);
+    if let Some(receipt) = response.get_mut("receipt").and_then(Value::as_object_mut) {
+        match operation_receipt {
+            Ok(receipt_path) => {
+                receipt.insert("receiptPath".to_string(), Value::String(receipt_path));
+            }
+            Err(error) => {
+                receipt.insert(
+                    "receiptWarning".to_string(),
+                    Value::String(format!("修复已完成，但无法写入维护回执：{error}")),
+                );
+            }
+        }
+    }
+    Ok(response)
 }
 
 #[tauri::command]
@@ -2439,12 +3140,8 @@ fn repair_bad_titles() -> Result<serde_json::Value, String> {
 fn list_tasks() -> Result<TaskList, String> {
     let home = codex_home();
     let tasks = list_local_tasks()?;
-    let affected_ids = bad_title_ids(&home);
     Ok(TaskList {
-        bad_title_count: tasks
-            .iter()
-            .filter(|task| affected_ids.contains(&task.id))
-            .count(),
+        bad_title_count: 0,
         tasks,
         codex_home: home.to_string_lossy().to_string(),
     })
@@ -2581,9 +3278,9 @@ fn inspect_archive(archive_path: String) -> Result<ArchiveInspection, String> {
     let model_settings = codex_model_settings(&codex_home());
     let file = File::open(&archive_path).map_err(|_| "找不到所选压缩包".to_string())?;
     let mut zip = ZipArchive::new(file).map_err(|_| "这不是有效的 ZIP 压缩包".to_string())?;
-    let existing: HashSet<_> = list_local_tasks()?
+    let existing: HashMap<_, _> = list_local_tasks()?
         .into_iter()
-        .map(|task| task.id)
+        .map(|task| (task.id.clone(), task))
         .collect();
     Ok(ArchiveInspection {
         canceled: false,
@@ -2607,8 +3304,13 @@ fn inspect_archive(archive_path: String) -> Result<ArchiveInspection, String> {
                 if task.model_provider.trim() == "custom" {
                     normalize_task_to_codex_model(&mut task, &model_settings);
                 }
+                let merge_preview = existing
+                    .get(&task.id)
+                    .and_then(|local_task| fs::read_to_string(&local_task.file_path).ok())
+                    .map(|local_contents| safe_merge_session_jsonl(&contents, &local_contents).preview);
                 InspectedTask {
-                    conflict: existing.contains(&task.id),
+                    conflict: existing.contains_key(&task.id),
+                    merge_preview,
                     task,
                 }
             })
@@ -2644,6 +3346,12 @@ fn import_archive(
         .as_ref()
         .and_then(|value| value.restore_existing)
         .unwrap_or(false);
+    let merge_task_ids = options
+        .as_ref()
+        .and_then(|value| value.merge_task_ids.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
     let target_cwd = options
         .as_ref()
         .and_then(|value| value.target_cwd.as_deref())
@@ -2656,6 +3364,7 @@ fn import_archive(
     let mut transaction = ImportTransaction::new(&home);
     let mut imported = Vec::new();
     let mut restored = Vec::new();
+    let mut merged = Vec::new();
     let mut skipped = Vec::new();
     for entry in manifest.tasks {
         let mut archive_task = entry.task;
@@ -2676,6 +3385,23 @@ fn import_archive(
         if let Some(existing_task) = existing_tasks.get(&archive_task.id) {
             if restore_existing {
                 let mut task = existing_task.clone();
+                let merge_result = if merge_task_ids.contains(&archive_task.id) {
+                    let local_contents = match fs::read_to_string(&task.file_path) {
+                        Ok(contents) => contents,
+                        Err(_) => {
+                            skipped.push(serde_json::json!({"id": archive_task.id, "title": archive_task.title, "reason": "merge_local_session_unreadable"}));
+                            continue;
+                        }
+                    };
+                    let result = safe_merge_session_jsonl(&content, &local_contents);
+                    if !result.preview.can_merge {
+                        skipped.push(serde_json::json!({"id": archive_task.id, "title": archive_task.title, "reason": "merge_requires_manual_review", "detail": result.preview.reason}));
+                        continue;
+                    }
+                    Some(result)
+                } else {
+                    None
+                };
                 let normalize_existing =
                     normalize_to_codex || task.model_provider.trim() == "custom";
                 let original_cwd = task.cwd.clone();
@@ -2723,18 +3449,23 @@ fn import_archive(
                 if cwd_changed {
                     task.cwd = resolved_cwd;
                 }
-                if cwd_changed || normalize_existing {
-                    if let Ok(mut contents) = fs::read_to_string(&task.file_path) {
-                        transaction.backup(&task.file_path, &stamp)?;
-                        if cwd_changed {
-                            contents = rewrite_session_cwd(&contents, &original_cwd, &task.cwd);
-                            contents = rewrite_session_meta_cwd(&contents, &task.cwd);
-                        }
-                        if normalize_existing {
-                            contents = rewrite_session_model_context(&contents, &model_settings);
-                        }
-                        transaction.write_file(&task.file_path, contents, &stamp)?;
+                if cwd_changed || normalize_existing || merge_result.is_some() {
+                    let mut contents = if let Some(result) = &merge_result {
+                        result.contents.clone()
+                    } else if let Ok(contents) = fs::read_to_string(&task.file_path) {
+                        contents
+                    } else {
+                        skipped.push(serde_json::json!({"id": archive_task.id, "title": archive_task.title, "reason": "local_session_unreadable"}));
+                        continue;
+                    };
+                    if cwd_changed {
+                        contents = rewrite_session_cwd(&contents, &original_cwd, &task.cwd);
+                        contents = rewrite_session_meta_cwd(&contents, &task.cwd);
                     }
+                    if normalize_existing {
+                        contents = rewrite_session_model_context(&contents, &model_settings);
+                    }
+                    transaction.write_file(&task.file_path, contents, &stamp)?;
                 }
                 if target_cwd.is_some() {
                     ensure_project_directory(&task.cwd)?;
@@ -2746,6 +3477,9 @@ fn import_archive(
                     task.project_path,
                     task.project_exists,
                 ) = infer_project(&task);
+                if let Some(result) = &merge_result {
+                    merged.push(serde_json::json!({"id": task.id, "title": task.title, "appendedRecords": result.preview.append_record_count}));
+                }
                 restored.push(task);
             } else {
                 skipped.push(serde_json::json!({"id": archive_task.id, "title": archive_task.title, "reason": "already_exists"}));
@@ -2831,7 +3565,7 @@ fn import_archive(
     if imported.is_empty() && restored.is_empty() {
         let backups = transaction.commit();
         return Ok(
-            serde_json::json!({"imported": [], "restored": [], "skipped": skipped, "backups": backups, "codexHome": home}),
+            serde_json::json!({"imported": [], "restored": [], "merged": [], "skipped": skipped, "backups": backups, "codexHome": home}),
         );
     }
     for path in codex_state_paths(&home) {
@@ -2848,9 +3582,22 @@ fn import_archive(
     register_desktop_project_state(&home, &registered)?;
     verify_registered_threads(&home, &registered)?;
     let backups = transaction.commit();
-    Ok(
-        serde_json::json!({"imported": imported.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "restored": restored.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "skipped": skipped, "backups": backups, "codexHome": home}),
-    )
+    let mut response = serde_json::json!({"imported": imported.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "restored": restored.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd, "rolloutPath": task.file_path})).collect::<Vec<_>>(), "merged": merged, "skipped": skipped, "backups": backups, "codexHome": home});
+    let operation_receipt = append_operation_receipt(&home, "import", &response);
+    if let Some(object) = response.as_object_mut() {
+        match operation_receipt {
+            Ok(receipt_path) => {
+                object.insert("receiptPath".to_string(), Value::String(receipt_path));
+            }
+            Err(error) => {
+                object.insert(
+                    "receiptWarning".to_string(),
+                    Value::String(format!("导入已完成，但无法写入维护回执：{error}")),
+                );
+            }
+        }
+    }
+    Ok(response)
 }
 
 #[tauri::command]
@@ -2873,6 +3620,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_tasks,
+            load_task_library,
+            get_task_health,
+            build_repair_plan,
+            apply_repair_plan,
+            validate_task_library,
+            list_operation_receipts,
+            get_operation_receipts_directory,
             export_tasks,
             restore_local_tasks,
             repair_bad_titles,
@@ -2890,7 +3644,7 @@ mod tests {
         append_index, archive_manifest, codex_model_settings, codex_state_paths, infer_project,
         is_codex_context_text, is_safe_task_id, register_catalog_threads,
         register_desktop_project_state, register_threads, repository_name, rewrite_session_cwd,
-        rewrite_session_model_context, session_details, simple_toml_string,
+        rewrite_session_model_context, safe_merge_session_jsonl, session_details, simple_toml_string,
         sort_tasks_by_project_order, verify_registered_threads, ArchiveTask, CodexModelSettings,
         ImportTransaction, Manifest, Task, ARCHIVE_SCHEMA,
     };
@@ -2898,6 +3652,38 @@ mod tests {
     use serde_json::Value;
     use std::{env, fs, io::Write, path::PathBuf};
     use zip::{write::SimpleFileOptions, ZipWriter};
+
+    #[test]
+    fn safe_merge_session_jsonl_appends_only_newer_local_records() {
+        let archive = concat!(
+            "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-01T10:00:00Z\",\"payload\":{\"id\":\"merge-task\"}}\n",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-01T10:01:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"历史消息\"}}\n"
+        );
+        let local = concat!(
+            "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-01T10:00:00Z\",\"payload\":{\"id\":\"merge-task\"}}\n",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-01T10:01:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"历史消息\"}}\n",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-01T10:02:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"本机续聊\"}}\n"
+        );
+
+        let merged = safe_merge_session_jsonl(archive, local);
+
+        assert!(merged.preview.can_merge);
+        assert_eq!(merged.preview.append_record_count, 1);
+        assert_eq!(merged.contents.lines().count(), 3);
+        assert!(merged.contents.contains("本机续聊"));
+    }
+
+    #[test]
+    fn safe_merge_session_jsonl_rejects_missing_comparable_timestamps() {
+        let archive = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"merge-task\"}}\n";
+        let local = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"本机续聊\"}}\n";
+
+        let merged = safe_merge_session_jsonl(archive, local);
+
+        assert!(!merged.preview.can_merge);
+        assert_eq!(merged.preview.append_record_count, 0);
+        assert!(merged.preview.reason.contains("时间戳"));
+    }
 
     #[test]
     fn rewrite_session_cwd_only_updates_structured_path_fields() {

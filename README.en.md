@@ -1,12 +1,18 @@
-# Codex Session Transfer
+# Codex Task Continuity
 
-A local-first desktop app for exporting, importing, syncing, and restoring Codex project task sessions across computers.
+A local-first desktop app that keeps local Codex tasks usable through device changes, backups, cleanup, and sidebar visibility problems. It selectively exports, imports, inspects, and re-registers project task sessions.
 
 It scans local Codex task history, displays tasks by project and title, exports selected sessions into a ZIP archive, and imports that archive into the current Codex data directory on another machine. All processing happens locally; session content is not uploaded.
 
-[中文 README](./README.md)
+[中文 README](./README.md) | [Product strategy, UX, and roadmap](./docs/product-strategy.md)
 
 ![Export overview](./docs/screenshots/readme/export-overview.png)
+
+## Positioning
+
+`Codex Task Continuity` solves the practical case where an important task still exists locally but is no longer easy to use: move it to another computer, keep an inspectable local archive, or re-register it when the sidebar no longer shows it.
+
+It is not a full disaster-recovery product. It does not overwrite an entire `.codex` directory, promise every private cache or collaboration relationship, or claim exact cross-task long-term-memory recovery. Session data never leaves the local machine.
 
 ## About
 
@@ -16,6 +22,7 @@ Codex Session Transfer is designed for:
 - Syncing selected Codex task history across multiple machines without copying the entire `.codex` directory.
 - Backing up important task sessions, including project paths, task titles, original session logs, and optional browser session config.
 - Restoring existing local session files back into the Codex task list when the files exist locally but no longer appear in the Codex sidebar.
+- Reviewing archive contents, duplicate tasks, and target projects before a local import changes Codex state.
 
 ## Features
 
@@ -30,6 +37,23 @@ Codex Session Transfer is designed for:
 - **Path adaptation**: map old missing project paths to same-name folders under `~/work`, `~/Projects`, and `~/Documents`.
 - **Running-app protection**: import is blocked while the Codex/ChatGPT desktop main process is running, preventing the client from overwriting restored sidebar state.
 - **Local backups**: backup Codex SQLite databases and global state before importing.
+
+## Recovery Boundaries
+
+- In scope: session portability, task titles and project metadata, sidebar re-registration, target-project binding, and local snapshots before import.
+- Not guaranteed: complete Codex-directory replacement, forced repair of every cache or sort preference, undeclared internal task relationships, or exact long-term-memory merging across tasks.
+- Safety rule: any write to local Codex state should happen after Codex is closed, after impact has been previewed, and with a local rollback snapshot.
+
+See the [product strategy](./docs/product-strategy.md) for the research rationale, two-view interaction design, and delivery plan.
+
+## Validation And Rollback
+
+Each successful import or repair appends a local maintenance receipt to `.codex/session-transfer/receipts.jsonl`. It records the operation summary and snapshot paths. Use **Validate task library** from the Task Library health check to inspect session files, indexes, task databases, and SQLite integrity.
+
+- Validation is read-only: it never clears caches, changes sort order, or mutates tasks.
+- Writes still create local snapshots; use the backup paths recorded in the receipt to locate rollback files.
+- The current receipt rotates at `1 MiB` and retains up to eight historical receipt files. Snapshots are never deleted by this policy; use **Open receipt directory** from the health check to inspect retained records.
+- After a real migration, reopen Codex and confirm tasks are visible and resumable before creating substantial new work.
 
 ## App Guide
 
