@@ -272,7 +272,7 @@ struct DesktopProjectState {
     projects: HashMap<String, DesktopProject>,
     project_order: Vec<String>,
     assignments: HashMap<String, ThreadProjectAssignment>,
-    client_threads: HashSet<String>,
+    projectless_threads: HashSet<String>,
 }
 
 fn default_project_exists() -> bool {
@@ -287,6 +287,52 @@ fn codex_home() -> PathBuf {
     env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
+}
+
+fn latest_state_database(home: &Path) -> PathBuf {
+    let mut candidates = fs::read_dir(home)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            let version = name
+                .strip_prefix("state_")?
+                .strip_suffix(".sqlite")?
+                .parse::<u64>()
+                .ok()?;
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            let modified = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+            Some((version, modified, name.to_string(), path))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates
+        .pop()
+        .map(|(_, _, _, path)| path)
+        .unwrap_or_else(|| home.join("state_5.sqlite"))
+}
+
+fn history_first_messages(home: &Path) -> HashMap<String, String> {
+    let mut messages = HashMap::new();
+    let Ok(contents) = fs::read_to_string(home.join("history.jsonl")) else {
+        return messages;
+    };
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(id) = value.get("session_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(text) = value.get("text").and_then(Value::as_str).and_then(meaningful_user_text) else {
+            continue;
+        };
+        messages.entry(id.to_string()).or_insert(text);
+    }
+    messages
 }
 
 fn simple_toml_string(contents: &str, key: &str) -> Option<String> {
@@ -568,7 +614,10 @@ fn truncate(value: &str, limit: usize) -> String {
 fn is_codex_context_text(value: &str) -> bool {
     let value = clean_text(value);
     let lower = value.to_ascii_lowercase();
-    lower.starts_with("<environment_context") || lower.starts_with("<recommended_plugins")
+    lower.starts_with("<environment_context")
+        || lower.starts_with("<recommended_plugins")
+        || lower.starts_with("[tool")
+        || lower.starts_with("assistant to=")
 }
 
 fn is_bad_title(value: &str) -> bool {
@@ -577,10 +626,21 @@ fn is_bad_title(value: &str) -> bool {
         return true;
     }
     is_codex_context_text(&value)
+        || value.chars().count() > 180
+        || ["<image name=", "assistant to=", "tool exec call:"]
+            .iter()
+            .any(|marker| value.to_ascii_lowercase().contains(marker))
 }
 
 fn meaningful_user_text(value: &str) -> Option<String> {
-    let value = clean_text(value);
+    let cleaned = clean_text(value);
+    let lower = cleaned.to_ascii_lowercase();
+    let end = ["<image name=", "<environment_context", "<recommended_plugins", "assistant to=", "[tool", "tool exec call:"]
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min()
+        .unwrap_or(cleaned.len());
+    let value = cleaned[..end].trim().to_string();
     if value.is_empty() || is_codex_context_text(&value) {
         None
     } else {
@@ -1096,7 +1156,7 @@ fn read_index(home: &Path) -> HashMap<String, Value> {
 
 fn database_tasks(home: &Path) -> HashMap<String, DatabaseTask> {
     let mut result = HashMap::new();
-    let path = home.join("state_5.sqlite");
+    let path = latest_state_database(home);
     let Ok(connection) =
         Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
@@ -1177,34 +1237,8 @@ fn catalog_visibility(
         .and_then(|items| items.get(task_id).map(|item| item.2))
 }
 
-#[cfg(target_os = "windows")]
-fn missing_desktop_project_visible(archived: bool) -> bool {
-    !archived
-}
-
-#[cfg(not(target_os = "windows"))]
-fn missing_desktop_project_visible(_archived: bool) -> bool {
-    false
-}
-
-#[cfg(target_os = "windows")]
-fn matched_desktop_project_visible(
-    _task_id: &str,
-    archived: bool,
-    _catalog_visible: Option<bool>,
-    _project_state: &DesktopProjectState,
-) -> bool {
-    !archived
-}
-
-#[cfg(not(target_os = "windows"))]
-fn matched_desktop_project_visible(
-    task_id: &str,
-    archived: bool,
-    catalog_visible: Option<bool>,
-    project_state: &DesktopProjectState,
-) -> bool {
-    !archived && catalog_visible.unwrap_or_else(|| project_state.client_threads.contains(task_id))
+fn desktop_sidebar_visible(archived: bool, registered_in_sidebar: bool) -> bool {
+    !archived && registered_in_sidebar
 }
 
 fn value_array_strings(value: Option<&Value>) -> Vec<String> {
@@ -1235,6 +1269,9 @@ fn read_desktop_project_state(home: &Path) -> Option<DesktopProjectState> {
     };
     let mut result = DesktopProjectState::default();
     result.project_order = value_array_strings(state.get("project-order"));
+    result.projectless_threads = value_array_strings(state.get("projectless-thread-ids"))
+        .into_iter()
+        .collect();
     let pinned_ids = value_array_strings(state.get("pinned-project-ids"))
         .into_iter()
         .collect::<HashSet<_>>();
@@ -1279,16 +1316,6 @@ fn read_desktop_project_state(home: &Path) -> Option<DesktopProjectState> {
                             .to_string(),
                     },
                 );
-            }
-        }
-    }
-
-    for source in [Some(&value), nested_state] {
-        if let Some(items) = source.and_then(Value::as_object) {
-            for key in items.keys() {
-                if let Some(id) = key.strip_prefix("thread-client-id-v1:local%3A") {
-                    result.client_threads.insert(id.to_string());
-                }
             }
         }
     }
@@ -1492,6 +1519,12 @@ fn push_unique_string(items: &mut Vec<Value>, value: &str) {
     }
 }
 
+fn prepend_unique_string(items: &mut Vec<Value>, value: &str) {
+    if !items.iter().any(|item| item.as_str() == Some(value)) {
+        items.insert(0, Value::String(value.to_string()));
+    }
+}
+
 fn sort_tasks_by_project_order(tasks: &mut [Task], project_order: &[String]) {
     let positions = project_order
         .iter()
@@ -1625,7 +1658,14 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
                 .entry("project-order")
                 .or_insert_with(|| Value::Array(Vec::new())),
         );
-        push_unique_string(project_order, &project_id);
+        // A recovered project no longer has an entry in Codex's previous order.
+        // Put it at the top instead of silently appending it below every existing
+        // project; existing projects retain their current position.
+        if project_already_exists {
+            push_unique_string(project_order, &project_id);
+        } else {
+            prepend_unique_string(project_order, &project_id);
+        }
 
         if task.project_pinned && !project_already_exists {
             let pinned_projects = array_mut(
@@ -1754,27 +1794,35 @@ fn infer_project(task: &Task) -> (String, String, String, bool) {
 fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), String> {
     let home = codex_home();
     let index = read_index(&home);
+    let history_messages = history_first_messages(&home);
     let database = database_tasks(&home);
     let catalog = catalog_tasks(&home);
     let affected_title_ids = bad_title_ids_from_metadata(&index, &database, &catalog);
     let desktop_projects = read_desktop_project_state(&home);
-    let mut files = HashSet::new();
-    let sessions = home.join("sessions");
-    if sessions.exists() {
-        for entry in WalkDir::new(sessions).into_iter().flatten() {
-            if entry.file_type().is_file()
-                && entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-            {
-                files.insert(entry.path().to_path_buf());
+    let mut files = Vec::new();
+    for session_root in [home.join("sessions"), home.join("archived_sessions")] {
+        if session_root.exists() {
+            for entry in WalkDir::new(session_root).into_iter().flatten() {
+                if entry.file_type().is_file()
+                    && entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+                {
+                    files.push(entry.path().to_path_buf());
+                }
             }
         }
     }
     let mut tasks = Vec::new();
+    let mut seen_task_ids = HashSet::new();
     for path in files {
         let Ok(mut task) = session_details(&path) else {
             continue;
         };
         if task.id.is_empty() {
+            continue;
+        }
+        // Prefer the active copy when the same task also has an archived
+        // residue, avoiding duplicate rows in the export list.
+        if !seen_task_ids.insert(task.id.clone()) {
             continue;
         }
         let indexed = index.get(&task.id);
@@ -1792,6 +1840,7 @@ fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), Str
             })
             .or_else(|| database_task.map(|item| item.title.clone()))
             .filter(|title| !is_bad_title(title))
+            .or_else(|| history_messages.get(&task.id).cloned())
             .unwrap_or_else(|| truncate(&task.first_user_message, 96));
         normalize_task_title(&mut task);
         if task.title.is_empty() {
@@ -1857,7 +1906,8 @@ fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), Str
                 task.history_mode = database_task.history_mode.clone();
             }
         }
-        task.archived = database_task.map(|item| item.archived).unwrap_or(false);
+        let file_is_archived = path.starts_with(home.join("archived_sessions"));
+        task.archived = file_is_archived || database_task.map(|item| item.archived).unwrap_or(false);
         let catalog_visible = catalog_visibility(&catalog, &task.id);
         task.codex_visible = catalog_visible.unwrap_or(true);
         (
@@ -1870,7 +1920,7 @@ fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), Str
             if let Some(assignment) = project_state.assignments.get(&task.id) {
                 if let Some(project) = project_state.projects.get(&assignment.project_id) {
                     apply_desktop_project(&mut task, project);
-                    task.codex_visible = !task.archived;
+                    task.codex_visible = desktop_sidebar_visible(task.archived, true);
                 } else {
                     let path = if assignment.cwd.trim().is_empty() {
                         task.cwd.clone()
@@ -1882,22 +1932,21 @@ fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), Str
                     task.project_path = path.clone();
                     task.project_exists = Path::new(&path).exists();
                     task.project_pinned = false;
-                    task.codex_visible = missing_desktop_project_visible(task.archived);
+                    // Codex keeps a client-thread entry after a project is removed from
+                    // the sidebar. The dangling project assignment is the authoritative
+                    // signal in this case, not the stale client-thread entry.
+                    task.codex_visible = false;
                 }
             } else if let Some(project) =
                 matching_desktop_project(project_state, &task.cwd, &task.project_path)
             {
                 apply_desktop_project(&mut task, project);
-                task.codex_visible = matched_desktop_project_visible(
-                    &task.id,
-                    task.archived,
-                    catalog_visible,
-                    project_state,
-                );
+                task.codex_visible = desktop_sidebar_visible(task.archived, true);
             } else {
-                task.codex_visible = !task.archived
-                    && catalog_visible
-                        .unwrap_or_else(|| project_state.client_threads.contains(&task.id));
+                task.codex_visible = desktop_sidebar_visible(
+                    task.archived,
+                    project_state.projectless_threads.contains(&task.id),
+                );
             }
         }
         task.browser_file = home
@@ -2265,7 +2314,7 @@ fn append_index(home: &Path, tasks: &[Task]) -> Result<(), String> {
 }
 
 fn verify_registered_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
-    let state_exists = home.join("state_5.sqlite").exists();
+    let state_exists = latest_state_database(home).exists();
     let catalog = catalog_tasks(home);
     let catalog_available = catalog.is_some();
     if !state_exists && !catalog_available {
@@ -2297,7 +2346,7 @@ fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn codex_state_paths(home: &Path) -> Vec<PathBuf> {
-    let state = home.join("state_5.sqlite");
+    let state = latest_state_database(home);
     let catalog = home.join("sqlite").join("codex-dev.db");
     vec![
         home.join("session_index.jsonl"),
@@ -2562,7 +2611,10 @@ fn validate_task_library() -> Result<TaskLibraryValidation, String> {
     }
 
     let integrity = vec![
-        sqlite_integrity(&home.join("state_5.sqlite"), "state_5.sqlite"),
+        {
+            let state = latest_state_database(&home);
+            sqlite_integrity(&state, state.file_name().and_then(|name| name.to_str()).unwrap_or("state.sqlite"))
+        },
         sqlite_integrity(&home.join("sqlite").join("codex-dev.db"), "codex-dev.db"),
     ];
     let healthy = issues.is_empty() && integrity.iter().all(|item| item.status == "ok");
@@ -2624,7 +2676,7 @@ fn replace_if_present(target: &mut String, source: &str) {
 }
 
 fn register_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
-    let state = home.join("state_5.sqlite");
+    let state = latest_state_database(home);
     if !state.exists() {
         return Ok(());
     }
@@ -3119,7 +3171,7 @@ fn repair_bad_titles() -> Result<serde_json::Value, String> {
     let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
     let backups = [
         backup_database(&home.join("session_index.jsonl"), &stamp),
-        backup_database(&home.join("state_5.sqlite"), &stamp),
+        backup_database(&latest_state_database(&home), &stamp),
         backup_database(&home.join("sqlite").join("codex-dev.db"), &stamp),
     ]
     .into_iter()
@@ -3248,7 +3300,7 @@ fn restore_local_tasks(task_ids: Vec<String>) -> Result<serde_json::Value, Strin
         normalize_task_to_codex_model(task, &model_settings);
     }
     let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    checkpoint_sqlite_database(&home.join("state_5.sqlite"))?;
+    checkpoint_sqlite_database(&latest_state_database(&home))?;
     checkpoint_sqlite_database(&home.join("sqlite").join("codex-dev.db"))?;
     let mut transaction = ImportTransaction::new(&home);
     for path in codex_state_paths(&home) {
@@ -3359,7 +3411,7 @@ fn import_archive(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    checkpoint_sqlite_database(&home.join("state_5.sqlite"))?;
+    checkpoint_sqlite_database(&latest_state_database(&home))?;
     checkpoint_sqlite_database(&home.join("sqlite").join("codex-dev.db"))?;
     let mut transaction = ImportTransaction::new(&home);
     let mut imported = Vec::new();
@@ -3641,9 +3693,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_index, archive_manifest, codex_model_settings, codex_state_paths, infer_project,
-        is_codex_context_text, is_safe_task_id, register_catalog_threads,
-        register_desktop_project_state, register_threads, repository_name, rewrite_session_cwd,
+        append_index, archive_manifest, codex_model_settings, codex_state_paths, history_first_messages, infer_project,
+        is_bad_title, is_codex_context_text, is_safe_task_id, meaningful_user_text, register_catalog_threads,
+        latest_state_database, register_desktop_project_state, register_threads, repository_name, rewrite_session_cwd,
         rewrite_session_model_context, safe_merge_session_jsonl, session_details, simple_toml_string,
         sort_tasks_by_project_order, verify_registered_threads, ArchiveTask, CodexModelSettings,
         ImportTransaction, Manifest, Task, ARCHIVE_SCHEMA,
@@ -3686,6 +3738,43 @@ mod tests {
     }
 
     #[test]
+    fn latest_state_database_prefers_the_highest_numeric_version() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-latest-state-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("state_5.sqlite"), "").unwrap();
+        fs::write(home.join("state_12.sqlite"), "").unwrap();
+
+        assert_eq!(latest_state_database(&home), home.join("state_12.sqlite"));
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn history_messages_keep_the_first_readable_user_message_per_session() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-history-title-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("history.jsonl"),
+            concat!(
+                "{\"session_id\":\"history-task\",\"text\":\"第一个问题\"}\n",
+                "{\"session_id\":\"history-task\",\"text\":\"第二个问题\"}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            history_first_messages(&home).get("history-task").map(String::as_str),
+            Some("第一个问题")
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn rewrite_session_cwd_only_updates_structured_path_fields() {
         let source = concat!(
             "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/old\"}}\n",
@@ -3716,6 +3805,13 @@ mod tests {
         assert!(is_codex_context_text(
             "<environment_context> <cwd>/tmp/project</cwd> </environment_context>"
         ));
+    }
+
+    #[test]
+    fn title_filter_removes_embedded_image_and_tool_transcript() {
+        let raw = "优化一下界面排版 <image name=[Image #1] path=\"C:\\Temp\\layout.png\"> assistant to=functions.exec tool exec call: ignored";
+        assert!(is_bad_title(raw));
+        assert_eq!(meaningful_user_text(raw).as_deref(), Some("优化一下界面排版"));
     }
 
     #[test]
@@ -4146,16 +4242,27 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
-    fn missing_desktop_project_is_hidden_on_macos_like_state() {
-        assert!(!super::missing_desktop_project_visible(false));
+    fn catalog_visibility_only_reports_explicit_catalog_entries() {
+        let mut catalog = std::collections::HashMap::new();
+        catalog.insert("visible-task".to_string(), ("Task".to_string(), String::new(), true));
+        catalog.insert("removed-task".to_string(), ("Task".to_string(), String::new(), false));
+        let catalog = Some(catalog);
+        assert_eq!(super::catalog_visibility(&catalog, "visible-task"), Some(true));
+        assert_eq!(super::catalog_visibility(&catalog, "removed-task"), Some(false));
+        assert_eq!(super::catalog_visibility(&catalog, "not-in-sidebar"), None);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn missing_desktop_project_stays_visible_on_windows_compat_state() {
-        assert!(super::missing_desktop_project_visible(false));
+    fn desktop_sidebar_visibility_requires_a_current_sidebar_registration() {
+        assert!(super::desktop_sidebar_visible(false, true));
+        assert!(!super::desktop_sidebar_visible(false, false));
+        assert!(!super::desktop_sidebar_visible(true, true));
+    }
+
+    #[test]
+    fn dangling_project_assignment_is_not_sidebar_visible() {
+        assert!(!super::desktop_sidebar_visible(false, false));
     }
 
     #[test]

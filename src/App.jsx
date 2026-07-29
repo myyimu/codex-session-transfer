@@ -407,9 +407,10 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
   const [repairPlan, setRepairPlan] = useState(null);
   const [planning, setPlanning] = useState(false);
   const [repairReceipt, setRepairReceipt] = useState(null);
+  const [repairQuery, setRepairQuery] = useState("");
+  const [deferredDetailsOpen, setDeferredDetailsOpen] = useState(false);
   const [validation, setValidation] = useState(null);
   const [validating, setValidating] = useState(false);
-  const [recentReceipt, setRecentReceipt] = useState(null);
   const [visibleLimit, setVisibleLimit] = useState(120);
   const codexRunning = Boolean(environment?.codexRunning);
 
@@ -421,6 +422,7 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
         : await bridge.listTasks();
       setTasks(result.tasks || []);
       setHealthReport(result.health || null);
+      return result;
     } catch (error) {
       showToast("error", "读取失败", error.message);
     } finally {
@@ -498,14 +500,14 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
     }
   };
 
-  const openHealth = async () => {
-    const candidates = healthReport?.tasks
-      ?.filter((task) => task.safeActions?.length && !task.requiresManualReview)
-      .map((task) => task.id) || [];
+  const openHealth = async (preferredIds = []) => {
+    const candidates = repairableTaskIds(healthReport);
+    const preferred = new Set(preferredIds.filter((id) => candidates.includes(id)));
     setRepairReceipt(null);
-    setHealthSelection(new Set(candidates));
+    setRepairQuery("");
+    setDeferredDetailsOpen(false);
+    setHealthSelection(preferred);
     setHealthOpen(true);
-    bridge.listOperationReceipts?.().then((items) => setRecentReceipt(items[0] || null)).catch(() => setRecentReceipt(null));
     await refreshRepairPlan(candidates);
   };
 
@@ -516,6 +518,12 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
     try {
       const next = await bridge.validateTaskLibrary();
       setValidation(next);
+      const library = await load();
+      const candidates = repairableTaskIds(library?.health);
+      setHealthSelection(new Set());
+      setRepairQuery("");
+      setDeferredDetailsOpen(false);
+      await refreshRepairPlan(candidates);
       showToast(next.healthy ? "success" : "error", next.healthy ? "任务库验证通过" : `发现 ${next.issueCount} 个一致性问题`, `${next.taskCount} 个本地任务已检查`);
     } catch (error) {
       showToast("error", "任务库验证失败", error.message);
@@ -524,20 +532,25 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
     }
   };
 
-  const openReceiptDirectory = async () => {
-    try {
-      const directory = await bridge.getOperationReceiptsDirectory?.();
-      if (directory) await bridge.revealPath(directory);
-    } catch (error) {
-      showToast("error", "无法打开回执目录", error.message);
-    }
-  };
-
   const toggleHealthTask = (id) => {
     const next = new Set(healthSelection);
     next.has(id) ? next.delete(id) : next.add(id);
     setHealthSelection(next);
   };
+
+  const repairGroups = useMemo(
+    () => buildRepairGroups(repairPlan?.items || [], tasks, repairQuery, healthSelection),
+    [healthSelection, repairPlan, repairQuery, tasks],
+  );
+
+  const toggleAllRepairable = () => {
+    const actionable = repairPlan?.items.filter((item) => item.canApply).map((item) => item.id) || [];
+    setHealthSelection((current) => current.size === actionable.length ? new Set() : new Set(actionable));
+  };
+
+  const deferredIssueCount = validation?.issueCount
+    ? Math.max(0, validation.issueCount - (repairPlan?.actionableCount || 0))
+    : (healthReport?.summary?.manualReviewCount || 0);
 
   const applyHealthPlan = async () => {
     setOperation("health");
@@ -560,7 +573,7 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
   };
 
   return (
-    <section className="workspace" aria-labelledby="export-title">
+    <section className={`workspace ${healthReport ? "export-workspace-has-health" : ""}`} aria-labelledby="export-title">
       <header className="workspace-header">
         <div>
           <span className="eyebrow">从这台电脑导出</span>
@@ -579,13 +592,13 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
             <span><strong>任务库健康检查</strong><small>只读扫描，不会自动修改本地数据</small></span>
           </span>
           <div className="health-summary-actions">
-            <button type="button" className="health-chip healthy" onClick={openHealth}>{healthReport.summary.healthyCount} 正常</button>
-            <button type="button" className="health-chip" onClick={openHealth}>{healthReport.summary.reregisterCount} 可重新登记</button>
-            <button type="button" className="health-chip" onClick={openHealth}>{healthReport.summary.titleRepairCount} 建议修复标题</button>
-            {healthReport.summary.manualReviewCount > 0 && <button type="button" className="health-chip warning" onClick={openHealth}>{healthReport.summary.manualReviewCount} 需人工处理</button>}
+            <button type="button" className="health-chip healthy" onClick={() => openHealth()}>{healthReport.summary.healthyCount} 正常</button>
+            <button type="button" className="health-chip" onClick={() => openHealth()}>{healthReport.summary.reregisterCount} 可重新登记</button>
+            <button type="button" className="health-chip" onClick={() => openHealth()}>{healthReport.summary.titleRepairCount} 建议修复标题</button>
+            {healthReport.summary.manualReviewCount > 0 && <button type="button" className="health-chip warning" onClick={() => openHealth()}>{healthReport.summary.manualReviewCount} 需人工处理</button>}
           </div>
           <button type="button" className="text-button compact health-open-button" onClick={validateLibrary}>验证任务库</button>
-          <button type="button" className="text-button compact health-open-button" onClick={openHealth}>查看建议</button>
+          <button type="button" className="text-button compact health-open-button" onClick={() => openHealth()}>查看建议</button>
         </section>
       )}
 
@@ -640,11 +653,11 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
           <button
             className="secondary-button"
             disabled={operation || !healthReport}
-            onClick={openHealth}
-            title="查看本地任务健康检查与可安全执行的修复建议"
+            onClick={() => openHealth([...selected])}
+            title={selected.size ? "把当前已选任务带入修复建议" : "查看本地任务健康检查与可安全执行的修复建议"}
           >
             <Wrench size={18} weight="bold" />
-            {operation === "health" ? "正在修复…" : "检查并修复"}
+            {operation === "health" ? "正在修复…" : selected.size ? `修复所选 ${selected.size} 个任务` : "检查并修复"}
           </button>
         </div>
       </footer>
@@ -653,54 +666,96 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
         <div className="health-drawer-backdrop" role="presentation" onMouseDown={() => setHealthOpen(false)}>
           <aside className="health-drawer" role="dialog" aria-modal="true" aria-label="本地任务修复建议" onMouseDown={(event) => event.stopPropagation()}>
             <header className="health-drawer-header">
-              <span><Wrench size={20} weight="duotone" /><span><strong>本地任务修复建议</strong><small>先预览影响，再创建快照并执行</small></span></span>
-              <button className="icon-button" onClick={() => setHealthOpen(false)} aria-label="关闭修复建议" title="关闭"><X size={17} /></button>
+              <span><Wrench size={20} weight="duotone" /><span><strong>修复任务</strong><small>{repairPlan?.actionableCount || 0} 个任务可安全修复</small></span></span>
+              <button className="icon-button health-drawer-close" type="button" onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setHealthOpen(false); }} aria-label="关闭修复建议" title="关闭"><X size={17} /></button>
             </header>
-
-            {validation && (
-              <div className={`validation-result ${validation.healthy ? "is-healthy" : "is-warning"}`}>
-                <ShieldCheck size={19} weight="duotone" />
-                <span><strong>{validation.healthy ? "任务库验证通过" : `发现 ${validation.issueCount} 个一致性问题`}</strong><small>{validation.integrity?.map((item) => `${item.name}: ${item.status}`).join(" · ")}</small>{validation.issues?.slice(0, 2).map((item) => <small key={`${item.code}-${item.id}`}>{item.title || item.id}：{item.detail}</small>)}</span>
-              </div>
-            )}
-            {recentReceipt && !repairReceipt && (
-              <p className="recent-receipt">最近维护：{recentReceipt.kind === "import" ? "导入" : "修复"} · {formatDate(recentReceipt.createdAt)} · 回执当前文件达到 1 MiB 后轮换，最多保留 8 份历史文件</p>
-            )}
 
             {repairReceipt ? (
               <div className="repair-receipt">
                 <ShieldCheck size={20} weight="duotone" />
-                <span><strong>操作回执</strong><small>{repairReceipt.registered || 0} 个重新登记 · {repairReceipt.titlesRepaired || 0} 个标题修复 · {repairReceipt.skipped || 0} 个跳过</small><small title={repairReceipt.codexHome}>{repairReceipt.message || repairReceipt.codexHome}</small>{repairReceipt.backups?.length > 0 && <small title={repairReceipt.backups.join("\n")}>快照：{repairReceipt.backups[0]}{repairReceipt.backups.length > 1 ? ` 等 ${repairReceipt.backups.length} 份` : ""}</small>}{repairReceipt.receiptWarning && <small>{repairReceipt.receiptWarning}</small>}</span>
-                {repairReceipt.receiptPath && <button className="icon-button" onClick={() => bridge.revealPath(repairReceipt.receiptPath)} title="打开维护回执" aria-label="打开维护回执"><FolderOpen size={17} /></button>}
+                <span><strong>修复已完成</strong><small>{(repairReceipt.registered || 0) + (repairReceipt.titlesRepaired || 0)} 个任务已处理</small></span>
               </div>
             ) : (
               <>
-                <p className="health-drawer-note">只会重新登记会话并修复已确认的异常标题；不会覆盖 JSONL 正文、创建项目文件夹或改写长期记忆。</p>
+                <p className="health-drawer-note">选择需要处理的任务；会话内容不会被覆盖。</p>
+                <div className="repair-plan-tools">
+                  <label className="repair-search-field">
+                    <MagnifyingGlass size={16} />
+                    <input value={repairQuery} onChange={(event) => setRepairQuery(event.target.value)} placeholder="搜索项目、任务名或路径" />
+                    {repairQuery && <button type="button" onClick={() => setRepairQuery("")} aria-label="清空修复搜索" title="清空搜索"><X size={14} /></button>}
+                  </label>
+                  <button type="button" className="text-button compact" onClick={toggleAllRepairable} disabled={!repairPlan?.actionableCount}>
+                    {healthSelection.size ? "清空选择" : `全选可修复 ${repairPlan?.actionableCount || 0} 个`}
+                  </button>
+                </div>
                 <div className="repair-plan-list">
                   {planning && <div className="repair-plan-empty"><ArrowClockwise size={20} className="spin" />正在生成修复计划…</div>}
-                  {!planning && repairPlan?.items.map((item) => (
-                    <label className={`repair-plan-item ${item.canApply ? "" : "is-blocked"}`} key={item.id}>
-                      <input type="checkbox" checked={healthSelection.has(item.id)} disabled={!item.canApply} onChange={() => toggleHealthTask(item.id)} />
-                      <span><strong title={item.title}>{item.title}</strong><small>{item.actions?.includes("reregister") ? "重新登记到 Codex 侧栏" : ""}{item.actions?.includes("repair_title") ? `${item.actions?.includes("reregister") ? " · " : ""}修复异常标题` : ""}</small><small title={item.cwd}>{item.reason}</small></span>
-                    </label>
+                  {!planning && repairGroups.map((group) => (
+                    <section className="repair-project-group" key={group.key}>
+                      <header><span><strong>{group.name}</strong><small title={group.path}>{group.path || "未记录项目路径"}</small></span><em>{group.items.length} 个任务</em></header>
+                      {group.items.map((item) => (
+                        <label className={`repair-plan-item ${item.canApply ? "" : "is-blocked"}`} key={item.id}>
+                          <input type="checkbox" checked={healthSelection.has(item.id)} disabled={!item.canApply} onChange={() => toggleHealthTask(item.id)} />
+                          <span><strong title={item.title}>{item.title}</strong><small>{item.actions?.includes("reregister") ? "重新显示在 Codex 中" : ""}{item.actions?.includes("repair_title") ? `${item.actions?.includes("reregister") ? " · " : ""}整理任务标题` : ""}</small></span>
+                        </label>
+                      ))}
+                    </section>
                   ))}
                   {!planning && !repairPlan?.items.length && <div className="repair-plan-empty">没有发现可安全修复的任务</div>}
+                  {!planning && repairPlan?.items.length > 0 && !repairGroups.length && <div className="repair-plan-empty">没有匹配的修复建议</div>}
                 </div>
-                {repairPlan && <p className="health-snapshot-note">{repairPlan.snapshotNote}</p>}
+                {deferredIssueCount > 0 && (
+                  <div className="deferred-issues">
+                    <button type="button" onClick={() => setDeferredDetailsOpen((open) => !open)}>{`另有 ${deferredIssueCount} 项未自动处理`}</button>
+                    {deferredDetailsOpen && <small>这些项目没有安全的自动修复方式，已保持不变。</small>}
+                  </div>
+                )}
               </>
             )}
 
             <footer className="health-drawer-footer">
-              <span>{repairReceipt ? "重新打开 Codex 后检查任务是否重新出现" : validating ? "正在验证任务库…" : `${repairPlan?.actionableCount || 0} 个任务可安全修复`}</span>
-              <button className="secondary-button compact-validation-button" onClick={openReceiptDirectory}>打开回执目录</button>
-              {!repairReceipt && <button className="secondary-button compact-validation-button" disabled={validating} onClick={validateLibrary}>{validating ? "正在验证…" : "验证任务库"}</button>}
-              {!repairReceipt && <button className="primary-button" disabled={!healthSelection.size || planning || operation || codexRunning} onClick={applyHealthPlan}>{codexRunning ? "请先退出 Codex" : operation === "health" ? "正在创建快照…" : "创建快照并修复"}</button>}
+              <span className="health-footer-status">{repairReceipt ? "重新打开 Codex 后检查任务是否重新出现" : validating ? "正在检查…" : healthSelection.size ? `已选择 ${healthSelection.size} 个任务` : "请选择需要修复的任务"}</span>
+              <div className="health-footer-actions">
+                {!repairReceipt && <button className="primary-button" disabled={!healthSelection.size || planning || operation || codexRunning} onClick={applyHealthPlan}>{codexRunning ? "请先退出 Codex" : operation === "health" ? "正在创建快照…" : "创建快照并修复"}</button>}
+              </div>
             </footer>
           </aside>
         </div>
       )}
     </section>
   );
+}
+
+function repairableTaskIds(report) {
+  return report?.tasks
+    ?.filter((task) => task.safeActions?.length && !task.requiresManualReview)
+    .map((task) => task.id) || [];
+}
+
+function buildRepairGroups(items, tasks, query, selectedIds) {
+  const taskById = new Map(tasks.map((task) => [task.id, task]));
+  const needle = query.trim().toLocaleLowerCase();
+  const groups = new Map();
+  items.forEach((item) => {
+    const task = taskById.get(item.id);
+    const key = task ? projectKey(task) : item.cwd || "__unknown__";
+    const name = task ? projectName(task) : (filename(item.cwd) || "未记录项目");
+    const path = task?.projectPath || item.cwd || task?.cwd || "";
+    const searchText = [name, path, item.title, item.cwd, item.reason, ...(item.actions || [])]
+      .join(" ")
+      .toLocaleLowerCase();
+    if (needle && !searchText.includes(needle)) return;
+    const group = groups.get(key) || { key, name, path, items: [] };
+    group.items.push(item);
+    groups.set(key, group);
+  });
+  return [...groups.values()]
+    .map((group) => ({
+      ...group,
+      items: [...group.items].sort((left, right) => Number(selectedIds.has(right.id)) - Number(selectedIds.has(left.id))),
+      hasSelected: group.items.some((item) => selectedIds.has(item.id)),
+    }))
+    .sort((left, right) => Number(right.hasSelected) - Number(left.hasSelected) || left.name.localeCompare(right.name, "zh-CN"));
 }
 
 function ImportView({ environment, showToast }) {

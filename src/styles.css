@@ -227,6 +227,10 @@ nav button.active strong {
   grid-template-rows: auto minmax(0, 1fr) auto;
 }
 
+.workspace.export-workspace-has-health {
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+}
+
 .workspace-header {
   display: flex;
   align-items: flex-start;
@@ -1345,6 +1349,12 @@ h1 {
   line-height: 15px;
 }
 
+.validation-result small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .validation-result strong {
   color: #315e4b;
   font-size: 11px;
@@ -1435,7 +1445,7 @@ h1 {
 }
 
 .health-drawer {
-  width: min(460px, calc(100vw - 28px));
+  width: min(540px, calc(100vw - 28px));
   height: 100%;
   display: flex;
   flex-direction: column;
@@ -1457,6 +1467,13 @@ h1 {
   border-bottom: 1px solid rgba(74, 110, 120, 0.1);
 }
 
+.health-drawer-close {
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
+  -webkit-app-region: no-drag;
+}
+
 .health-drawer-note,
 .health-snapshot-note {
   margin: 14px 20px;
@@ -1465,10 +1482,81 @@ h1 {
   line-height: 18px;
 }
 
+.deferred-issues {
+  margin: 0 20px 12px;
+  color: #7b8d94;
+  font-size: 10px;
+}
+
+.deferred-issues button {
+  padding: 0;
+  color: #6d858e;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.deferred-issues small {
+  display: block;
+  margin-top: 5px;
+  line-height: 15px;
+}
+
 .health-snapshot-note {
   padding: 8px 10px;
   border-radius: 7px;
   background: #f3fafc;
+}
+
+.repair-plan-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 20px 10px;
+}
+
+.repair-search-field {
+  height: 34px;
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  color: #66818c;
+  border: 1px solid rgba(78, 131, 149, 0.2);
+  border-radius: 7px;
+  background: #fbfeff;
+}
+
+.repair-search-field:focus-within {
+  border-color: #62bddb;
+  box-shadow: 0 0 0 3px rgba(98, 189, 219, 0.12);
+}
+
+.repair-search-field input {
+  min-width: 0;
+  flex: 1;
+  color: #395863;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+}
+
+.repair-search-field button {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  color: #68818b;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
 }
 
 .repair-plan-list {
@@ -1476,6 +1564,58 @@ h1 {
   min-height: 0;
   overflow: auto;
   padding: 0 12px;
+}
+
+.repair-project-group {
+  overflow: hidden;
+  margin-bottom: 10px;
+  border: 1px solid rgba(79, 127, 143, 0.14);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.repair-project-group > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  border-bottom: 1px solid rgba(79, 127, 143, 0.1);
+  background: rgba(237, 250, 255, 0.72);
+}
+
+.repair-project-group > header span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.repair-project-group > header strong {
+  overflow: hidden;
+  color: #2a5767;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repair-project-group > header small {
+  overflow: hidden;
+  color: #7a9199;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repair-project-group > header em {
+  flex: 0 0 auto;
+  color: #4e8293;
+  font-size: 10px;
+  font-style: normal;
+}
+
+.repair-project-group .repair-plan-item:last-child {
+  border-bottom: 0;
 }
 
 .repair-plan-item {
@@ -1544,16 +1684,35 @@ h1 {
 }
 
 .health-drawer-footer {
-  min-height: 70px;
+  min-height: 78px;
+  display: grid;
+  grid-template-columns: minmax(108px, 1fr) auto;
+  align-items: center;
   margin-top: auto;
   border-top: 1px solid rgba(74, 110, 120, 0.1);
   background: rgba(251, 254, 255, 0.92);
 }
 
-.health-drawer-footer > span {
+.health-footer-status {
+  min-width: 0;
   color: #6c818a;
   font-size: 10px;
   line-height: 15px;
+}
+
+.health-footer-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.health-footer-actions .compact-validation-button {
+  min-width: 112px;
+}
+
+.health-footer-actions .primary-button {
+  min-width: 142px;
 }
 
 .load-more-tasks {
@@ -1576,5 +1735,30 @@ h1 {
   .health-summary-actions {
     order: 3;
     flex-basis: 100%;
+  }
+}
+
+@media (max-width: 680px) {
+  .health-drawer {
+    width: 100vw;
+  }
+
+  .health-drawer-header,
+  .health-drawer-footer {
+    padding-inline: 16px;
+  }
+
+  .health-drawer-footer {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .health-footer-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .health-footer-actions > button {
+    flex: 1 1 132px;
   }
 }

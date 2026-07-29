@@ -40,3 +40,31 @@ The 1120 x 760 captures keep list titles, timestamps, paths, statuses, and persi
 - Primary interactions tested: search, select, export completion, import navigation, archive preview, duplicate status, import completion.
 - Console errors checked: none.
 - final result: passed
+
+---
+
+# 2026-07-29 修复建议抽屉排版复核
+
+- Source visual truth: `C:/Users/Legion/AppData/Local/Temp/codex-clipboard-74827dd1-43e7-455f-bcd4-ac81a239228e.png`
+- Implementation evidence: browser-rendered local Vite preview at `http://127.0.0.1:4173/` (1280 × 720 CSS px); the browser demo data does not expose a repair-plan drawer state.
+- State: populated export list after the drawer-footer layout change.
+
+## Findings
+
+- [Resolved P1] Persistent drawer controls could overflow the narrow footer and force the status copy into character-by-character wrapping.
+  - Fix: the footer now uses a two-column grid, with status copy allowed to shrink and the three actions grouped in `.health-footer-actions`; the drawer has a 540 px desktop maximum and a wrapping mobile action layout.
+  - Evidence: `npm run build:web` succeeds; the running 1280 × 720 preview keeps the main list, toolbar and persistent export action bar within the viewport.
+
+## Required fidelity surfaces
+
+- Typography: preserves the existing compact 10–12 px utility copy and 12 px action labels; status copy has a dedicated shrinking column rather than a forced narrow flex item.
+- Spacing and layout rhythm: footer padding and 8 px button gaps remain consistent; the actions are contained as one aligned group.
+- Colors and tokens: no color changes; cyan action semantics, translucent surfaces and watercolor background are retained.
+- Image quality and asset fidelity: no imagery or assets were changed.
+- Copy and content: repair, verification and receipt labels are unchanged.
+
+## Test gap
+
+The browser-only demo bridge does not return a health report, so it cannot open the native repair-plan drawer for a screenshot matched to the supplied drawer reference. The code path is compiled successfully, but this exact native state still needs one visual pass in the desktop app.
+
+- final result: blocked
