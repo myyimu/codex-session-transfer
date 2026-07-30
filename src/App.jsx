@@ -412,11 +412,58 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
   const [validation, setValidation] = useState(null);
   const [validating, setValidating] = useState(false);
   const [visibleLimit, setVisibleLimit] = useState(120);
+  const [scanProgress, setScanProgress] = useState(null);
+  const scanRunRef = useRef(null);
   const codexRunning = Boolean(environment?.codexRunning);
 
-  const load = async () => {
+  const load = useCallback(async (resumeToken) => {
+    const continuation = typeof resumeToken === "string" ? resumeToken : undefined;
+    if (scanRunRef.current && bridge.cancelBackgroundJob) bridge.cancelBackgroundJob(scanRunRef.current);
     setLoading(true);
+    setScanProgress({ stage: "starting", scanned: 0, total: 0, discovered: 0 });
+    if (!continuation) {
+      setHealthReport(null);
+      setTasks([]);
+    }
     try {
+      if (bridge.startTaskScan && bridge.onTaskScanProgress) {
+        const runId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+        scanRunRef.current = runId;
+        return await new Promise((resolve, reject) => {
+          let unlisten = null;
+          const finish = (callback) => {
+            if (scanRunRef.current === runId) scanRunRef.current = null;
+            unlisten?.();
+            callback();
+          };
+          bridge.onTaskScanProgress((event) => {
+            if (event?.runId !== runId) return;
+            setScanProgress(event);
+            if (event.kind === "batch") {
+              setTasks((current) => {
+                const next = new Map(current.map((task) => [task.id, task]));
+                (event.tasks || []).forEach((task) => next.set(task.id, task));
+                return sortTasksByUpdated([...next.values()]);
+              });
+            }
+            if (event.kind === "complete") {
+              setTasks(sortTasksByUpdated(event.tasks || []));
+              setHealthReport(event.health || null);
+              finish(() => resolve(event));
+            } else if (event.kind === "cancelled") {
+              finish(() => resolve(null));
+            } else if (event.kind === "timed_out") {
+              showToast("error", "扫描暂停", "已保留已发现的任务，可继续扫描剩余任务或重新扫描。");
+              finish(() => resolve(null));
+            } else if (event.kind === "error") {
+              finish(() => reject(new Error(event.message || "读取本地任务失败")));
+            }
+          }).then((stop) => {
+            unlisten = stop;
+            bridge.startTaskScan(runId, continuation).catch((error) => finish(() => reject(error)));
+          }).catch(reject);
+        });
+      }
       const result = bridge.loadTaskLibrary
         ? await bridge.loadTaskLibrary()
         : await bridge.listTasks();
@@ -426,11 +473,16 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
     } catch (error) {
       showToast("error", "读取失败", error.message);
     } finally {
-      setLoading(false);
+      if (!scanRunRef.current) setLoading(false);
     }
-  };
+  }, [showToast]);
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    return () => {
+      if (scanRunRef.current && bridge.cancelBackgroundJob) bridge.cancelBackgroundJob(scanRunRef.current);
+    };
+  }, [load]);
 
   const projects = useMemo(() => buildProjects(tasks), [tasks]);
 
@@ -469,6 +521,24 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
       else visibleTasks.forEach((task) => next.add(task.id));
       return next;
     });
+  };
+
+  const cancelScan = () => {
+    if (scanRunRef.current && bridge.cancelBackgroundJob) {
+      bridge.cancelBackgroundJob(scanRunRef.current);
+      setScanProgress((current) => current ? { ...current, stage: "cancelling" } : current);
+    }
+  };
+
+  const resumeScan = () => {
+    if (scanProgress?.resumeToken) load(scanProgress.resumeToken);
+  };
+
+  const loadMoreOnScroll = (event) => {
+    const { scrollTop, scrollHeight, clientHeight } = event.currentTarget;
+    if (scrollHeight - scrollTop - clientHeight < 180) {
+      setVisibleLimit((current) => Math.min(current + 120, filtered.length));
+    }
   };
 
   const exportSelected = async () => {
@@ -578,11 +648,15 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
         <div>
           <span className="eyebrow">从这台电脑导出</span>
           <h1 id="export-title">选择要带走的任务</h1>
-          <p>{loading ? "正在读取…" : `${tasks.length} 个 Codex 任务 · 数据只在本机处理`}</p>
+          <p>{loading ? `${scanProgress?.stage === "organizing" ? "正在整理任务信息" : "正在扫描"}${scanProgress?.total ? ` · ${scanProgress.scanned || 0}/${scanProgress.total}，已发现 ${scanProgress.discovered || tasks.length} 个` : "…"}` : scanProgress?.kind === "timed_out" ? `扫描已暂停 · 已发现 ${scanProgress.discovered || tasks.length}/${scanProgress.total || "?"} 个任务` : `${tasks.length} 个 Codex 任务 · 数据只在本机处理`}</p>
         </div>
-        <button className="icon-button refresh-button" onClick={load} disabled={loading} title="重新扫描" aria-label="重新扫描">
-          <ArrowClockwise size={19} className={loading ? "spin" : ""} />
-        </button>
+        <div className="scan-actions">
+          {loading && <button type="button" className="text-button compact" onClick={cancelScan}>取消扫描</button>}
+          {!loading && scanProgress?.kind === "timed_out" && <button type="button" className="text-button compact" onClick={resumeScan}>继续扫描</button>}
+          <button className="icon-button refresh-button" onClick={() => load()} disabled={loading} title="重新扫描" aria-label="重新扫描">
+            <ArrowClockwise size={19} className={loading ? "spin" : ""} />
+          </button>
+        </div>
       </header>
 
       {!loading && healthReport && (
@@ -594,7 +668,6 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
           <div className="health-summary-actions">
             <button type="button" className="health-chip healthy" onClick={() => openHealth()}>{healthReport.summary.healthyCount} 正常</button>
             <button type="button" className="health-chip" onClick={() => openHealth()}>{healthReport.summary.reregisterCount} 可重新登记</button>
-            <button type="button" className="health-chip" onClick={() => openHealth()}>{healthReport.summary.titleRepairCount} 建议修复标题</button>
             {healthReport.summary.manualReviewCount > 0 && <button type="button" className="health-chip warning" onClick={() => openHealth()}>{healthReport.summary.manualReviewCount} 需人工处理</button>}
           </div>
           <button type="button" className="text-button compact health-open-button" onClick={validateLibrary}>验证任务库</button>
@@ -625,15 +698,15 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
         </div>
       </div>
 
-      <div className="task-list" aria-live="polite">
-        {loading && <div className="empty-state"><ArrowClockwise size={28} className="spin" /><strong>正在扫描 Codex 任务</strong></div>}
+      <div className="task-list" aria-live="polite" onScroll={loadMoreOnScroll}>
+        {loading && !tasks.length && <div className="empty-state"><ArrowClockwise size={28} className="spin" /><strong>正在扫描 Codex 任务</strong><span>扫描到的任务会立即显示在这里</span></div>}
         {!loading && !filtered.length && (
           <div className="empty-state"><MagnifyingGlass size={28} /><strong>没有找到匹配的任务</strong><span>换一个关键词试试</span></div>
         )}
-        {!loading && visibleTasks.map((task) => (
+        {visibleTasks.map((task) => (
           <TaskRow key={task.id} task={task} selected={selected.has(task.id)} onToggle={toggle} />
         ))}
-        {!loading && filtered.length > visibleTasks.length && (
+        {filtered.length > visibleTasks.length && (
           <button className="text-button load-more-tasks" onClick={() => setVisibleLimit((current) => current + 120)}>
             显示更多任务（剩余 {filtered.length - visibleTasks.length} 个）
           </button>
@@ -696,7 +769,7 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
                       {group.items.map((item) => (
                         <label className={`repair-plan-item ${item.canApply ? "" : "is-blocked"}`} key={item.id}>
                           <input type="checkbox" checked={healthSelection.has(item.id)} disabled={!item.canApply} onChange={() => toggleHealthTask(item.id)} />
-                          <span><strong title={item.title}>{item.title}</strong><small>{item.actions?.includes("reregister") ? "重新显示在 Codex 中" : ""}{item.actions?.includes("repair_title") ? `${item.actions?.includes("reregister") ? " · " : ""}整理任务标题` : ""}</small></span>
+                          <span><strong title={item.title}>{item.title}</strong><small>{item.actions?.includes("reregister") ? "重新显示在 Codex 中" : ""}</small></span>
                         </label>
                       ))}
                     </section>
@@ -726,9 +799,13 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
   );
 }
 
+function sortTasksByUpdated(tasks) {
+  return [...tasks].sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")));
+}
+
 function repairableTaskIds(report) {
   return report?.tasks
-    ?.filter((task) => task.safeActions?.length && !task.requiresManualReview)
+    ?.filter((task) => task.safeActions?.includes("reregister") && !task.requiresManualReview)
     .map((task) => task.id) || [];
 }
 
@@ -1000,10 +1077,10 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [refreshEnvironment]);
 
-  const showToast = (type, title, message) => {
+  const showToast = useCallback((type, title, message) => {
     setToast({ type, title, message });
     window.setTimeout(() => setToast(null), 5000);
-  };
+  }, []);
 
   return (
     <main className="app-shell">

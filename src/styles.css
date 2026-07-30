@@ -1264,6 +1264,12 @@ h1 {
   }
 }
 
+.scan-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .import-merge-toggle {
   min-width: 64px;
   display: inline-flex;

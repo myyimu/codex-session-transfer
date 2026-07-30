@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
@@ -9,6 +10,9 @@ function canceled() {
 export const tauriBridge = {
   listTasks: () => invoke("list_tasks"),
   loadTaskLibrary: () => invoke("load_task_library"),
+  startTaskScan: (runId, resumeToken) => invoke("start_task_scan", { runId, resumeToken }),
+  cancelBackgroundJob: (jobId) => invoke("cancel_background_job", { jobId }),
+  onTaskScanProgress: (handler) => listen("task-scan-progress", (event) => handler(event.payload)),
   getTaskHealth: () => invoke("get_task_health"),
   buildRepairPlan: (taskIds) => invoke("build_repair_plan", { taskIds }),
   applyRepairPlan: (taskIds) => invoke("apply_repair_plan", { taskIds }),

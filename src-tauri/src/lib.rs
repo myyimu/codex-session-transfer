@@ -14,12 +14,13 @@ use std::{
     sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use walkdir::WalkDir;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 const ARCHIVE_SCHEMA: &str = "codex-session-transfer/v1";
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+const TASK_SCAN_TIMEOUT: Duration = Duration::from_secs(90);
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -151,6 +152,40 @@ struct TaskLibrary {
     tasks: Vec<Task>,
     codex_home: String,
     health: TaskHealthReport,
+}
+
+// A scan may be stopped between files.  We intentionally do not abort a write
+// operation halfway through: repair/import cancellation is only safe before a
+// snapshot or database write begins.
+static CANCELLED_BACKGROUND_JOBS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static PAUSED_TASK_SCANS: OnceLock<Mutex<HashMap<String, PausedTaskScan>>> = OnceLock::new();
+
+struct PausedTaskScan {
+    files: Vec<PathBuf>,
+    next_index: usize,
+    seen_task_ids: HashSet<String>,
+    discovered: usize,
+}
+
+fn cancelled_background_jobs() -> &'static Mutex<HashSet<String>> {
+    CANCELLED_BACKGROUND_JOBS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn job_is_cancelled(job_id: &str) -> bool {
+    cancelled_background_jobs()
+        .lock()
+        .map(|jobs| jobs.contains(job_id))
+        .unwrap_or(false)
+}
+
+fn clear_background_job(job_id: &str) {
+    if let Ok(mut jobs) = cancelled_background_jobs().lock() {
+        jobs.remove(job_id);
+    }
+}
+
+fn paused_task_scans() -> &'static Mutex<HashMap<String, PausedTaskScan>> {
+    PAUSED_TASK_SCANS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[derive(Clone)]
@@ -304,7 +339,10 @@ fn latest_state_database(home: &Path) -> PathBuf {
                 .parse::<u64>()
                 .ok()?;
             let modified = entry.metadata().ok()?.modified().ok()?;
-            let modified = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+            let modified = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
             Some((version, modified, name.to_string(), path))
         })
         .collect::<Vec<_>>();
@@ -327,7 +365,11 @@ fn history_first_messages(home: &Path) -> HashMap<String, String> {
         let Some(id) = value.get("session_id").and_then(Value::as_str) else {
             continue;
         };
-        let Some(text) = value.get("text").and_then(Value::as_str).and_then(meaningful_user_text) else {
+        let Some(text) = value
+            .get("text")
+            .and_then(Value::as_str)
+            .and_then(meaningful_user_text)
+        else {
             continue;
         };
         messages.entry(id.to_string()).or_insert(text);
@@ -635,11 +677,18 @@ fn is_bad_title(value: &str) -> bool {
 fn meaningful_user_text(value: &str) -> Option<String> {
     let cleaned = clean_text(value);
     let lower = cleaned.to_ascii_lowercase();
-    let end = ["<image name=", "<environment_context", "<recommended_plugins", "assistant to=", "[tool", "tool exec call:"]
-        .iter()
-        .filter_map(|marker| lower.find(marker))
-        .min()
-        .unwrap_or(cleaned.len());
+    let end = [
+        "<image name=",
+        "<environment_context",
+        "<recommended_plugins",
+        "assistant to=",
+        "[tool",
+        "tool exec call:",
+    ]
+    .iter()
+    .filter_map(|marker| lower.find(marker))
+    .min()
+    .unwrap_or(cleaned.len());
     let value = cleaned[..end].trim().to_string();
     if value.is_empty() || is_codex_context_text(&value) {
         None
@@ -1055,13 +1104,19 @@ fn safe_merge_session_jsonl(archive: &str, local: &str) -> SessionMergeResult {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let base_preview = |can_merge: bool, append_record_count: usize, archive_last: Option<DateTime<Utc>>, local_last: Option<DateTime<Utc>>, reason: &str| {
+    let base_preview = |can_merge: bool,
+                        append_record_count: usize,
+                        archive_last: Option<DateTime<Utc>>,
+                        local_last: Option<DateTime<Utc>>,
+                        reason: &str| {
         SessionMergePreview {
             can_merge,
             archive_record_count: archive_lines.len(),
             local_record_count: local_lines.len(),
             append_record_count,
-            archive_last_activity: archive_last.map(|time| time.to_rfc3339()).unwrap_or_default(),
+            archive_last_activity: archive_last
+                .map(|time| time.to_rfc3339())
+                .unwrap_or_default(),
             local_last_activity: local_last.map(|time| time.to_rfc3339()).unwrap_or_default(),
             reason: reason.to_string(),
         }
@@ -1077,7 +1132,13 @@ fn safe_merge_session_jsonl(archive: &str, local: &str) -> SessionMergeResult {
     for line in &archive_lines {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             return SessionMergeResult {
-                preview: base_preview(false, 0, None, None, "归档会话包含无法解析的记录，已停止合并。"),
+                preview: base_preview(
+                    false,
+                    0,
+                    None,
+                    None,
+                    "归档会话包含无法解析的记录，已停止合并。",
+                ),
                 contents: String::new(),
             };
         };
@@ -1087,26 +1148,47 @@ fn safe_merge_session_jsonl(archive: &str, local: &str) -> SessionMergeResult {
     }
     let Some(archive_last) = archive_last else {
         return SessionMergeResult {
-            preview: base_preview(false, 0, None, None, "归档会话没有可比较的时间戳，无法安全追加。"),
+            preview: base_preview(
+                false,
+                0,
+                None,
+                None,
+                "归档会话没有可比较的时间戳，无法安全追加。",
+            ),
             contents: String::new(),
         };
     };
 
-    let archive_records = archive_lines.iter().map(String::as_str).collect::<HashSet<_>>();
+    let archive_records = archive_lines
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     let mut local_last: Option<DateTime<Utc>> = None;
     let mut last_appended_timestamp: Option<DateTime<Utc>> = None;
     let mut appended = Vec::new();
     for line in &local_lines {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             return SessionMergeResult {
-                preview: base_preview(false, 0, Some(archive_last), local_last, "本机会话包含无法解析的记录，已停止合并。"),
+                preview: base_preview(
+                    false,
+                    0,
+                    Some(archive_last),
+                    local_last,
+                    "本机会话包含无法解析的记录，已停止合并。",
+                ),
                 contents: String::new(),
             };
         };
         let Some(timestamp) = record_timestamp(&record) else {
             if !archive_records.contains(line.as_str()) {
                 return SessionMergeResult {
-                    preview: base_preview(false, 0, Some(archive_last), local_last, "本机续聊包含无法安全排序的无时间戳记录，已停止自动合并。"),
+                    preview: base_preview(
+                        false,
+                        0,
+                        Some(archive_last),
+                        local_last,
+                        "本机续聊包含无法安全排序的无时间戳记录，已停止自动合并。",
+                    ),
                     contents: String::new(),
                 };
             }
@@ -1116,7 +1198,13 @@ fn safe_merge_session_jsonl(archive: &str, local: &str) -> SessionMergeResult {
         if timestamp > archive_last && !archive_records.contains(line.as_str()) {
             if last_appended_timestamp.is_some_and(|last| timestamp < last) {
                 return SessionMergeResult {
-                    preview: base_preview(false, 0, Some(archive_last), local_last, "本机续聊的新增记录时间顺序倒退，已停止自动合并。"),
+                    preview: base_preview(
+                        false,
+                        0,
+                        Some(archive_last),
+                        local_last,
+                        "本机续聊的新增记录时间顺序倒退，已停止自动合并。",
+                    ),
                     contents: String::new(),
                 };
             }
@@ -1126,7 +1214,13 @@ fn safe_merge_session_jsonl(archive: &str, local: &str) -> SessionMergeResult {
     }
     if appended.is_empty() {
         return SessionMergeResult {
-            preview: base_preview(false, 0, Some(archive_last), local_last, "本机没有时间晚于归档末尾的可追加记录。"),
+            preview: base_preview(
+                false,
+                0,
+                Some(archive_last),
+                local_last,
+                "本机没有时间晚于归档末尾的可追加记录。",
+            ),
             contents: String::new(),
         };
     }
@@ -1134,7 +1228,13 @@ fn safe_merge_session_jsonl(archive: &str, local: &str) -> SessionMergeResult {
     let mut merged = archive_lines.clone();
     merged.extend(appended.iter().cloned());
     SessionMergeResult {
-        preview: base_preview(true, appended.len(), Some(archive_last), local_last, "将以归档为基线，追加本机较新的记录。"),
+        preview: base_preview(
+            true,
+            appended.len(),
+            Some(archive_last),
+            local_last,
+            "将以归档为基线，追加本机较新的记录。",
+        ),
         contents: format!("{}\n", merged.join("\n")),
     }
 }
@@ -1791,14 +1891,7 @@ fn infer_project(task: &Task) -> (String, String, String, bool) {
     )
 }
 
-fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), String> {
-    let home = codex_home();
-    let index = read_index(&home);
-    let history_messages = history_first_messages(&home);
-    let database = database_tasks(&home);
-    let catalog = catalog_tasks(&home);
-    let affected_title_ids = bad_title_ids_from_metadata(&index, &database, &catalog);
-    let desktop_projects = read_desktop_project_state(&home);
+fn session_file_paths(home: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for session_root in [home.join("sessions"), home.join("archived_sessions")] {
         if session_root.exists() {
@@ -1811,6 +1904,44 @@ fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), Str
             }
         }
     }
+    files
+}
+
+fn scan_preview_task(home: &Path, path: &Path) -> Option<Task> {
+    let mut task = session_details(path).ok()?;
+    if task.id.is_empty() {
+        return None;
+    }
+    task.archived = path.starts_with(home.join("archived_sessions"));
+    task.browser_file = home
+        .join("browser")
+        .join("sessions")
+        .join(format!("{}.toml", task.id));
+    (
+        task.project_key,
+        task.project_name,
+        task.project_path,
+        task.project_exists,
+    ) = infer_project(&task);
+    normalize_task_title(&mut task);
+    if task.title.is_empty() {
+        task.title = truncate(&task.first_user_message, 96);
+    }
+    if task.title.is_empty() {
+        task.title = format!("未命名任务 {}", &task.id[..task.id.len().min(8)]);
+    }
+    Some(task)
+}
+
+fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), String> {
+    let home = codex_home();
+    let index = read_index(&home);
+    let history_messages = history_first_messages(&home);
+    let database = database_tasks(&home);
+    let catalog = catalog_tasks(&home);
+    let affected_title_ids = bad_title_ids_from_metadata(&index, &database, &catalog);
+    let desktop_projects = read_desktop_project_state(&home);
+    let files = session_file_paths(&home);
     let mut tasks = Vec::new();
     let mut seen_task_ids = HashSet::new();
     for path in files {
@@ -1907,7 +2038,8 @@ fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), Str
             }
         }
         let file_is_archived = path.starts_with(home.join("archived_sessions"));
-        task.archived = file_is_archived || database_task.map(|item| item.archived).unwrap_or(false);
+        task.archived =
+            file_is_archived || database_task.map(|item| item.archived).unwrap_or(false);
         let catalog_visible = catalog_visibility(&catalog, &task.id);
         task.codex_visible = catalog_visible.unwrap_or(true);
         (
@@ -1965,6 +2097,23 @@ fn list_local_tasks() -> Result<Vec<Task>, String> {
 
 fn archive_path(id: &str, file: &str) -> String {
     format!("tasks/{id}/{file}")
+}
+
+fn active_session_copy_path(home: &Path, task: &Task) -> PathBuf {
+    let date = parse_time(if task.created_at.is_empty() {
+        &task.updated_at
+    } else {
+        &task.created_at
+    });
+    home.join("sessions")
+        .join(date.year().to_string())
+        .join(format!("{:02}", date.month()))
+        .join(format!("{:02}", date.day()))
+        .join(format!(
+            "rollout-{}-{}.jsonl",
+            date.format("%Y-%m-%dT%H-%M-%S"),
+            task.id
+        ))
 }
 
 fn is_safe_task_id(id: &str) -> bool {
@@ -2482,7 +2631,9 @@ fn prune_rotated_operation_receipts(parent: &Path) -> Result<(), String> {
 
 fn append_operation_receipt(home: &Path, kind: &str, result: &Value) -> Result<String, String> {
     let path = receipt_path(home);
-    let parent = path.parent().ok_or_else(|| "无法创建维护回执目录".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "无法创建维护回执目录".to_string())?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     if fs::metadata(&path)
         .map(|metadata| metadata.len() >= MAX_CURRENT_RECEIPT_BYTES)
@@ -2508,8 +2659,12 @@ fn append_operation_receipt(home: &Path, kind: &str, result: &Value) -> Result<S
         .append(true)
         .open(&path)
         .map_err(|error| error.to_string())?;
-    writeln!(file, "{}", serde_json::to_string(&receipt).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&receipt).map_err(|error| error.to_string())?
+    )
+    .map_err(|error| error.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -2548,7 +2703,9 @@ fn sqlite_integrity(path: &Path, name: &str) -> ValidationIntegrity {
         };
     }
     let status = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .and_then(|connection| connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)))
+        .and_then(|connection| {
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        })
         .unwrap_or_else(|error| format!("error: {error}"));
     ValidationIntegrity {
         name: name.to_string(),
@@ -2557,12 +2714,21 @@ fn sqlite_integrity(path: &Path, name: &str) -> ValidationIntegrity {
 }
 
 #[tauri::command]
-fn validate_task_library() -> Result<TaskLibraryValidation, String> {
+async fn validate_task_library() -> Result<TaskLibraryValidation, String> {
+    tauri::async_runtime::spawn_blocking(validate_task_library_blocking)
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn validate_task_library_blocking() -> Result<TaskLibraryValidation, String> {
     let home = codex_home();
     let tasks = list_local_tasks()?;
     let index = read_index(&home);
     let database = database_tasks(&home);
-    let session_ids = tasks.iter().map(|task| task.id.clone()).collect::<HashSet<_>>();
+    let session_ids = tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<HashSet<_>>();
     let mut issues = Vec::new();
 
     for task in &tasks {
@@ -2613,7 +2779,13 @@ fn validate_task_library() -> Result<TaskLibraryValidation, String> {
     let integrity = vec![
         {
             let state = latest_state_database(&home);
-            sqlite_integrity(&state, state.file_name().and_then(|name| name.to_str()).unwrap_or("state.sqlite"))
+            sqlite_integrity(
+                &state,
+                state
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("state.sqlite"),
+            )
         },
         sqlite_integrity(&home.join("sqlite").join("codex-dev.db"), "codex-dev.db"),
     ];
@@ -2885,7 +3057,7 @@ fn bad_title_ids(home: &Path) -> HashSet<String> {
     bad_title_ids_from_metadata(&index, &database, &catalog)
 }
 
-fn task_health_issues(task: &Task, affected_title_ids: &HashSet<String>) -> Vec<TaskHealthIssue> {
+fn task_health_issues(task: &Task, _affected_title_ids: &HashSet<String>) -> Vec<TaskHealthIssue> {
     let mut issues = Vec::new();
     if !task.file_path.is_file() {
         issues.push(TaskHealthIssue {
@@ -2905,21 +3077,13 @@ fn task_health_issues(task: &Task, affected_title_ids: &HashSet<String>) -> Vec<
             recommended_action: "reregister".to_string(),
         });
     }
-    if affected_title_ids.contains(&task.id) {
-        issues.push(TaskHealthIssue {
-            code: "bad_title".to_string(),
-            level: "repairable".to_string(),
-            title: "任务标题需要修复".to_string(),
-            detail: "索引或任务状态中保留了系统上下文标题；将从有效首条用户消息重新生成标题。".to_string(),
-            recommended_action: "repair_title".to_string(),
-        });
-    }
     if !task.project_exists {
         issues.push(TaskHealthIssue {
             code: "unbound_project".to_string(),
             level: "info".to_string(),
             title: "历史项目路径不存在".to_string(),
-            detail: "任务会保留为未绑定项目；本次修复不会创建同名文件夹或绑定错误路径。".to_string(),
+            detail: "任务会保留为未绑定项目；本次修复不会创建同名文件夹或绑定错误路径。"
+                .to_string(),
             recommended_action: "keep_unbound".to_string(),
         });
     }
@@ -2956,7 +3120,10 @@ fn build_repair_plan_for(task_ids: &[String]) -> Result<RepairPlan, String> {
     let affected_title_ids = bad_title_ids(&home);
     let tasks = list_local_tasks()?;
     let mut items = Vec::new();
-    for task in tasks.into_iter().filter(|task| requested.contains(&task.id)) {
+    for task in tasks
+        .into_iter()
+        .filter(|task| requested.contains(&task.id))
+    {
         let health = task_health_item(&task, &affected_title_ids);
         let can_apply = !health.requires_manual_review && !health.safe_actions.is_empty();
         let reason = if health.requires_manual_review {
@@ -3014,16 +3181,31 @@ fn get_task_health() -> Result<TaskHealthReport, String> {
             healthy_count: items.iter().filter(|item| item.issues.is_empty()).count(),
             reregister_count: items
                 .iter()
-                .filter(|item| item.safe_actions.iter().any(|action| action == "reregister"))
+                .filter(|item| {
+                    item.safe_actions
+                        .iter()
+                        .any(|action| action == "reregister")
+                })
                 .count(),
             title_repair_count: items
                 .iter()
-                .filter(|item| item.safe_actions.iter().any(|action| action == "repair_title"))
+                .filter(|item| {
+                    item.safe_actions
+                        .iter()
+                        .any(|action| action == "repair_title")
+                })
                 .count(),
-            manual_review_count: items.iter().filter(|item| item.requires_manual_review).count(),
+            manual_review_count: items
+                .iter()
+                .filter(|item| item.requires_manual_review)
+                .count(),
             unbound_project_count: items
                 .iter()
-                .filter(|item| item.issues.iter().any(|issue| issue.code == "unbound_project"))
+                .filter(|item| {
+                    item.issues
+                        .iter()
+                        .any(|issue| issue.code == "unbound_project")
+                })
                 .count(),
         },
         tasks: items,
@@ -3040,40 +3222,237 @@ fn task_health_report(tasks: &[Task], affected_title_ids: &HashSet<String>) -> T
             healthy_count: items.iter().filter(|item| item.issues.is_empty()).count(),
             reregister_count: items
                 .iter()
-                .filter(|item| item.safe_actions.iter().any(|action| action == "reregister"))
+                .filter(|item| {
+                    item.safe_actions
+                        .iter()
+                        .any(|action| action == "reregister")
+                })
                 .count(),
             title_repair_count: items
                 .iter()
-                .filter(|item| item.safe_actions.iter().any(|action| action == "repair_title"))
+                .filter(|item| {
+                    item.safe_actions
+                        .iter()
+                        .any(|action| action == "repair_title")
+                })
                 .count(),
-            manual_review_count: items.iter().filter(|item| item.requires_manual_review).count(),
+            manual_review_count: items
+                .iter()
+                .filter(|item| item.requires_manual_review)
+                .count(),
             unbound_project_count: items
                 .iter()
-                .filter(|item| item.issues.iter().any(|issue| issue.code == "unbound_project"))
+                .filter(|item| {
+                    item.issues
+                        .iter()
+                        .any(|issue| issue.code == "unbound_project")
+                })
                 .count(),
         },
         tasks: items,
     }
 }
 
+fn emit_scan_event(app: &tauri::AppHandle, payload: Value) {
+    let _ = app.emit("task-scan-progress", payload);
+}
+
 #[tauri::command]
-fn load_task_library() -> Result<TaskLibrary, String> {
-    let home = codex_home();
-    let (tasks, affected_title_ids) = list_local_tasks_with_title_ids()?;
-    Ok(TaskLibrary {
-        health: task_health_report(&tasks, &affected_title_ids),
-        tasks,
-        codex_home: home.to_string_lossy().to_string(),
+fn start_task_scan(
+    app: tauri::AppHandle,
+    run_id: String,
+    resume_token: Option<String>,
+) -> Result<(), String> {
+    if run_id.trim().is_empty() {
+        return Err("扫描标识无效".to_string());
+    }
+    clear_background_job(&run_id);
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let home = codex_home();
+        let resume_token = resume_token.filter(|token| !token.trim().is_empty());
+        let continuation_token = resume_token.clone().unwrap_or_else(|| run_id.clone());
+        let mut paused = resume_token
+            .as_deref()
+            .and_then(|token| paused_task_scans().lock().ok()?.remove(token))
+            .unwrap_or_else(|| PausedTaskScan {
+                files: session_file_paths(&home),
+                next_index: 0,
+                seen_task_ids: HashSet::new(),
+                discovered: 0,
+            });
+        let start_index = paused.next_index;
+        let files = std::mem::take(&mut paused.files);
+        let total = files.len();
+        emit_scan_event(
+            &app,
+            serde_json::json!({
+                "runId": run_id, "kind": "progress", "stage": "scanning", "scanned": start_index,
+                "total": total, "discovered": paused.discovered, "resumed": resume_token.is_some()
+            }),
+        );
+        let mut batch = Vec::new();
+        let mut discovered = paused.discovered;
+        let mut seen = paused.seen_task_ids;
+        for index in start_index..total {
+            let path = &files[index];
+            if job_is_cancelled(&run_id) {
+                if !batch.is_empty() {
+                    emit_scan_event(
+                        &app,
+                        serde_json::json!({
+                            "runId": run_id, "kind": "batch", "stage": "scanning", "scanned": index,
+                            "total": total, "discovered": discovered, "tasks": batch
+                        }),
+                    );
+                }
+                emit_scan_event(
+                    &app,
+                    serde_json::json!({
+                        "runId": run_id, "kind": "cancelled", "stage": "scanning", "scanned": index,
+                        "total": total, "discovered": discovered
+                    }),
+                );
+                clear_background_job(&run_id);
+                return;
+            }
+            if started.elapsed() > TASK_SCAN_TIMEOUT {
+                if !batch.is_empty() {
+                    emit_scan_event(
+                        &app,
+                        serde_json::json!({
+                            "runId": run_id, "kind": "batch", "stage": "scanning", "scanned": index,
+                            "total": total, "discovered": discovered, "tasks": batch
+                        }),
+                    );
+                }
+                if let Ok(mut scans) = paused_task_scans().lock() {
+                    scans.insert(
+                        continuation_token.clone(),
+                        PausedTaskScan {
+                            files,
+                            next_index: index,
+                            seen_task_ids: seen,
+                            discovered,
+                        },
+                    );
+                }
+                emit_scan_event(
+                    &app,
+                    serde_json::json!({
+                        "runId": run_id, "kind": "timed_out", "stage": "scanning", "scanned": index,
+                        "total": total, "discovered": discovered, "resumeToken": continuation_token
+                    }),
+                );
+                clear_background_job(&run_id);
+                return;
+            }
+            if let Some(task) = scan_preview_task(&home, path) {
+                if seen.insert(task.id.clone()) {
+                    discovered += 1;
+                    batch.push(task);
+                }
+            }
+            if batch.len() >= 24 || index + 1 == total {
+                emit_scan_event(
+                    &app,
+                    serde_json::json!({
+                        "runId": run_id, "kind": "batch", "stage": "scanning", "scanned": index + 1,
+                        "total": total, "discovered": discovered, "tasks": batch
+                    }),
+                );
+                batch = Vec::new();
+            } else if (index + 1) % 12 == 0 {
+                emit_scan_event(
+                    &app,
+                    serde_json::json!({
+                        "runId": run_id, "kind": "progress", "stage": "scanning", "scanned": index + 1,
+                        "total": total, "discovered": discovered
+                    }),
+                );
+            }
+        }
+
+        // The second pass uses the in-memory session cache populated above. It
+        // only enriches task rows with index/database/sidebar metadata and then
+        // calculates the health summary.
+        emit_scan_event(
+            &app,
+            serde_json::json!({
+                "runId": run_id, "kind": "progress", "stage": "organizing", "scanned": total,
+                "total": total, "discovered": discovered
+            }),
+        );
+        if job_is_cancelled(&run_id) {
+            emit_scan_event(
+                &app,
+                serde_json::json!({"runId": run_id, "kind": "cancelled", "stage": "organizing", "scanned": total, "total": total, "discovered": discovered}),
+            );
+        } else if let Ok((tasks, affected_title_ids)) = list_local_tasks_with_title_ids() {
+            if let Ok(mut scans) = paused_task_scans().lock() {
+                scans.remove(&continuation_token);
+            }
+            let health = task_health_report(&tasks, &affected_title_ids);
+            emit_scan_event(
+                &app,
+                serde_json::json!({
+                    "runId": run_id, "kind": "complete", "stage": "complete", "scanned": total,
+                    "total": total, "discovered": tasks.len(), "tasks": tasks,
+                    "health": health, "codexHome": home.to_string_lossy()
+                }),
+            );
+        } else {
+            emit_scan_event(
+                &app,
+                serde_json::json!({"runId": run_id, "kind": "error", "message": "读取本地任务元数据失败"}),
+            );
+        }
+        clear_background_job(&run_id);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_background_job(job_id: String) -> bool {
+    if job_id.trim().is_empty() {
+        return false;
+    }
+    cancelled_background_jobs()
+        .lock()
+        .map(|mut jobs| jobs.insert(job_id))
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+async fn load_task_library() -> Result<TaskLibrary, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let home = codex_home();
+        let (tasks, affected_title_ids) = list_local_tasks_with_title_ids()?;
+        Ok(TaskLibrary {
+            health: task_health_report(&tasks, &affected_title_ids),
+            tasks,
+            codex_home: home.to_string_lossy().to_string(),
+        })
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn build_repair_plan(task_ids: Vec<String>) -> Result<RepairPlan, String> {
-    build_repair_plan_for(&task_ids)
+async fn build_repair_plan(task_ids: Vec<String>) -> Result<RepairPlan, String> {
+    tauri::async_runtime::spawn_blocking(move || build_repair_plan_for(&task_ids))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn apply_repair_plan(task_ids: Vec<String>) -> Result<serde_json::Value, String> {
+async fn apply_repair_plan(task_ids: Vec<String>) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || apply_repair_plan_blocking(task_ids))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn apply_repair_plan_blocking(task_ids: Vec<String>) -> Result<serde_json::Value, String> {
     let plan = build_repair_plan_for(&task_ids)?;
     let executable_ids = plan
         .items
@@ -3108,7 +3487,10 @@ fn apply_repair_plan(task_ids: Vec<String>) -> Result<serde_json::Value, String>
     }
 
     let result = restore_local_tasks(executable_ids)?;
-    let backups = result.get("backups").cloned().unwrap_or_else(|| serde_json::json!([]));
+    let backups = result
+        .get("backups")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     let codex_home_value = result
         .get("codexHome")
         .cloned()
@@ -3306,10 +3688,21 @@ fn restore_local_tasks(task_ids: Vec<String>) -> Result<serde_json::Value, Strin
     for path in codex_state_paths(&home) {
         transaction.backup(&path, &stamp)?;
     }
-    for task in &selected {
+    for task in &mut selected {
         let contents = fs::read_to_string(&task.file_path).map_err(|error| error.to_string())?;
         let rewritten = rewrite_session_model_context(&contents, &model_settings);
-        if rewritten != contents {
+        let archived_source = task.file_path.starts_with(home.join("archived_sessions"));
+        if archived_source {
+            let active_path = active_session_copy_path(&home, task);
+            if let Some(parent) = active_path.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            // Keep the archived source as a recoverable historical copy. The
+            // active copy becomes authoritative on the next scan and prevents
+            // a successfully re-registered task from being flagged again.
+            transaction.write_file(&active_path, rewritten, &stamp)?;
+            task.file_path = active_path;
+        } else if rewritten != contents {
             transaction.write_file(&task.file_path, rewritten, &stamp)?;
         }
     }
@@ -3359,7 +3752,9 @@ fn inspect_archive(archive_path: String) -> Result<ArchiveInspection, String> {
                 let merge_preview = existing
                     .get(&task.id)
                     .and_then(|local_task| fs::read_to_string(&local_task.file_path).ok())
-                    .map(|local_contents| safe_merge_session_jsonl(&contents, &local_contents).preview);
+                    .map(|local_contents| {
+                        safe_merge_session_jsonl(&contents, &local_contents).preview
+                    });
                 InspectedTask {
                     conflict: existing.contains_key(&task.id),
                     merge_preview,
@@ -3673,6 +4068,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_tasks,
             load_task_library,
+            start_task_scan,
+            cancel_background_job,
             get_task_health,
             build_repair_plan,
             apply_repair_plan,
@@ -3693,12 +4090,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_index, archive_manifest, codex_model_settings, codex_state_paths, history_first_messages, infer_project,
-        is_bad_title, is_codex_context_text, is_safe_task_id, meaningful_user_text, register_catalog_threads,
-        latest_state_database, register_desktop_project_state, register_threads, repository_name, rewrite_session_cwd,
-        rewrite_session_model_context, safe_merge_session_jsonl, session_details, simple_toml_string,
-        sort_tasks_by_project_order, verify_registered_threads, ArchiveTask, CodexModelSettings,
-        ImportTransaction, Manifest, Task, ARCHIVE_SCHEMA,
+        append_index, archive_manifest, codex_model_settings, codex_state_paths,
+        history_first_messages, infer_project, is_bad_title, is_codex_context_text,
+        is_safe_task_id, latest_state_database, meaningful_user_text, register_catalog_threads,
+        register_desktop_project_state, register_threads, repository_name, rewrite_session_cwd,
+        rewrite_session_model_context, safe_merge_session_jsonl, session_details,
+        simple_toml_string, sort_tasks_by_project_order, verify_registered_threads, ArchiveTask,
+        CodexModelSettings, ImportTransaction, Manifest, Task, ARCHIVE_SCHEMA,
     };
     use rusqlite::Connection;
     use serde_json::Value;
@@ -3768,7 +4166,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            history_first_messages(&home).get("history-task").map(String::as_str),
+            history_first_messages(&home)
+                .get("history-task")
+                .map(String::as_str),
             Some("第一个问题")
         );
         fs::remove_dir_all(&home).ok();
@@ -3811,7 +4211,10 @@ mod tests {
     fn title_filter_removes_embedded_image_and_tool_transcript() {
         let raw = "优化一下界面排版 <image name=[Image #1] path=\"C:\\Temp\\layout.png\"> assistant to=functions.exec tool exec call: ignored";
         assert!(is_bad_title(raw));
-        assert_eq!(meaningful_user_text(raw).as_deref(), Some("优化一下界面排版"));
+        assert_eq!(
+            meaningful_user_text(raw).as_deref(),
+            Some("优化一下界面排版")
+        );
     }
 
     #[test]
@@ -4245,11 +4648,23 @@ mod tests {
     #[test]
     fn catalog_visibility_only_reports_explicit_catalog_entries() {
         let mut catalog = std::collections::HashMap::new();
-        catalog.insert("visible-task".to_string(), ("Task".to_string(), String::new(), true));
-        catalog.insert("removed-task".to_string(), ("Task".to_string(), String::new(), false));
+        catalog.insert(
+            "visible-task".to_string(),
+            ("Task".to_string(), String::new(), true),
+        );
+        catalog.insert(
+            "removed-task".to_string(),
+            ("Task".to_string(), String::new(), false),
+        );
         let catalog = Some(catalog);
-        assert_eq!(super::catalog_visibility(&catalog, "visible-task"), Some(true));
-        assert_eq!(super::catalog_visibility(&catalog, "removed-task"), Some(false));
+        assert_eq!(
+            super::catalog_visibility(&catalog, "visible-task"),
+            Some(true)
+        );
+        assert_eq!(
+            super::catalog_visibility(&catalog, "removed-task"),
+            Some(false)
+        );
         assert_eq!(super::catalog_visibility(&catalog, "not-in-sidebar"), None);
     }
 
