@@ -373,20 +373,13 @@ function ImportProjectPicker({ projects, value, onChange }) {
   );
 }
 
-function NavButton({ active, icon: Icon, title, subtitle, onSelect }) {
-  const handlePointerDown = (event) => {
-    if (event.button === undefined || event.button === 0) {
-      event.preventDefault();
-      onSelect();
-    }
-  };
-
+function NavButton({ active, disabled, icon: Icon, title, subtitle, onSelect }) {
   return (
     <button
       type="button"
       className={active ? "active" : ""}
+      disabled={disabled}
       onClick={onSelect}
-      onPointerDown={handlePointerDown}
     >
       <Icon size={20} weight={active ? "fill" : "regular"} />
       <span><strong>{title}</strong><small>{subtitle}</small></span>
@@ -394,7 +387,7 @@ function NavButton({ active, icon: Icon, title, subtitle, onSelect }) {
   );
 }
 
-function ExportView({ environment, showToast, refreshEnvironment }) {
+function ExportView({ environment, showToast, refreshEnvironment, onOperationChange }) {
   const [tasks, setTasks] = useState([]);
   const [query, setQuery] = useState("");
   const [project, setProject] = useState("all");
@@ -403,6 +396,7 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
   const [operation, setOperation] = useState("");
   const [healthReport, setHealthReport] = useState(null);
   const [healthOpen, setHealthOpen] = useState(false);
+  const [healthDrawerView, setHealthDrawerView] = useState("repair");
   const [healthSelection, setHealthSelection] = useState(new Set());
   const [repairPlan, setRepairPlan] = useState(null);
   const [planning, setPlanning] = useState(false);
@@ -411,9 +405,16 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
   const [deferredDetailsOpen, setDeferredDetailsOpen] = useState(false);
   const [validation, setValidation] = useState(null);
   const [validating, setValidating] = useState(false);
+  const [snapshots, setSnapshots] = useState([]);
+  const [snapshotSelection, setSnapshotSelection] = useState(new Set());
+  const [loadingSnapshots, setLoadingSnapshots] = useState(false);
+  const [confirmSnapshotDelete, setConfirmSnapshotDelete] = useState(false);
   const [visibleLimit, setVisibleLimit] = useState(120);
   const [scanProgress, setScanProgress] = useState(null);
   const scanRunRef = useRef(null);
+  const scannedTaskIdsRef = useRef(new Set());
+  const healthDrawerRef = useRef(null);
+  const healthTriggerRef = useRef(null);
   const codexRunning = Boolean(environment?.codexRunning);
 
   const load = useCallback(async (resumeToken) => {
@@ -424,6 +425,7 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
     if (!continuation) {
       setHealthReport(null);
       setTasks([]);
+      scannedTaskIdsRef.current = new Set();
     }
     try {
       if (bridge.startTaskScan && bridge.onTaskScanProgress) {
@@ -440,14 +442,17 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
             if (event?.runId !== runId) return;
             setScanProgress(event);
             if (event.kind === "batch") {
-              setTasks((current) => {
-                const next = new Map(current.map((task) => [task.id, task]));
-                (event.tasks || []).forEach((task) => next.set(task.id, task));
-                return sortTasksByUpdated([...next.values()]);
+              const additions = (event.tasks || []).filter((task) => {
+                if (scannedTaskIdsRef.current.has(task.id)) return false;
+                scannedTaskIdsRef.current.add(task.id);
+                return true;
               });
+              if (additions.length) setTasks((current) => [...current, ...additions]);
             }
             if (event.kind === "complete") {
-              setTasks(sortTasksByUpdated(event.tasks || []));
+              const completedTasks = sortTasksByUpdated(event.tasks || []);
+              scannedTaskIdsRef.current = new Set(completedTasks.map((task) => task.id));
+              setTasks(completedTasks);
               setHealthReport(event.health || null);
               finish(() => resolve(event));
             } else if (event.kind === "cancelled") {
@@ -543,6 +548,7 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
 
   const exportSelected = async () => {
     setOperation("export");
+    onOperationChange("export");
     try {
       const result = await bridge.exportTasks([...selected]);
       if (!result.canceled) {
@@ -552,6 +558,7 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
       showToast("error", "导出失败", error.message);
     } finally {
       setOperation("");
+      onOperationChange("");
     }
   };
 
@@ -571,18 +578,22 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
   };
 
   const openHealth = async (preferredIds = []) => {
+    healthTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const candidates = repairableTaskIds(healthReport);
     const preferred = new Set(preferredIds.filter((id) => candidates.includes(id)));
     setRepairReceipt(null);
     setRepairQuery("");
     setDeferredDetailsOpen(false);
     setHealthSelection(preferred);
+    setHealthDrawerView("repair");
     setHealthOpen(true);
     await refreshRepairPlan(candidates);
   };
 
   const validateLibrary = async () => {
     if (!bridge.validateTaskLibrary) return;
+    healthTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setHealthDrawerView("repair");
     setHealthOpen(true);
     setValidating(true);
     try {
@@ -599,6 +610,58 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
       showToast("error", "任务库验证失败", error.message);
     } finally {
       setValidating(false);
+    }
+  };
+
+  const loadSnapshots = async () => {
+    if (!bridge.listLocalSnapshots) return;
+    setLoadingSnapshots(true);
+    try {
+      setSnapshots(await bridge.listLocalSnapshots());
+    } catch (error) {
+      showToast("error", "无法读取本地快照", error.message);
+    } finally {
+      setLoadingSnapshots(false);
+    }
+  };
+
+  const openSnapshots = async () => {
+    healthTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setHealthDrawerView("snapshots");
+    setSnapshotSelection(new Set());
+    setConfirmSnapshotDelete(false);
+    setHealthOpen(true);
+    await loadSnapshots();
+  };
+
+  const toggleSnapshot = (path) => {
+    setSnapshotSelection((current) => {
+      const next = new Set(current);
+      next.has(path) ? next.delete(path) : next.add(path);
+      return next;
+    });
+  };
+
+  const prepareCleanAllSnapshots = () => {
+    setSnapshotSelection(new Set(snapshots.map((snapshot) => snapshot.path)));
+    setConfirmSnapshotDelete(true);
+  };
+
+  const deleteSnapshots = async () => {
+    if (!snapshotSelection.size || !bridge.deleteLocalSnapshots) return;
+    setOperation("snapshots");
+    onOperationChange("snapshots");
+    try {
+      const result = await bridge.deleteLocalSnapshots([...snapshotSelection]);
+      setSnapshots((current) => current.filter((snapshot) => !snapshotSelection.has(snapshot.path)));
+      setSnapshotSelection(new Set());
+      setConfirmSnapshotDelete(false);
+      showToast("success", "本地快照已删除", `已释放 ${formatBytes(result.reclaimedBytes || 0)} 空间`);
+    } catch (error) {
+      showToast("error", "删除快照失败", error.message);
+    } finally {
+      setOperation("");
+      onOperationChange("");
     }
   };
 
@@ -621,9 +684,14 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
   const deferredIssueCount = validation?.issueCount
     ? Math.max(0, validation.issueCount - (repairPlan?.actionableCount || 0))
     : (healthReport?.summary?.manualReviewCount || 0);
+  const snapshotBytes = snapshots.reduce((sum, snapshot) => sum + (snapshot.size || 0), 0);
+  const selectedSnapshotBytes = snapshots
+    .filter((snapshot) => snapshotSelection.has(snapshot.path))
+    .reduce((sum, snapshot) => sum + (snapshot.size || 0), 0);
 
   const applyHealthPlan = async () => {
     setOperation("health");
+    onOperationChange("health");
     try {
       const result = await bridge.applyRepairPlan([...healthSelection]);
       const receipt = result.receipt || {};
@@ -639,8 +707,42 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
       showToast("error", "修复失败", error.message);
     } finally {
       setOperation("");
+      onOperationChange("");
     }
   };
+
+  useEffect(() => {
+    if (!healthOpen) return undefined;
+    const focusTimer = window.requestAnimationFrame(() => {
+      healthDrawerRef.current?.querySelector(".health-drawer-close")?.focus();
+    });
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setHealthOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...(healthDrawerRef.current?.querySelectorAll(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ) || [])];
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusTimer);
+      window.removeEventListener("keydown", onKeyDown);
+      healthTriggerRef.current?.focus?.();
+    };
+  }, [healthOpen]);
 
   return (
     <section className={`workspace ${healthReport ? "export-workspace-has-health" : ""}`} aria-labelledby="export-title">
@@ -672,6 +774,7 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
           </div>
           <button type="button" className="text-button compact health-open-button" onClick={validateLibrary}>验证任务库</button>
           <button type="button" className="text-button compact health-open-button" onClick={() => openHealth()}>查看建议</button>
+          <button type="button" className="text-button compact health-open-button" onClick={openSnapshots}>管理快照</button>
         </section>
       )}
 
@@ -736,14 +839,28 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
       </footer>
 
       {healthOpen && (
-        <div className="health-drawer-backdrop" role="presentation" onMouseDown={() => setHealthOpen(false)}>
-          <aside className="health-drawer" role="dialog" aria-modal="true" aria-label="本地任务修复建议" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="health-drawer-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setHealthOpen(false); }}>
+          <aside ref={healthDrawerRef} className="health-drawer" role="dialog" aria-modal="true" aria-label={healthDrawerView === "snapshots" ? "本地快照管理" : "本地任务修复建议"} tabIndex={-1}>
             <header className="health-drawer-header">
-              <span><Wrench size={20} weight="duotone" /><span><strong>修复任务</strong><small>{repairPlan?.actionableCount || 0} 个任务可安全修复</small></span></span>
-              <button className="icon-button health-drawer-close" type="button" onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setHealthOpen(false); }} aria-label="关闭修复建议" title="关闭"><X size={17} /></button>
+              {healthDrawerView === "snapshots" ? <span><FileArchive size={20} weight="duotone" /><span><strong>本地快照</strong><small>{snapshots.length} 份 · 共 {formatBytes(snapshotBytes || 0)}</small></span></span> : <span><Wrench size={20} weight="duotone" /><span><strong>修复任务</strong><small>{repairPlan?.actionableCount || 0} 个任务可安全修复</small></span></span>}
+              <button className="icon-button health-drawer-close" type="button" onClick={(event) => { event.stopPropagation(); setHealthOpen(false); }} aria-label="关闭" title="关闭"><X size={17} /></button>
             </header>
 
-            {repairReceipt ? (
+            {healthDrawerView === "snapshots" ? (
+              <>
+                <p className="health-snapshot-note">修复或导入前创建的本地备份会保留在这台电脑。默认不清理；删除后无法撤销。</p>
+                <div className="snapshot-list repair-plan-list">
+                  {loadingSnapshots && <div className="repair-plan-empty"><ArrowClockwise size={20} className="spin" />正在读取快照…</div>}
+                  {!loadingSnapshots && snapshots.map((snapshot) => (
+                    <label className="repair-plan-item snapshot-item" key={snapshot.path}>
+                      <input type="checkbox" checked={snapshotSelection.has(snapshot.path)} onChange={() => toggleSnapshot(snapshot.path)} />
+                      <span><strong title={snapshot.name}>{snapshot.name}</strong><small>{formatDate(snapshot.modifiedAt)} · {formatBytes(snapshot.size || 0)}</small></span>
+                    </label>
+                  ))}
+                  {!loadingSnapshots && !snapshots.length && <div className="repair-plan-empty">暂无本地快照</div>}
+                </div>
+              </>
+            ) : repairReceipt ? (
               <div className="repair-receipt">
                 <ShieldCheck size={20} weight="duotone" />
                 <span><strong>修复已完成</strong><small>{(repairReceipt.registered || 0) + (repairReceipt.titlesRepaired || 0)} 个任务已处理</small></span>
@@ -787,9 +904,9 @@ function ExportView({ environment, showToast, refreshEnvironment }) {
             )}
 
             <footer className="health-drawer-footer">
-              <span className="health-footer-status">{repairReceipt ? "重新打开 Codex 后检查任务是否重新出现" : validating ? "正在检查…" : healthSelection.size ? `已选择 ${healthSelection.size} 个任务` : "请选择需要修复的任务"}</span>
+              <span className="health-footer-status">{healthDrawerView === "snapshots" ? (snapshotSelection.size ? `已选择 ${snapshotSelection.size} 份 · ${formatBytes(selectedSnapshotBytes || 0)}` : "请选择要删除的快照") : repairReceipt ? "重新打开 Codex 后检查任务是否重新出现" : validating ? "正在检查…" : healthSelection.size ? `已选择 ${healthSelection.size} 个任务` : "请选择需要修复的任务"}</span>
               <div className="health-footer-actions">
-                {!repairReceipt && <button className="primary-button" disabled={!healthSelection.size || planning || operation || codexRunning} onClick={applyHealthPlan}>{codexRunning ? "请先退出 Codex" : operation === "health" ? "正在创建快照…" : "创建快照并修复"}</button>}
+                {healthDrawerView === "snapshots" ? (confirmSnapshotDelete ? <><button className="text-button compact" type="button" disabled={operation} onClick={() => setConfirmSnapshotDelete(false)}>取消</button><button className="danger-button" type="button" disabled={operation} onClick={deleteSnapshots}>{operation === "snapshots" ? "正在删除…" : `确认删除 ${snapshotSelection.size} 份`}</button></> : <><button className="text-button compact" type="button" disabled={!snapshots.length || loadingSnapshots || operation} onClick={prepareCleanAllSnapshots}>清理全部</button><button className="danger-button" type="button" disabled={!snapshotSelection.size || operation} onClick={() => setConfirmSnapshotDelete(true)}>删除所选</button></>) : !repairReceipt && <button className="primary-button" disabled={!healthSelection.size || planning || operation || codexRunning} onClick={applyHealthPlan}>{codexRunning ? "请先退出 Codex" : operation === "health" ? "正在创建快照…" : "创建快照并修复"}</button>}
               </div>
             </footer>
           </aside>
@@ -835,7 +952,7 @@ function buildRepairGroups(items, tasks, query, selectedIds) {
     .sort((left, right) => Number(right.hasSelected) - Number(left.hasSelected) || left.name.localeCompare(right.name, "zh-CN"));
 }
 
-function ImportView({ environment, showToast }) {
+function ImportView({ environment, showToast, onOperationChange }) {
   const [archive, setArchive] = useState(null);
   const [adaptPaths, setAdaptPaths] = useState(true);
   const [restoreExisting, setRestoreExisting] = useState(false);
@@ -888,6 +1005,7 @@ function ImportView({ environment, showToast }) {
 
   const runImport = async () => {
     setWorking(true);
+    onOperationChange("import");
     try {
       const next = await bridge.importArchive(archive.path, { adaptPaths, restoreExisting, mergeTaskIds: [...mergeTaskIds], targetCwd });
       const importedCount = next.imported?.length || 0;
@@ -904,6 +1022,7 @@ function ImportView({ environment, showToast }) {
       showToast("error", "导入失败", error.message);
     } finally {
       setWorking(false);
+      onOperationChange("");
     }
   };
 
@@ -1051,8 +1170,10 @@ function ImportView({ environment, showToast }) {
 
 export function App() {
   const [mode, setMode] = useState("export");
+  const [activeOperation, setActiveOperation] = useState("");
   const [environment, setEnvironment] = useState(null);
   const [toast, setToast] = useState(null);
+  const toastTimerRef = useRef(null);
 
   const refreshEnvironment = useCallback(() => {
     bridge.getEnvironment().then((next) => {
@@ -1077,14 +1198,22 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [refreshEnvironment]);
 
+  useEffect(() => () => {
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+  }, []);
+
   const showToast = useCallback((type, title, message) => {
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
     setToast({ type, title, message });
-    window.setTimeout(() => setToast(null), 5000);
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast(null);
+      toastTimerRef.current = null;
+    }, 5000);
   }, []);
 
   return (
     <main className="app-shell">
-      <div className="window-drag-region" />
+      <div className="window-drag-region" data-tauri-drag-region />
       <aside className="sidebar">
         <div className="brand">
           <span className="brand-mark"><img src="/transfer-icon-dream.png" alt="" /></span>
@@ -1097,6 +1226,7 @@ export function App() {
             icon={DownloadSimple}
             title="导出任务"
             subtitle="打包这台电脑的会话"
+            disabled={Boolean(activeOperation)}
             onSelect={() => setMode("export")}
           />
           <NavButton
@@ -1104,6 +1234,7 @@ export function App() {
             icon={CloudArrowDown}
             title="导入任务"
             subtitle="恢复到新的电脑"
+            disabled={Boolean(activeOperation)}
             onSelect={() => setMode("import")}
           />
         </nav>
@@ -1123,9 +1254,9 @@ export function App() {
       </aside>
 
       {mode === "export" ? (
-        <ExportView environment={environment} showToast={showToast} refreshEnvironment={refreshEnvironment} />
+        <ExportView environment={environment} showToast={showToast} refreshEnvironment={refreshEnvironment} onOperationChange={setActiveOperation} />
       ) : (
-        <ImportView environment={environment} showToast={showToast} />
+        <ImportView environment={environment} showToast={showToast} onOperationChange={setActiveOperation} />
       )}
       <Toast toast={toast} onClose={() => setToast(null)} />
     </main>

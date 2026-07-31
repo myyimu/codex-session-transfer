@@ -7,3 +7,4 @@ release/
 design-*.png
 /src-tauri/target/
 /src-tauri/gen/
+.idea/

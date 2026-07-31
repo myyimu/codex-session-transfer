@@ -1,17 +1,19 @@
 use chrono::{DateTime, Datelike, Local, Utc};
+#[cfg(not(target_os = "windows"))]
+use chrono::{NaiveDateTime, TimeZone};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
 use tauri::{Emitter, Manager};
@@ -21,6 +23,12 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 const ARCHIVE_SCHEMA: &str = "codex-session-transfer/v1";
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const TASK_SCAN_TIMEOUT: Duration = Duration::from_secs(90);
+const PAUSED_TASK_SCAN_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_PAUSED_TASK_SCANS: usize = 3;
+const MAX_SESSION_DETAILS_CACHE_ENTRIES: usize = 2_048;
+const LOCAL_WRITE_LOCK_FILE: &str = ".codex-session-transfer-write.lock";
+const LOCAL_WRITE_LOCK_TTL: Duration = Duration::from_secs(2 * 60);
+const LOCAL_SNAPSHOT_MARKER: &str = ".codex-session-transfer.backup-";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -52,6 +60,8 @@ struct Task {
     cli_version: String,
     #[serde(default)]
     thread_source: String,
+    #[serde(default)]
+    forked_from_id: String,
     #[serde(default)]
     agent_path: String,
     #[serde(default)]
@@ -108,6 +118,22 @@ struct TaskList {
     bad_title_count: usize,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalSnapshot {
+    path: String,
+    name: String,
+    size: u64,
+    modified_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotDeletionResult {
+    deleted_count: usize,
+    reclaimed_bytes: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TaskHealthIssue {
@@ -159,12 +185,15 @@ struct TaskLibrary {
 // snapshot or database write begins.
 static CANCELLED_BACKGROUND_JOBS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static PAUSED_TASK_SCANS: OnceLock<Mutex<HashMap<String, PausedTaskScan>>> = OnceLock::new();
+static LOCAL_WRITE_OPERATION: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct PausedTaskScan {
     files: Vec<PathBuf>,
     next_index: usize,
     seen_task_ids: HashSet<String>,
+    tasks: Vec<Task>,
     discovered: usize,
+    paused_at: Instant,
 }
 
 fn cancelled_background_jobs() -> &'static Mutex<HashSet<String>> {
@@ -188,11 +217,189 @@ fn paused_task_scans() -> &'static Mutex<HashMap<String, PausedTaskScan>> {
     PAUSED_TASK_SCANS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+struct LocalWriteOperation {
+    _in_process: MutexGuard<'static, ()>,
+    lock_path: PathBuf,
+}
+
+impl Drop for LocalWriteOperation {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+fn write_lock_is_stale(lock_path: &Path, now: SystemTime) -> bool {
+    let expired = fs::metadata(lock_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age > LOCAL_WRITE_LOCK_TTL);
+    expired && !lock_owner_is_running(lock_path)
+}
+
+fn lock_owner_is_running(lock_path: &Path) -> bool {
+    let Some((pid, started_at)) = read_lock_owner(lock_path)
+    else {
+        return false;
+    };
+    let is_running = process_is_running(pid);
+    if !is_running {
+        return false;
+    }
+    started_at
+        .zip(process_started_at(pid))
+        .map(|(expected, actual)| expected == actual)
+        .unwrap_or(true)
+}
+
+fn read_lock_owner(lock_path: &Path) -> Option<(u32, Option<i64>)> {
+    let contents = fs::read_to_string(lock_path).ok()?;
+    let pid = contents.lines().find_map(|line| {
+        line.strip_prefix("pid=")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    })?;
+    let started_at = contents.lines().find_map(|line| {
+        line.strip_prefix("started_at_unix=")
+            .and_then(|value| value.trim().parse::<i64>().ok())
+    });
+    Some((pid, started_at))
+}
+
+fn process_is_running(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = Command::new("tasklist");
+        command
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .creation_flags(CREATE_NO_WINDOW);
+        command
+            .output()
+            .ok()
+            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
+fn process_started_at(pid: u32) -> Option<i64> {
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "$process = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($process) {{ ([DateTimeOffset]$process.StartTime).ToUnixTimeSeconds() }}"
+        );
+        let mut command = Command::new("powershell");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW);
+        command
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|output| output.trim().parse::<i64>().ok())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|output| NaiveDateTime::parse_from_str(output.trim(), "%a %b %e %H:%M:%S %Y").ok())
+            .and_then(|started_at| Local.from_local_datetime(&started_at).single())
+            .map(|started_at| started_at.timestamp())
+    }
+}
+
+fn write_lock_contents(lock_path: &Path, mut file: File, contents: &[u8]) -> Result<(), String> {
+    if let Err(error) = file.write_all(contents) {
+        fs::remove_file(lock_path).ok();
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+fn create_local_write_lock(lock_path: &Path) -> Result<(), String> {
+    let contents = format!(
+        "pid={}\nstarted_at_unix={}\n",
+        std::process::id(),
+        process_started_at(std::process::id()).unwrap_or_else(|| Utc::now().timestamp()),
+    );
+    match OpenOptions::new().write(true).create_new(true).open(lock_path) {
+        Ok(file) => write_lock_contents(lock_path, file, contents.as_bytes()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists && write_lock_is_stale(lock_path, SystemTime::now()) => {
+            fs::remove_file(lock_path).map_err(|error| error.to_string())?;
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(lock_path)
+                .map_err(|error| error.to_string())?;
+            write_lock_contents(lock_path, file, contents.as_bytes())
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(
+            "另一实例正在写入 Codex 本地数据。请等待其完成；若确认程序已异常退出，约两分钟后可自动恢复重试。".to_string(),
+        ),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn acquire_local_write_operation(home: &Path) -> Result<LocalWriteOperation, String> {
+    let in_process = LOCAL_WRITE_OPERATION
+        .get_or_init(|| Mutex::new(()))
+        .try_lock()
+        .map_err(|_| "已有本地导入或修复正在执行，请等待其完成。".to_string())?;
+    fs::create_dir_all(home).map_err(|error| error.to_string())?;
+    let lock_path = home.join(LOCAL_WRITE_LOCK_FILE);
+    create_local_write_lock(&lock_path)?;
+    Ok(LocalWriteOperation {
+        _in_process: in_process,
+        lock_path,
+    })
+}
+
+fn prune_paused_task_scans(scans: &mut HashMap<String, PausedTaskScan>) {
+    scans.retain(|_, scan| scan.paused_at.elapsed() < PAUSED_TASK_SCAN_TTL);
+    while scans.len() > MAX_PAUSED_TASK_SCANS {
+        let Some(oldest) = scans
+            .iter()
+            .min_by_key(|(_, scan)| scan.paused_at)
+            .map(|(token, _)| token.clone())
+        else {
+            break;
+        };
+        scans.remove(&oldest);
+    }
+}
+
+fn take_paused_task_scan(token: &str) -> Option<PausedTaskScan> {
+    let mut scans = paused_task_scans().lock().ok()?;
+    prune_paused_task_scans(&mut scans);
+    scans.remove(token)
+}
+
+fn store_paused_task_scan(token: String, scan: PausedTaskScan) {
+    let Ok(mut scans) = paused_task_scans().lock() else {
+        return;
+    };
+    scans.insert(token, scan);
+    prune_paused_task_scans(&mut scans);
+}
+
 #[derive(Clone)]
 struct SessionDetailsCacheEntry {
     size: u64,
     modified_at: Option<SystemTime>,
     task: Task,
+}
+
+#[derive(Default)]
+struct SessionDetailsCache {
+    entries: HashMap<PathBuf, SessionDetailsCacheEntry>,
+    insertion_order: VecDeque<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -458,7 +665,7 @@ fn latest_session_model_settings(home: &Path) -> Option<CodexModelSettings> {
             model: String::new(),
             reasoning_effort: String::new(),
         };
-        for line in BufReader::new(file).lines().filter_map(Result::ok) {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
             let Ok(record) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
@@ -603,12 +810,12 @@ fn codex_desktop_processes() -> Vec<String> {
             .as_ref()
             .map(|item| String::from_utf8_lossy(&item.stdout).to_string())
             .unwrap_or_default();
-        return text
+        text
             .lines()
             .filter_map(|line| line.split(',').next())
             .map(|name| name.trim().trim_matches('"').to_string())
-            .filter(|name| matches!(name.as_str(), "ChatGPT.exe" | "Codex.exe"))
-            .collect();
+            .filter(|name| is_codex_desktop_process(name))
+            .collect()
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -622,13 +829,16 @@ fn codex_desktop_processes() -> Vec<String> {
             .map(|item| String::from_utf8_lossy(&item.stdout).to_string())
             .unwrap_or_default();
         text.lines()
-            .filter(|line| {
-                line.contains("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")
-                    || line.contains("/Applications/Codex.app/Contents/MacOS/Codex")
-            })
+            .filter(|line| is_codex_desktop_process(line))
             .map(|line| clean_text(line))
             .collect()
     }
+}
+
+fn is_codex_desktop_process(value: &str) -> bool {
+    matches!(value, "ChatGPT.exe" | "Codex.exe")
+        || value.contains("ChatGPT.app/Contents/MacOS/ChatGPT")
+        || value.contains("Codex.app/Contents/MacOS/Codex")
 }
 
 fn is_codex_desktop_running() -> bool {
@@ -802,6 +1012,10 @@ fn apply_session_record_metadata(task: &mut Task, record: &Value) {
             payload.get("thread_source").and_then(Value::as_str),
         );
         set_if_empty(
+            &mut task.forked_from_id,
+            payload.get("forked_from_id").and_then(Value::as_str),
+        );
+        set_if_empty(
             &mut task.agent_path,
             payload.get("agent_path").and_then(Value::as_str),
         );
@@ -898,10 +1112,10 @@ fn session_details(path: &Path) -> Result<Task, String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     let size = metadata.len();
     let modified_at = metadata.modified().ok();
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, SessionDetailsCacheEntry>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    static CACHE: OnceLock<Mutex<SessionDetailsCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(SessionDetailsCache::default()));
     if let Ok(cache) = cache.lock() {
-        if let Some(entry) = cache.get(path) {
+        if let Some(entry) = cache.entries.get(path) {
             if entry.size == size && entry.modified_at == modified_at {
                 return Ok(entry.task.clone());
             }
@@ -925,6 +1139,7 @@ fn session_details(path: &Path) -> Result<Task, String> {
         approval_mode: String::new(),
         cli_version: String::new(),
         thread_source: String::new(),
+        forked_from_id: String::new(),
         agent_path: String::new(),
         agent_nickname: String::new(),
         agent_role: String::new(),
@@ -1062,10 +1277,17 @@ fn session_details(path: &Path) -> Result<Task, String> {
             .unwrap_or(last_activity_at)
     };
     if let Ok(mut cache) = cache.lock() {
-        if cache.len() >= 10_000 {
-            cache.clear();
+        if !cache.entries.contains_key(path) {
+            while cache.entries.len() >= MAX_SESSION_DETAILS_CACHE_ENTRIES {
+                if let Some(oldest) = cache.insertion_order.pop_front() {
+                    cache.entries.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            cache.insertion_order.push_back(path.to_path_buf());
         }
-        cache.insert(
+        cache.entries.insert(
             path.to_path_buf(),
             SessionDetailsCacheEntry {
                 size,
@@ -1367,11 +1589,13 @@ fn read_desktop_project_state(home: &Path) -> Option<DesktopProjectState> {
     } else {
         nested_state?
     };
-    let mut result = DesktopProjectState::default();
-    result.project_order = value_array_strings(state.get("project-order"));
-    result.projectless_threads = value_array_strings(state.get("projectless-thread-ids"))
-        .into_iter()
-        .collect();
+    let mut result = DesktopProjectState {
+        project_order: value_array_strings(state.get("project-order")),
+        projectless_threads: value_array_strings(state.get("projectless-thread-ids"))
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
     let pinned_ids = value_array_strings(state.get("pinned-project-ids"))
         .into_iter()
         .collect::<HashSet<_>>();
@@ -1704,9 +1928,11 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
             let project_roots = matched_project
                 .map(|project| project.root_paths.clone())
                 .unwrap_or_else(|| {
-                    has_project_folder
-                        .then(|| vec![cwd.clone()])
-                        .unwrap_or_default()
+                    if has_project_folder {
+                        vec![cwd.clone()]
+                    } else {
+                        Vec::new()
+                    }
                 });
             (project_id, project_name, project_roots)
         };
@@ -1933,29 +2159,39 @@ fn scan_preview_task(home: &Path, path: &Path) -> Option<Task> {
     Some(task)
 }
 
-fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), String> {
-    let home = codex_home();
-    let index = read_index(&home);
-    let history_messages = history_first_messages(&home);
-    let database = database_tasks(&home);
-    let catalog = catalog_tasks(&home);
-    let affected_title_ids = bad_title_ids_from_metadata(&index, &database, &catalog);
-    let desktop_projects = read_desktop_project_state(&home);
-    let files = session_file_paths(&home);
+fn session_tasks(home: &Path) -> Vec<Task> {
     let mut tasks = Vec::new();
     let mut seen_task_ids = HashSet::new();
-    for path in files {
+    for path in session_file_paths(home) {
         let Ok(mut task) = session_details(&path) else {
             continue;
         };
-        if task.id.is_empty() {
+        if task.id.is_empty() || !seen_task_ids.insert(task.id.clone()) {
             continue;
         }
-        // Prefer the active copy when the same task also has an archived
-        // residue, avoiding duplicate rows in the export list.
-        if !seen_task_ids.insert(task.id.clone()) {
-            continue;
-        }
+        // Prefer the active copy when the same task also has an archived residue.
+        task.archived = path.starts_with(home.join("archived_sessions"));
+        task.browser_file = home
+            .join("browser")
+            .join("sessions")
+            .join(format!("{}.toml", task.id));
+        tasks.push(task);
+    }
+    tasks
+}
+
+fn enrich_local_tasks_with_title_ids(
+    home: &Path,
+    raw_tasks: Vec<Task>,
+) -> Result<(Vec<Task>, HashSet<String>), String> {
+    let index = read_index(home);
+    let history_messages = history_first_messages(home);
+    let database = database_tasks(home);
+    let catalog = catalog_tasks(home);
+    let affected_title_ids = bad_title_ids_from_metadata(&index, &database, &catalog);
+    let desktop_projects = read_desktop_project_state(home);
+    let mut tasks = Vec::new();
+    for mut task in raw_tasks {
         let indexed = index.get(&task.id);
         let database_task = database.get(&task.id);
         let catalog_task = catalog.as_ref().and_then(|items| items.get(&task.id));
@@ -2037,9 +2273,7 @@ fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), Str
                 task.history_mode = database_task.history_mode.clone();
             }
         }
-        let file_is_archived = path.starts_with(home.join("archived_sessions"));
-        task.archived =
-            file_is_archived || database_task.map(|item| item.archived).unwrap_or(false);
+        task.archived = task.archived || database_task.map(|item| item.archived).unwrap_or(false);
         let catalog_visible = catalog_visibility(&catalog, &task.id);
         task.codex_visible = catalog_visible.unwrap_or(true);
         (
@@ -2081,14 +2315,15 @@ fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), Str
                 );
             }
         }
-        task.browser_file = home
-            .join("browser")
-            .join("sessions")
-            .join(format!("{}.toml", task.id));
         tasks.push(task);
     }
     tasks.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Ok((tasks, affected_title_ids))
+}
+
+fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), String> {
+    let home = codex_home();
+    enrich_local_tasks_with_title_ids(&home, session_tasks(&home))
 }
 
 fn list_local_tasks() -> Result<Vec<Task>, String> {
@@ -2144,6 +2379,26 @@ fn session_meta_id<R: BufRead>(reader: R) -> Result<String, String> {
     Err("压缩包会话缺少 session_meta".to_string())
 }
 
+fn session_meta_forked_from_id<R: BufRead>(reader: R) -> Result<String, String> {
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        return Ok(record
+            .get("payload")
+            .and_then(|payload| payload.get("forked_from_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or_default()
+            .to_string());
+    }
+    Err("压缩包会话缺少 session_meta".to_string())
+}
+
 fn archive_manifest(path: &Path) -> Result<Manifest, String> {
     let file = File::open(path).map_err(|_| "找不到所选压缩包".to_string())?;
     let mut zip = ZipArchive::new(file).map_err(|_| "这不是有效的 ZIP 压缩包".to_string())?;
@@ -2167,6 +2422,8 @@ fn archive_manifest(path: &Path) -> Result<Manifest, String> {
     if manifest.schema != ARCHIVE_SCHEMA
         || manifest.tasks.iter().any(|task| {
             !is_safe_task_id(&task.task.id)
+                || (!task.task.forked_from_id.is_empty()
+                    && !is_safe_task_id(&task.task.forked_from_id))
                 || !task
                     .session_file
                     .starts_with(&format!("tasks/{}/", task.task.id))
@@ -2189,6 +2446,15 @@ fn archive_manifest(path: &Path) -> Result<Manifest, String> {
         let session_id = session_meta_id(BufReader::new(session))?;
         if session_id != task.task.id {
             return Err("压缩包会话 ID 与 manifest 不一致".to_string());
+        }
+        let session = zip
+            .by_name(&task.session_file)
+            .map_err(|_| "压缩包缺少会话文件".to_string())?;
+        let session_forked_from_id = session_meta_forked_from_id(BufReader::new(session))?;
+        if !task.task.forked_from_id.is_empty()
+            && task.task.forked_from_id != session_forked_from_id
+        {
+            return Err("压缩包会话关系与 manifest 不一致".to_string());
         }
         if let Some(browser_file) = &task.browser_file {
             zip.by_name(browser_file)
@@ -2226,19 +2492,35 @@ fn resolve_local_cwd(cwd: &str) -> String {
     cwd.to_string()
 }
 
-fn ensure_project_directory(cwd: &str) -> Result<(), String> {
-    let cwd = cwd.trim();
-    if cwd.is_empty() {
-        return Ok(());
+fn resolved_import_cwd(source_cwd: &str, target_cwd: Option<&str>, adapt_paths: bool) -> String {
+    if source_cwd.trim().is_empty() {
+        return String::new();
     }
-    let path = Path::new(cwd);
-    if path.exists() {
-        if path.is_dir() {
-            return Ok(());
-        }
-        return Err(format!("项目路径已存在但不是文件夹：{cwd}"));
+    // Worktrees are owned by Codex/Git. A historical worktree is restored as
+    // unbound when it is absent locally; this utility never creates or binds it.
+    if is_codex_worktree(source_cwd) && !Path::new(source_cwd).is_dir() {
+        return String::new();
     }
-    fs::create_dir_all(path).map_err(|error| format!("无法创建项目文件夹 {cwd}: {error}"))
+    if let Some(target) = target_cwd.map(str::trim).filter(|path| !path.is_empty()) {
+        return if Path::new(target).is_dir() {
+            target.to_string()
+        } else {
+            String::new()
+        };
+    }
+    if !adapt_paths {
+        return if Path::new(source_cwd).is_dir() {
+            source_cwd.to_string()
+        } else {
+            String::new()
+        };
+    }
+    let resolved = resolve_local_cwd(source_cwd);
+    if Path::new(&resolved).is_dir() {
+        resolved
+    } else {
+        String::new()
+    }
 }
 
 fn is_path_field(name: &str) -> bool {
@@ -2305,9 +2587,6 @@ fn rewrite_session_cwd(contents: &str, from: &str, to: &str) -> String {
 }
 
 fn rewrite_session_meta_cwd(contents: &str, to: &str) -> String {
-    if to.is_empty() {
-        return contents.to_string();
-    }
     contents
         .lines()
         .map(|line| match serde_json::from_str::<Value>(line) {
@@ -2481,15 +2760,6 @@ fn verify_registered_threads(home: &Path, tasks: &[Task]) -> Result<(), String> 
     Ok(())
 }
 
-fn backup_database(path: &Path, stamp: &str) -> Option<String> {
-    if !path.exists() {
-        return None;
-    }
-    let target = PathBuf::from(format!("{}.backup-{stamp}", path.display()));
-    fs::copy(path, &target).ok()?;
-    Some(target.to_string_lossy().to_string())
-}
-
 fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}-{suffix}", path.display()))
 }
@@ -2549,7 +2819,7 @@ impl ImportTransaction {
         if !path.exists() || !self.backed_paths.insert(path.to_path_buf()) {
             return Ok(());
         }
-        let target = PathBuf::from(format!("{}.backup-{stamp}", path.display()));
+        let target = PathBuf::from(format!("{}{}{}", path.display(), LOCAL_SNAPSHOT_MARKER, stamp));
         fs::copy(path, &target).map_err(|error| format!("无法备份 {}: {error}", path.display()))?;
         self.backups.push(target.to_string_lossy().to_string());
         Ok(())
@@ -2585,7 +2855,7 @@ impl Drop for ImportTransaction {
             fs::remove_file(path).ok();
         }
         for backup in self.backups.iter().rev() {
-            if let Some((original, _)) = backup.rsplit_once(".backup-") {
+            if let Some((original, _)) = backup.rsplit_once(LOCAL_SNAPSHOT_MARKER) {
                 fs::copy(backup, original).ok();
             }
         }
@@ -2621,7 +2891,7 @@ fn prune_rotated_operation_receipts(parent: &Path) -> Result<(), String> {
             Some((modified, entry.path()))
         })
         .collect::<Vec<_>>();
-    archives.sort_by(|left, right| left.0.cmp(&right.0));
+    archives.sort_by_key(|entry| entry.0);
     let excess = archives.len().saturating_sub(MAX_ROTATED_RECEIPTS);
     for (_, path) in archives.into_iter().take(excess) {
         fs::remove_file(path).map_err(|error| error.to_string())?;
@@ -2824,6 +3094,108 @@ fn get_operation_receipts_directory() -> String {
         .unwrap_or_default()
 }
 
+fn is_local_snapshot_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(LOCAL_SNAPSHOT_MARKER))
+}
+
+fn local_snapshots(home: &Path) -> Result<Vec<LocalSnapshot>, String> {
+    if !home.exists() {
+        return Ok(Vec::new());
+    }
+    let mut snapshots = Vec::new();
+    for entry in WalkDir::new(home)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !is_local_snapshot_file(path) {
+            continue;
+        }
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("无法读取快照 {}: {error}", path.display()))?;
+        let modified_at = metadata
+            .modified()
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(|_| Utc::now())
+            .to_rfc3339();
+        snapshots.push(LocalSnapshot {
+            path: path.to_string_lossy().to_string(),
+            name: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("未命名快照")
+                .to_string(),
+            size: metadata.len(),
+            modified_at,
+        });
+    }
+    snapshots.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+    Ok(snapshots)
+}
+
+fn validated_local_snapshot_path(home: &Path, requested_path: &str) -> Result<PathBuf, String> {
+    let canonical_home =
+        fs::canonicalize(home).map_err(|error| format!("无法访问 Codex 数据目录: {error}"))?;
+    let candidate = fs::canonicalize(Path::new(requested_path))
+        .map_err(|_| "快照不存在或已被删除。".to_string())?;
+    if !candidate.starts_with(&canonical_home) || !is_local_snapshot_file(&candidate) {
+        return Err("只能删除当前 Codex 数据目录中由本工具创建的快照。".to_string());
+    }
+    Ok(candidate)
+}
+
+fn delete_local_snapshots_blocking(
+    snapshot_paths: Vec<String>,
+) -> Result<SnapshotDeletionResult, String> {
+    if snapshot_paths.is_empty() {
+        return Ok(SnapshotDeletionResult {
+            deleted_count: 0,
+            reclaimed_bytes: 0,
+        });
+    }
+    let home = codex_home();
+    let _write_guard = acquire_local_write_operation(&home)?;
+    let snapshots = snapshot_paths
+        .iter()
+        .map(|path| validated_local_snapshot_path(&home, path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut reclaimed_bytes = 0;
+    for snapshot in &snapshots {
+        reclaimed_bytes += fs::metadata(snapshot)
+            .map_err(|error| format!("无法读取快照 {}: {error}", snapshot.display()))?
+            .len();
+    }
+    for snapshot in &snapshots {
+        fs::remove_file(snapshot)
+            .map_err(|error| format!("无法删除快照 {}: {error}", snapshot.display()))?;
+    }
+    Ok(SnapshotDeletionResult {
+        deleted_count: snapshots.len(),
+        reclaimed_bytes,
+    })
+}
+
+#[tauri::command]
+async fn list_local_snapshots() -> Result<Vec<LocalSnapshot>, String> {
+    tauri::async_runtime::spawn_blocking(|| local_snapshots(&codex_home()))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn delete_local_snapshots(
+    snapshot_paths: Vec<String>,
+) -> Result<SnapshotDeletionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || delete_local_snapshots_blocking(snapshot_paths))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     if value.trim().is_empty() {
         fallback
@@ -2988,36 +3360,6 @@ fn register_catalog_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(())
-}
-
-fn rewrite_index_titles(home: &Path, tasks: &[Task]) -> Result<(), String> {
-    let path = home.join("session_index.jsonl");
-    if !path.exists() {
-        return Ok(());
-    }
-    let titles = tasks
-        .iter()
-        .map(|task| (task.id.clone(), task.title.clone()))
-        .collect::<HashMap<_, _>>();
-    let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let mut lines = Vec::new();
-    for line in contents.lines() {
-        let Ok(mut value) = serde_json::from_str::<Value>(line) else {
-            lines.push(line.to_string());
-            continue;
-        };
-        if let Some(id) = value.get("id").and_then(Value::as_str) {
-            if let Some(title) = titles.get(id) {
-                if !title.trim().is_empty() {
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert("thread_name".to_string(), Value::String(title.clone()));
-                    }
-                }
-            }
-        }
-        lines.push(serde_json::to_string(&value).unwrap_or_else(|_| line.to_string()));
-    }
-    fs::write(path, format!("{}\n", lines.join("\n"))).map_err(|error| error.to_string())
 }
 
 fn bad_title_ids_from_metadata(
@@ -3274,12 +3616,14 @@ fn start_task_scan(
         let continuation_token = resume_token.clone().unwrap_or_else(|| run_id.clone());
         let mut paused = resume_token
             .as_deref()
-            .and_then(|token| paused_task_scans().lock().ok()?.remove(token))
+            .and_then(take_paused_task_scan)
             .unwrap_or_else(|| PausedTaskScan {
                 files: session_file_paths(&home),
                 next_index: 0,
                 seen_task_ids: HashSet::new(),
+                tasks: Vec::new(),
                 discovered: 0,
+                paused_at: Instant::now(),
             });
         let start_index = paused.next_index;
         let files = std::mem::take(&mut paused.files);
@@ -3294,6 +3638,7 @@ fn start_task_scan(
         let mut batch = Vec::new();
         let mut discovered = paused.discovered;
         let mut seen = paused.seen_task_ids;
+        let mut preview_tasks = paused.tasks;
         for index in start_index..total {
             let path = &files[index];
             if job_is_cancelled(&run_id) {
@@ -3326,17 +3671,17 @@ fn start_task_scan(
                         }),
                     );
                 }
-                if let Ok(mut scans) = paused_task_scans().lock() {
-                    scans.insert(
-                        continuation_token.clone(),
-                        PausedTaskScan {
-                            files,
-                            next_index: index,
-                            seen_task_ids: seen,
-                            discovered,
-                        },
-                    );
-                }
+                store_paused_task_scan(
+                    continuation_token.clone(),
+                    PausedTaskScan {
+                        files,
+                        next_index: index,
+                        seen_task_ids: seen,
+                        tasks: preview_tasks,
+                        discovered,
+                        paused_at: Instant::now(),
+                    },
+                );
                 emit_scan_event(
                     &app,
                     serde_json::json!({
@@ -3350,6 +3695,7 @@ fn start_task_scan(
             if let Some(task) = scan_preview_task(&home, path) {
                 if seen.insert(task.id.clone()) {
                     discovered += 1;
+                    preview_tasks.push(task.clone());
                     batch.push(task);
                 }
             }
@@ -3388,7 +3734,9 @@ fn start_task_scan(
                 &app,
                 serde_json::json!({"runId": run_id, "kind": "cancelled", "stage": "organizing", "scanned": total, "total": total, "discovered": discovered}),
             );
-        } else if let Ok((tasks, affected_title_ids)) = list_local_tasks_with_title_ids() {
+        } else if let Ok((tasks, affected_title_ids)) =
+            enrich_local_tasks_with_title_ids(&home, preview_tasks)
+        {
             if let Ok(mut scans) = paused_task_scans().lock() {
                 scans.remove(&continuation_token);
             }
@@ -3486,7 +3834,9 @@ fn apply_repair_plan_blocking(task_ids: Vec<String>) -> Result<serde_json::Value
         }));
     }
 
-    let result = restore_local_tasks(executable_ids)?;
+    let home = codex_home();
+    let _write_guard = acquire_local_write_operation(&home)?;
+    let result = restore_local_tasks_blocking(executable_ids)?;
     let backups = result
         .get("backups")
         .cloned()
@@ -3523,51 +3873,6 @@ fn apply_repair_plan_blocking(task_ids: Vec<String>) -> Result<serde_json::Value
         }
     }
     Ok(response)
-}
-
-#[tauri::command]
-fn repair_bad_titles() -> Result<serde_json::Value, String> {
-    if is_codex_desktop_running() {
-        return Err("检测到 Codex/ChatGPT 桌面端正在运行。请先完全退出 Codex，再修复异常标题，避免运行中的客户端覆盖修复结果。".to_string());
-    }
-    let home = codex_home();
-    let affected_ids = bad_title_ids(&home);
-
-    let mut tasks = list_local_tasks()?;
-    for task in &mut tasks {
-        normalize_task_title(task);
-        if task.title.is_empty() {
-            task.title = format!("未命名任务 {}", &task.id[..task.id.len().min(8)]);
-        }
-    }
-    let selected = tasks
-        .into_iter()
-        .filter(|task| affected_ids.contains(&task.id) && !task.title.trim().is_empty())
-        .collect::<Vec<_>>();
-    if selected.is_empty() {
-        return Ok(
-            serde_json::json!({"repaired": [], "count": 0, "backups": [], "codexHome": home}),
-        );
-    }
-
-    let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let backups = [
-        backup_database(&home.join("session_index.jsonl"), &stamp),
-        backup_database(&latest_state_database(&home), &stamp),
-        backup_database(&home.join("sqlite").join("codex-dev.db"), &stamp),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    rewrite_index_titles(&home, &selected)?;
-    register_threads(&home, &selected)?;
-    register_catalog_threads(&home, &selected)?;
-    Ok(serde_json::json!({
-        "count": selected.len(),
-        "repaired": selected.iter().map(|task| serde_json::json!({"id": task.id, "title": task.title, "cwd": task.cwd})).collect::<Vec<_>>(),
-        "backups": backups,
-        "codexHome": home
-    }))
 }
 
 #[tauri::command]
@@ -3648,6 +3953,12 @@ fn export_tasks(task_ids: Vec<String>, destination: String) -> Result<serde_json
 
 #[tauri::command]
 fn restore_local_tasks(task_ids: Vec<String>) -> Result<serde_json::Value, String> {
+    let home = codex_home();
+    let _write_guard = acquire_local_write_operation(&home)?;
+    restore_local_tasks_blocking(task_ids)
+}
+
+fn restore_local_tasks_blocking(task_ids: Vec<String>) -> Result<serde_json::Value, String> {
     if is_codex_desktop_running() {
         return Err("检测到 Codex/ChatGPT 桌面端正在运行。请先完全退出 Codex，再恢复本地会话，避免侧边栏状态被运行中的客户端覆盖。".to_string());
     }
@@ -3776,6 +4087,7 @@ fn import_archive(
     let source = PathBuf::from(&archive_path);
     let manifest = archive_manifest(&source)?;
     let home = codex_home();
+    let _write_guard = acquire_local_write_operation(&home)?;
     let model_settings = codex_model_settings(&home);
     fs::create_dir_all(home.join("sessions")).map_err(|error| error.to_string())?;
     fs::create_dir_all(home.join("browser").join("sessions")).map_err(|error| error.to_string())?;
@@ -3873,6 +4185,7 @@ fn import_archive(
                 replace_if_present(&mut task.approval_mode, &archive_task.approval_mode);
                 replace_if_present(&mut task.cli_version, &archive_task.cli_version);
                 replace_if_present(&mut task.thread_source, &archive_task.thread_source);
+                replace_if_present(&mut task.forked_from_id, &archive_task.forked_from_id);
                 replace_if_present(&mut task.agent_path, &archive_task.agent_path);
                 replace_if_present(&mut task.agent_nickname, &archive_task.agent_nickname);
                 replace_if_present(&mut task.agent_role, &archive_task.agent_role);
@@ -3882,16 +4195,8 @@ fn import_archive(
                     normalize_task_to_codex_model(&mut task, &model_settings);
                 }
                 normalize_task_title(&mut task);
-                let resolved_cwd = target_cwd
-                    .as_deref()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| {
-                        if adapt_paths {
-                            resolve_local_cwd(&task.cwd)
-                        } else {
-                            task.cwd.clone()
-                        }
-                    });
+                let resolved_cwd =
+                    resolved_import_cwd(&task.cwd, target_cwd.as_deref(), adapt_paths);
                 let cwd_changed = resolved_cwd != task.cwd;
                 if cwd_changed {
                     task.cwd = resolved_cwd;
@@ -3913,9 +4218,6 @@ fn import_archive(
                         contents = rewrite_session_model_context(&contents, &model_settings);
                     }
                     transaction.write_file(&task.file_path, contents, &stamp)?;
-                }
-                if target_cwd.is_some() {
-                    ensure_project_directory(&task.cwd)?;
                 }
                 task.archived = false;
                 (
@@ -3950,23 +4252,9 @@ fn import_archive(
             date.format("%Y-%m-%dT%H-%M-%S"),
             task.id
         ));
-        let local_cwd = if let Some(cwd) = target_cwd.as_deref() {
-            cwd.to_string()
-        } else if adapt_paths {
-            let resolved = resolve_local_cwd(&task.cwd);
-            if Path::new(&resolved).is_dir() {
-                resolved
-            } else {
-                task.cwd.clone()
-            }
-        } else {
-            task.cwd.clone()
-        };
-        if target_cwd.is_some() {
-            ensure_project_directory(&local_cwd)?;
-        }
+        let local_cwd = resolved_import_cwd(&task.cwd, target_cwd.as_deref(), adapt_paths);
         let mut session_content = rewrite_session_cwd(&content, &task.cwd, &local_cwd);
-        if target_cwd.is_some() {
+        if local_cwd != task.cwd {
             session_content = rewrite_session_meta_cwd(&session_content, &local_cwd);
         }
         if normalize_to_codex {
@@ -4076,9 +4364,10 @@ pub fn run() {
             validate_task_library,
             list_operation_receipts,
             get_operation_receipts_directory,
+            list_local_snapshots,
+            delete_local_snapshots,
             export_tasks,
             restore_local_tasks,
-            repair_bad_titles,
             inspect_archive,
             import_archive,
             get_environment
@@ -4090,17 +4379,27 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_index, archive_manifest, codex_model_settings, codex_state_paths,
-        history_first_messages, infer_project, is_bad_title, is_codex_context_text,
-        is_safe_task_id, latest_state_database, meaningful_user_text, register_catalog_threads,
+        acquire_local_write_operation, append_index, archive_manifest, codex_model_settings,
+        codex_state_paths, history_first_messages, infer_project, is_bad_title,
+        is_codex_context_text, is_codex_desktop_process, is_safe_task_id, latest_state_database,
+        local_snapshots, meaningful_user_text, prune_paused_task_scans, register_catalog_threads,
         register_desktop_project_state, register_threads, repository_name, rewrite_session_cwd,
         rewrite_session_model_context, safe_merge_session_jsonl, session_details,
-        simple_toml_string, sort_tasks_by_project_order, verify_registered_threads, ArchiveTask,
-        CodexModelSettings, ImportTransaction, Manifest, Task, ARCHIVE_SCHEMA,
+        simple_toml_string, sort_tasks_by_project_order, validated_local_snapshot_path,
+        verify_registered_threads, ArchiveTask,
+        CodexModelSettings, ImportTransaction, Manifest, PausedTaskScan, Task, ARCHIVE_SCHEMA,
+        LOCAL_SNAPSHOT_MARKER, LOCAL_WRITE_LOCK_FILE, MAX_PAUSED_TASK_SCANS,
+        PAUSED_TASK_SCAN_TTL,
     };
     use rusqlite::Connection;
     use serde_json::Value;
-    use std::{env, fs, io::Write, path::PathBuf};
+    use std::{
+        collections::{HashMap, HashSet},
+        env, fs,
+        io::Write,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
     use zip::{write::SimpleFileOptions, ZipWriter};
 
     #[test]
@@ -4133,6 +4432,116 @@ mod tests {
         assert!(!merged.preview.can_merge);
         assert_eq!(merged.preview.append_record_count, 0);
         assert!(merged.preview.reason.contains("时间戳"));
+    }
+
+    #[test]
+    fn detects_codex_and_chatgpt_from_any_macos_application_path() {
+        assert!(is_codex_desktop_process(
+            "123 /Users/test/Applications/Codex.app/Contents/MacOS/Codex"
+        ));
+        assert!(is_codex_desktop_process(
+            "456 /private/var/folders/tmp/AppTranslocation/ChatGPT.app/Contents/MacOS/ChatGPT"
+        ));
+        assert!(!is_codex_desktop_process(
+            "789 /Applications/Terminal.app/Contents/MacOS/Terminal"
+        ));
+    }
+
+    #[test]
+    fn local_write_operation_rejects_parallel_writes() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-write-lock-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&home).ok();
+        fs::create_dir_all(&home).unwrap();
+        let guard =
+            acquire_local_write_operation(&home).expect("first write operation acquires the lock");
+        assert!(home.join(LOCAL_WRITE_LOCK_FILE).exists());
+        assert!(acquire_local_write_operation(&home).is_err());
+        drop(guard);
+        assert!(!home.join(LOCAL_WRITE_LOCK_FILE).exists());
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn local_snapshots_only_lists_backup_files() {
+        let home = env::temp_dir().join(format!(
+            "codex-session-transfer-snapshots-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(home.join("sqlite")).unwrap();
+        fs::write(
+            home.join(format!("state_5.sqlite{LOCAL_SNAPSHOT_MARKER}test")),
+            "backup",
+        )
+        .unwrap();
+        fs::write(
+            home.join("sqlite")
+                .join(format!("codex-dev.db{LOCAL_SNAPSHOT_MARKER}test")),
+            "backup",
+        )
+        .unwrap();
+        fs::write(home.join("state_5.sqlite"), "live").unwrap();
+
+        let snapshots = local_snapshots(&home).unwrap();
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| snapshot.name.contains(LOCAL_SNAPSHOT_MARKER)));
+    }
+
+    #[test]
+    fn snapshot_deletion_rejects_files_outside_codex_home() {
+        let root = env::temp_dir().join(format!(
+            "codex-session-transfer-snapshot-scope-{}",
+            std::process::id()
+        ));
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let outside = root.join(format!("outside{LOCAL_SNAPSHOT_MARKER}test"));
+        fs::write(&outside, "backup").unwrap();
+
+        let result = validated_local_snapshot_path(&home, &outside.to_string_lossy());
+        fs::remove_dir_all(&root).ok();
+
+        assert!(result.is_err());
+    }
+
+    fn paused_scan(paused_at: Instant) -> PausedTaskScan {
+        PausedTaskScan {
+            files: Vec::new(),
+            next_index: 0,
+            seen_task_ids: HashSet::new(),
+            tasks: Vec::new(),
+            discovered: 0,
+            paused_at,
+        }
+    }
+
+    #[test]
+    fn paused_scan_cache_discards_expired_and_oldest_entries() {
+        let now = Instant::now();
+        let mut scans = HashMap::new();
+        scans.insert(
+            "expired".to_string(),
+            paused_scan(now - PAUSED_TASK_SCAN_TTL),
+        );
+        for index in 0..=MAX_PAUSED_TASK_SCANS {
+            scans.insert(
+                format!("scan-{index}"),
+                paused_scan(now - Duration::from_secs((MAX_PAUSED_TASK_SCANS - index) as u64)),
+            );
+        }
+
+        prune_paused_task_scans(&mut scans);
+
+        assert_eq!(scans.len(), MAX_PAUSED_TASK_SCANS);
+        assert!(!scans.contains_key("expired"));
+        assert!(!scans.contains_key("scan-0"));
+        assert!(scans.contains_key(&format!("scan-{MAX_PAUSED_TASK_SCANS}")));
     }
 
     #[test]
@@ -4562,6 +4971,23 @@ mod tests {
     }
 
     #[test]
+    fn session_details_reads_forked_from_id() {
+        let path = env::temp_dir().join(format!(
+            "codex-session-transfer-forked-task-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"child-task","forked_from_id":"parent-task","timestamp":"2026-07-31T01:46:41Z","cwd":"/tmp/project"}}"#,
+        )
+        .unwrap();
+        let task = session_details(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(task.forked_from_id, "parent-task");
+    }
+
+    #[test]
     fn session_details_reads_model_from_turn_context() {
         let path = env::temp_dir().join(format!(
             "codex-session-transfer-turn-context-model-{}.jsonl",
@@ -4686,6 +5112,7 @@ mod tests {
             "codex-session-transfer-db-metadata-{}",
             std::process::id()
         ));
+        fs::remove_dir_all(&home).ok();
         fs::create_dir_all(&home).unwrap();
         let connection = Connection::open(home.join("state_5.sqlite")).unwrap();
         connection
@@ -4761,6 +5188,7 @@ mod tests {
                 },
             )
             .unwrap();
+        drop(connection);
         fs::remove_dir_all(&home).ok();
 
         assert_eq!(row.0, "custom");
@@ -4778,6 +5206,7 @@ mod tests {
             "codex-session-transfer-catalog-ready-{}",
             std::process::id()
         ));
+        fs::remove_dir_all(&home).ok();
         let sqlite = home.join("sqlite");
         fs::create_dir_all(&sqlite).unwrap();
         let connection = Connection::open(sqlite.join("codex-dev.db")).unwrap();
@@ -4826,6 +5255,7 @@ mod tests {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .unwrap();
+        drop(connection);
         fs::remove_dir_all(&home).ok();
 
         assert_eq!(state, (41, 1));
@@ -4849,6 +5279,7 @@ mod tests {
             approval_mode: String::new(),
             cli_version: String::new(),
             thread_source: String::new(),
+            forked_from_id: String::new(),
             agent_path: String::new(),
             agent_nickname: String::new(),
             agent_role: String::new(),
@@ -4914,19 +5345,10 @@ mod tests {
     }
 
     #[test]
-    fn ensure_project_directory_creates_missing_folder() {
-        let path = env::temp_dir()
-            .join(format!(
-                "codex-session-transfer-project-{}",
-                std::process::id()
-            ))
-            .join("missing-project");
-        fs::remove_dir_all(path.parent().unwrap()).ok();
-
-        super::ensure_project_directory(&path.to_string_lossy()).unwrap();
-        assert!(path.is_dir());
-
-        fs::remove_dir_all(path.parent().unwrap()).ok();
+    fn missing_codex_worktree_stays_unbound_on_import() {
+        let cwd = r"Z:\historical\.codex\worktrees\77c3\RAGTest";
+        assert!(super::resolved_import_cwd(cwd, None, true).is_empty());
+        assert!(super::resolved_import_cwd(cwd, Some(r"Z:\target"), true).is_empty());
     }
 
     #[test]

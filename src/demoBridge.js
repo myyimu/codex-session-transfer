@@ -26,6 +26,10 @@ const demoTasks = [
 }));
 
 let archive = null;
+let snapshots = [
+  { path: "/Users/yimu/.codex/state_5.sqlite.backup-demo", name: "state_5.sqlite.backup-demo", size: 1860000, modifiedAt: new Date(now - 7200000).toISOString() },
+  { path: "/Users/yimu/.codex/sqlite/codex-dev.db.backup-demo", name: "codex-dev.db.backup-demo", size: 920000, modifiedAt: new Date(now - 86400000).toISOString() },
+];
 
 export const demoBridge = {
   async listTasks() {
@@ -44,14 +48,16 @@ export const demoBridge = {
       codexHome: "/Users/yimu/.codex",
     };
   },
-  async repairBadTitles() {
-    await new Promise((resolve) => setTimeout(resolve, 520));
-    return {
-      count: 2,
-      repaired: demoTasks.slice(0, 2),
-      backups: ["state_5.sqlite.backup-demo", "codex-dev.db.backup-demo"],
-      codexHome: "/Users/yimu/.codex",
-    };
+  async listLocalSnapshots() {
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    return snapshots;
+  },
+  async deleteLocalSnapshots(snapshotPaths) {
+    await new Promise((resolve) => setTimeout(resolve, 260));
+    const selected = new Set(snapshotPaths);
+    const deleted = snapshots.filter((snapshot) => selected.has(snapshot.path));
+    snapshots = snapshots.filter((snapshot) => !selected.has(snapshot.path));
+    return { deletedCount: deleted.length, reclaimedBytes: deleted.reduce((sum, snapshot) => sum + snapshot.size, 0) };
   },
   async chooseArchive() {
     await new Promise((resolve) => setTimeout(resolve, 280));

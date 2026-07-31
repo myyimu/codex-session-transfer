@@ -50,7 +50,6 @@ button {
   inset: 0 0 auto 0;
   height: 40px;
   z-index: 20;
-  -webkit-app-region: drag;
 }
 
 .sidebar,
@@ -1719,6 +1718,33 @@ h1 {
 
 .health-footer-actions .primary-button {
   min-width: 142px;
+}
+
+.danger-button {
+  min-width: 104px;
+  height: 34px;
+  padding: 0 14px;
+  color: #9d4d43;
+  border: 1px solid rgba(181, 92, 78, 0.34);
+  border-radius: 7px;
+  background: #fff8f6;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.danger-button:hover:not(:disabled) {
+  color: #fff;
+  border-color: #b75a4b;
+  background: #b75a4b;
+}
+
+.danger-button:disabled {
+  color: #99a4a7;
+  border-color: #d9e0e2;
+  background: #edf1f2;
+  cursor: default;
 }
 
 .load-more-tasks {
