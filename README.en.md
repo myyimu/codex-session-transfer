@@ -6,8 +6,6 @@ It scans local Codex task history, displays tasks by project and title, exports 
 
 [中文 README](./README.md) | [Product strategy, UX, and roadmap](./docs/product-strategy.md)
 
-![Export overview](./docs/screenshots/readme/export-overview.png)
-
 ## Positioning
 
 `Codex Task Continuity` solves the practical case where an important task still exists locally but is no longer easy to use: move it to another computer, keep an inspectable local archive, or re-register it when the sidebar no longer shows it.
@@ -27,6 +25,7 @@ Codex Session Transfer is designed for:
 ## Features
 
 - **Export tasks**: scan local Codex task history and export selected tasks as a ZIP archive.
+- **Progressive scanning**: discovered tasks appear while scanning; scans can be cancelled and continued after a timeout.
 - **Project grouping**: filter tasks by Codex project from the project picker next to the search box.
 - **Task search**: search by task title, project path, and session content.
 - **Project state labels**: missing projects or projects not shown in the Codex sidebar are marked and placed later in the picker.
@@ -36,24 +35,24 @@ Codex Session Transfer is designed for:
 - **Third-party routed session adaptation**: sessions created through `cc switch` or another third-party API route are imported as normal Codex sessions and continue with the new computer's current Codex default model.
 - **Path adaptation**: map old missing project paths to same-name folders under `~/work`, `~/Projects`, and `~/Documents`.
 - **Running-app protection**: import is blocked while the Codex/ChatGPT desktop main process is running, preventing the client from overwriting restored sidebar state.
-- **Local backups**: backup Codex SQLite databases and global state before importing.
+- **Show tasks again**: when a local session still exists but is not shown in Codex, choose the affected tasks by project and safely re-register them.
+- **Local safety backups**: preserve a local Codex-state backup automatically before importing or re-registering tasks.
 
 ## Recovery Boundaries
 
-- In scope: session portability, task titles and project metadata, sidebar re-registration, target-project binding, and local snapshots before import.
+- In scope: session portability, task titles and project metadata, making tasks visible in the sidebar again, target-project binding, and local safety backups before writes.
 - Not guaranteed: complete Codex-directory replacement, forced repair of every cache or sort preference, undeclared internal task relationships, or exact long-term-memory merging across tasks.
-- Safety rule: any write to local Codex state should happen after Codex is closed, after impact has been previewed, and with a local rollback snapshot.
+- Safety rule: any write to local Codex state should happen after Codex is closed, after impact has been previewed, and with a local safety backup.
 
 See the [product strategy](./docs/product-strategy.md) for the research rationale, two-view interaction design, and delivery plan.
 
-## Validation And Rollback
+## Safety Backups
 
-Each successful import or repair appends a local maintenance receipt to `.codex/session-transfer/receipts.jsonl`. It records the operation summary and snapshot paths. Use **Validate task library** from the Task Library health check to inspect session files, indexes, task databases, and SQLite integrity.
+Before importing or making tasks visible again, the app automatically preserves a safety backup of local Codex state. Backups are never removed automatically; after a repair completes, you can open **Manage local backups** to review or remove selected backups.
 
-- Validation is read-only: it never clears caches, changes sort order, or mutates tasks.
-- Writes still create local snapshots; use the backup paths recorded in the receipt to locate rollback files.
-- The current receipt rotates at `1 MiB` and retains up to eight historical receipt files. Snapshots are never deleted by this policy; use **Open receipt directory** from the health check to inspect retained records.
-- After a real migration, reopen Codex and confirm tasks are visible and resumable before creating substantial new work.
+- Backups stay on the current computer and are never uploaded.
+- The app never clears caches automatically, changes ordering, or overwrites the entire `.codex` directory.
+- After a migration or repair, reopen Codex and confirm tasks are visible and resumable before creating substantial new work.
 
 ## App Guide
 
@@ -61,21 +60,23 @@ Each successful import or repair appends a local maintenance receipt to `.codex/
 
 The app opens on the Export Tasks page. The list shows task titles, update time, project path, and conversation count. Select tasks, then click an Export button.
 
-![Export tasks](./docs/screenshots/readme/export-overview.png)
-
 ### 2. Filter by Project
 
 Click the project picker next to the search box to filter tasks by project. Missing, deleted, or hidden projects are labeled so you can decide whether to migrate or restore them.
 
 ![Project picker](./docs/screenshots/readme/project-dropdown.png)
 
-### 3. Import an Archive
+### 3. Show Tasks Again
+
+When the Export page says that tasks are not currently shown in Codex, click **Handle tasks**. The app groups actionable tasks by project and starts with nothing selected. Choose the tasks you want, run **Back up and repair**, then reopen Codex to verify the result.
+
+### 4. Import an Archive
 
 Switch to Import Tasks, then drag or choose a `.zip` archive created by this app. The app previews the archive before writing anything to Codex data.
 
 ![Import archive](./docs/screenshots/readme/import-empty.png)
 
-### 4. Handle Duplicates and Target Project
+### 5. Handle Duplicates and Target Project
 
 After selecting an archive, each task receives an import status:
 
