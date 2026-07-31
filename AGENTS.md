@@ -29,3 +29,4 @@ When implementing from a selected generated mock, treat that image as the source
 - Export, import, and repair are mutually exclusive operations. Once one starts, keep the user in its current view and prevent a second operation from starting until it completes.
 - Writes to Codex data must also be mutually exclusive across separate app processes through an atomic local lock file; a stale lock may be reclaimed only after its expiry threshold.
 - Snapshot cleanup is explicit and opt-in: show local snapshot storage on demand and delete only user-selected snapshots; never auto-delete recovery snapshots.
+- Technical consistency checks are retained only for internal diagnosis. Do not expose database validation, consistency counts, or non-actionable findings in the normal UI; show only an actionable “task not shown in Codex” recovery prompt. Local snapshots remain automatic safeguards before writes, while snapshot management stays hidden until an operation has completed.

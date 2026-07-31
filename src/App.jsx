@@ -23,6 +23,7 @@ import { demoBridge } from "./demoBridge.js";
 import { tauriBridge } from "./tauriBridge.js";
 
 const bridge = window.__TAURI_INTERNALS__ ? tauriBridge : demoBridge;
+const isMacOS = /Macintosh|Mac OS X/.test(navigator.userAgent);
 
 function formatDate(value) {
   if (!value) return "时间未知";
@@ -402,9 +403,6 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
   const [planning, setPlanning] = useState(false);
   const [repairReceipt, setRepairReceipt] = useState(null);
   const [repairQuery, setRepairQuery] = useState("");
-  const [deferredDetailsOpen, setDeferredDetailsOpen] = useState(false);
-  const [validation, setValidation] = useState(null);
-  const [validating, setValidating] = useState(false);
   const [snapshots, setSnapshots] = useState([]);
   const [snapshotSelection, setSnapshotSelection] = useState(new Set());
   const [loadingSnapshots, setLoadingSnapshots] = useState(false);
@@ -583,34 +581,10 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
     const preferred = new Set(preferredIds.filter((id) => candidates.includes(id)));
     setRepairReceipt(null);
     setRepairQuery("");
-    setDeferredDetailsOpen(false);
     setHealthSelection(preferred);
     setHealthDrawerView("repair");
     setHealthOpen(true);
     await refreshRepairPlan(candidates);
-  };
-
-  const validateLibrary = async () => {
-    if (!bridge.validateTaskLibrary) return;
-    healthTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    setHealthDrawerView("repair");
-    setHealthOpen(true);
-    setValidating(true);
-    try {
-      const next = await bridge.validateTaskLibrary();
-      setValidation(next);
-      const library = await load();
-      const candidates = repairableTaskIds(library?.health);
-      setHealthSelection(new Set());
-      setRepairQuery("");
-      setDeferredDetailsOpen(false);
-      await refreshRepairPlan(candidates);
-      showToast(next.healthy ? "success" : "error", next.healthy ? "任务库验证通过" : `发现 ${next.issueCount} 个一致性问题`, `${next.taskCount} 个本地任务已检查`);
-    } catch (error) {
-      showToast("error", "任务库验证失败", error.message);
-    } finally {
-      setValidating(false);
-    }
   };
 
   const loadSnapshots = async () => {
@@ -681,9 +655,6 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
     setHealthSelection((current) => current.size === actionable.length ? new Set() : new Set(actionable));
   };
 
-  const deferredIssueCount = validation?.issueCount
-    ? Math.max(0, validation.issueCount - (repairPlan?.actionableCount || 0))
-    : (healthReport?.summary?.manualReviewCount || 0);
   const snapshotBytes = snapshots.reduce((sum, snapshot) => sum + (snapshot.size || 0), 0);
   const selectedSnapshotBytes = snapshots
     .filter((snapshot) => snapshotSelection.has(snapshot.path))
@@ -761,20 +732,13 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
         </div>
       </header>
 
-      {!loading && healthReport && (
+      {!loading && healthReport?.summary?.reregisterCount > 0 && (
         <section className="health-summary" aria-label="本地任务健康摘要">
           <span className="health-summary-copy">
             <ShieldCheck size={19} weight="duotone" />
-            <span><strong>任务库健康检查</strong><small>只读扫描，不会自动修改本地数据</small></span>
+            <span><strong>{healthReport.summary.reregisterCount} 个任务暂未在 Codex 中显示</strong><small>会话仍保留在本机，可选择重新显示</small></span>
           </span>
-          <div className="health-summary-actions">
-            <button type="button" className="health-chip healthy" onClick={() => openHealth()}>{healthReport.summary.healthyCount} 正常</button>
-            <button type="button" className="health-chip" onClick={() => openHealth()}>{healthReport.summary.reregisterCount} 可重新登记</button>
-            {healthReport.summary.manualReviewCount > 0 && <button type="button" className="health-chip warning" onClick={() => openHealth()}>{healthReport.summary.manualReviewCount} 需人工处理</button>}
-          </div>
-          <button type="button" className="text-button compact health-open-button" onClick={validateLibrary}>验证任务库</button>
-          <button type="button" className="text-button compact health-open-button" onClick={() => openHealth()}>查看建议</button>
-          <button type="button" className="text-button compact health-open-button" onClick={openSnapshots}>管理快照</button>
+          <button type="button" className="text-button compact health-open-button" onClick={() => openHealth()}>处理任务</button>
         </section>
       )}
 
@@ -840,15 +804,15 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
 
       {healthOpen && (
         <div className="health-drawer-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setHealthOpen(false); }}>
-          <aside ref={healthDrawerRef} className="health-drawer" role="dialog" aria-modal="true" aria-label={healthDrawerView === "snapshots" ? "本地快照管理" : "本地任务修复建议"} tabIndex={-1}>
-            <header className="health-drawer-header">
-              {healthDrawerView === "snapshots" ? <span><FileArchive size={20} weight="duotone" /><span><strong>本地快照</strong><small>{snapshots.length} 份 · 共 {formatBytes(snapshotBytes || 0)}</small></span></span> : <span><Wrench size={20} weight="duotone" /><span><strong>修复任务</strong><small>{repairPlan?.actionableCount || 0} 个任务可安全修复</small></span></span>}
-              <button className="icon-button health-drawer-close" type="button" onClick={(event) => { event.stopPropagation(); setHealthOpen(false); }} aria-label="关闭" title="关闭"><X size={17} /></button>
+            <aside ref={healthDrawerRef} className="health-drawer" role="dialog" aria-modal="true" aria-label={healthDrawerView === "snapshots" ? "本地安全备份管理" : "本地任务修复建议"} tabIndex={-1}>
+              <header className="health-drawer-header">
+              {healthDrawerView === "snapshots" ? <span><FileArchive size={20} weight="duotone" /><span><strong>本地安全备份</strong><small>{snapshots.length} 份 · 共 {formatBytes(snapshotBytes || 0)}</small></span></span> : <span><Wrench size={20} weight="duotone" /><span><strong>修复任务</strong><small>{repairPlan?.actionableCount || 0} 个任务可安全修复</small></span></span>}
+              <button className="icon-button health-drawer-close" type="button" onClick={(event) => { event.stopPropagation(); setHealthOpen(false); }} onDoubleClick={(event) => event.stopPropagation()} aria-label="关闭" title="关闭"><X size={17} /></button>
             </header>
 
             {healthDrawerView === "snapshots" ? (
               <>
-                <p className="health-snapshot-note">修复或导入前创建的本地备份会保留在这台电脑。默认不清理；删除后无法撤销。</p>
+                <p className="health-snapshot-note">修复或导入前创建的安全备份会保留在这台电脑。默认不清理；删除后无法撤销。</p>
                 <div className="snapshot-list repair-plan-list">
                   {loadingSnapshots && <div className="repair-plan-empty"><ArrowClockwise size={20} className="spin" />正在读取快照…</div>}
                   {!loadingSnapshots && snapshots.map((snapshot) => (
@@ -857,13 +821,13 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
                       <span><strong title={snapshot.name}>{snapshot.name}</strong><small>{formatDate(snapshot.modifiedAt)} · {formatBytes(snapshot.size || 0)}</small></span>
                     </label>
                   ))}
-                  {!loadingSnapshots && !snapshots.length && <div className="repair-plan-empty">暂无本地快照</div>}
+                  {!loadingSnapshots && !snapshots.length && <div className="repair-plan-empty">暂无本地安全备份</div>}
                 </div>
               </>
             ) : repairReceipt ? (
               <div className="repair-receipt">
                 <ShieldCheck size={20} weight="duotone" />
-                <span><strong>修复已完成</strong><small>{(repairReceipt.registered || 0) + (repairReceipt.titlesRepaired || 0)} 个任务已处理</small></span>
+                <span><strong>修复已完成</strong><small>{(repairReceipt.registered || 0) + (repairReceipt.titlesRepaired || 0)} 个任务已处理；已保留本地安全备份</small></span>
               </div>
             ) : (
               <>
@@ -894,19 +858,14 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
                   {!planning && !repairPlan?.items.length && <div className="repair-plan-empty">没有发现可安全修复的任务</div>}
                   {!planning && repairPlan?.items.length > 0 && !repairGroups.length && <div className="repair-plan-empty">没有匹配的修复建议</div>}
                 </div>
-                {deferredIssueCount > 0 && (
-                  <div className="deferred-issues">
-                    <button type="button" onClick={() => setDeferredDetailsOpen((open) => !open)}>{`另有 ${deferredIssueCount} 项未自动处理`}</button>
-                    {deferredDetailsOpen && <small>这些项目没有安全的自动修复方式，已保持不变。</small>}
-                  </div>
-                )}
               </>
             )}
 
             <footer className="health-drawer-footer">
-              <span className="health-footer-status">{healthDrawerView === "snapshots" ? (snapshotSelection.size ? `已选择 ${snapshotSelection.size} 份 · ${formatBytes(selectedSnapshotBytes || 0)}` : "请选择要删除的快照") : repairReceipt ? "重新打开 Codex 后检查任务是否重新出现" : validating ? "正在检查…" : healthSelection.size ? `已选择 ${healthSelection.size} 个任务` : "请选择需要修复的任务"}</span>
+              <span className="health-footer-status">{healthDrawerView === "snapshots" ? (snapshotSelection.size ? `已选择 ${snapshotSelection.size} 份 · ${formatBytes(selectedSnapshotBytes || 0)}` : "请选择要删除的备份") : repairReceipt ? "重新打开 Codex 后检查任务是否重新出现" : healthSelection.size ? `已选择 ${healthSelection.size} 个任务` : "请选择需要处理的任务"}</span>
               <div className="health-footer-actions">
-                {healthDrawerView === "snapshots" ? (confirmSnapshotDelete ? <><button className="text-button compact" type="button" disabled={operation} onClick={() => setConfirmSnapshotDelete(false)}>取消</button><button className="danger-button" type="button" disabled={operation} onClick={deleteSnapshots}>{operation === "snapshots" ? "正在删除…" : `确认删除 ${snapshotSelection.size} 份`}</button></> : <><button className="text-button compact" type="button" disabled={!snapshots.length || loadingSnapshots || operation} onClick={prepareCleanAllSnapshots}>清理全部</button><button className="danger-button" type="button" disabled={!snapshotSelection.size || operation} onClick={() => setConfirmSnapshotDelete(true)}>删除所选</button></>) : !repairReceipt && <button className="primary-button" disabled={!healthSelection.size || planning || operation || codexRunning} onClick={applyHealthPlan}>{codexRunning ? "请先退出 Codex" : operation === "health" ? "正在创建快照…" : "创建快照并修复"}</button>}
+                {healthDrawerView === "snapshots" ? (confirmSnapshotDelete ? <><button className="text-button compact" type="button" disabled={operation} onClick={() => setConfirmSnapshotDelete(false)}>取消</button><button className="danger-button" type="button" disabled={operation} onClick={deleteSnapshots}>{operation === "snapshots" ? "正在删除…" : `确认删除 ${snapshotSelection.size} 份`}</button></> : <><button className="text-button compact" type="button" disabled={!snapshots.length || loadingSnapshots || operation} onClick={prepareCleanAllSnapshots}>清理全部</button><button className="danger-button" type="button" disabled={!snapshotSelection.size || operation} onClick={() => setConfirmSnapshotDelete(true)}>删除所选</button></>) : !repairReceipt && <button className="primary-button" disabled={!healthSelection.size || planning || operation || codexRunning} onClick={applyHealthPlan}>{codexRunning ? "请先退出 Codex" : operation === "health" ? "正在准备安全备份…" : "安全备份并修复"}</button>}
+                {healthDrawerView !== "snapshots" && repairReceipt && <button type="button" className="text-button compact" onClick={openSnapshots}>管理本地备份</button>}
               </div>
             </footer>
           </aside>
@@ -1146,7 +1105,7 @@ function ImportView({ environment, showToast, onOperationChange }) {
           {result && (
             <div className="result-strip">
               <ShieldCheck size={20} weight="duotone" />
-              <span><strong>导入完成</strong><small title={result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}>{result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}</small>{result.backups?.length > 0 && <small title={result.backups.join("\n")}>快照：{result.backups[0]}{result.backups.length > 1 ? ` 等 ${result.backups.length} 份` : ""}</small>}{result.receiptWarning && <small>{result.receiptWarning}</small>}</span>
+              <span><strong>导入完成</strong><small title={result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}>{result.restored?.length ? "已从本地历史恢复，请重启 Codex 查看" : "请重启 Codex 刷新任务列表"}</small>{result.backups?.length > 0 && <small>已保留本地安全备份</small>}{result.receiptWarning && <small>{result.receiptWarning}</small>}</span>
               {result.receiptPath && <button className="icon-button" onClick={() => bridge.revealPath(result.receiptPath)} title="打开维护回执" aria-label="打开维护回执"><FileArchive size={18} /></button>}
               <button className="icon-button" onClick={() => bridge.revealPath(environment.codexHome)} title="打开 Codex 数据目录" aria-label="打开 Codex 数据目录"><FolderOpen size={18} /></button>
             </div>
@@ -1213,7 +1172,7 @@ export function App() {
 
   return (
     <main className="app-shell">
-      <div className="window-drag-region" data-tauri-drag-region />
+      {isMacOS && !healthOpen && <div className="window-drag-region" data-tauri-drag-region />}
       <aside className="sidebar">
         <div className="brand">
           <span className="brand-mark"><img src="/transfer-icon-dream.png" alt="" /></span>

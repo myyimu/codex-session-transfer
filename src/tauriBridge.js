@@ -16,7 +16,6 @@ export const tauriBridge = {
   getTaskHealth: () => invoke("get_task_health"),
   buildRepairPlan: (taskIds) => invoke("build_repair_plan", { taskIds }),
   applyRepairPlan: (taskIds) => invoke("apply_repair_plan", { taskIds }),
-  validateTaskLibrary: () => invoke("validate_task_library"),
   listOperationReceipts: () => invoke("list_operation_receipts"),
   getOperationReceiptsDirectory: () => invoke("get_operation_receipts_directory"),
   listLocalSnapshots: () => invoke("list_local_snapshots"),

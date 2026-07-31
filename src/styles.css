@@ -45,18 +45,18 @@ button {
   background: rgba(255, 255, 255, 0.12);
 }
 
-.window-drag-region {
-  position: fixed;
-  inset: 0 0 auto 0;
-  height: 40px;
-  z-index: 20;
-}
-
 .sidebar,
 .workspace,
 .toast {
   position: relative;
   z-index: 1;
+}
+
+.window-drag-region {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: 40px;
+  z-index: 20;
 }
 
 .sidebar {
@@ -1476,7 +1476,6 @@ h1 {
   position: relative;
   z-index: 2;
   pointer-events: auto;
-  -webkit-app-region: no-drag;
 }
 
 .health-drawer-note,
