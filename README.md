@@ -205,6 +205,12 @@ codex-session-transfer/v1
 
 应用只读取本机 Codex 数据目录，并在本机生成或导入 ZIP 文件。它不会上传会话内容，也不需要服务器。
 
+## 作者与贡献者
+
+- 作者：myyimu（翊木最可爱~）
+- 贡献者：欢迎通过 Issue 或 Pull Request 参与改进；贡献记录见 [GitHub Contributors](https://github.com/myyimu/codex-session-transfer/graphs/contributors)。
+- 仓库：[github.com/myyimu/codex-session-transfer](https://github.com/myyimu/codex-session-transfer)
+
 ## 开源协议
 
 [MIT](./LICENSE)
