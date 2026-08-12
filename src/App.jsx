@@ -1172,7 +1172,7 @@ export function App() {
 
   return (
     <main className="app-shell">
-      {isMacOS && !healthOpen && <div className="window-drag-region" data-tauri-drag-region />}
+      {isMacOS && <div className="window-drag-region" data-tauri-drag-region />}
       <aside className="sidebar">
         <div className="brand">
           <span className="brand-mark"><img src="/transfer-icon-dream.png" alt="" /></span>
