@@ -560,6 +560,34 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
     }
   };
 
+  const bindSelected = async () => {
+    if (!selected.size || !bridge.bindLocalTasks || !bridge.chooseDirectory) return;
+    let targetCwd;
+    try {
+      targetCwd = await bridge.chooseDirectory();
+    } catch (error) {
+      showToast("error", "无法选择项目目录", error.message);
+      return;
+    }
+    if (!targetCwd) return;
+    const confirmed = window.confirm(`将所选 ${selected.size} 个任务绑定到：\n${targetCwd}\n\n软件会先创建本地安全备份，并更新会话工作目录。`);
+    if (!confirmed) return;
+    setOperation("bind");
+    onOperationChange("bind");
+    try {
+      const result = await bridge.bindLocalTasks([...selected], targetCwd);
+      setSelected(new Set());
+      showToast("success", `已绑定 ${result.bound?.length || selected.size} 个任务`, result.message || targetCwd);
+      await load();
+      refreshEnvironment?.();
+    } catch (error) {
+      showToast("error", "绑定项目失败", error.message);
+    } finally {
+      setOperation("");
+      onOperationChange("");
+    }
+  };
+
   const refreshRepairPlan = async (ids) => {
     if (!ids.length || !bridge.buildRepairPlan) {
       setRepairPlan(null);
@@ -789,6 +817,15 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
           <button className="primary-button" disabled={!selected.size || operation} onClick={exportSelected}>
             <Export size={18} weight="bold" />
             {operation === "export" ? "正在打包…" : "导出压缩包"}
+          </button>
+          <button
+            className="secondary-button"
+            disabled={!selected.size || operation || codexRunning}
+            onClick={bindSelected}
+            title="明确选择一个本机项目目录，将所选任务的历史路径改为该目录"
+          >
+            <FolderOpen size={18} weight="bold" />
+            {operation === "bind" ? "正在绑定…" : "绑定本机项目"}
           </button>
           <button
             className="secondary-button"

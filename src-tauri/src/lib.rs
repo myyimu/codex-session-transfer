@@ -2008,6 +2008,10 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
                     .entry("active-workspace-roots")
                     .or_insert_with(|| Value::Array(Vec::new())),
             );
+            active_roots.retain(|item| match item.as_str() {
+                Some(root) => Path::new(root).is_dir(),
+                None => true,
+            });
             push_unique_string(active_roots, &cwd);
         }
 
@@ -2040,6 +2044,10 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
                     .entry(task.id.clone())
                     .or_insert_with(|| Value::Array(Vec::new())),
             );
+            roots.retain(|item| match item.as_str() {
+                Some(root) => root == cwd || Path::new(root).is_dir(),
+                None => true,
+            });
             push_unique_string(roots, &cwd);
         } else {
             writable_roots.remove(&task.id);
@@ -4029,6 +4037,113 @@ fn restore_local_tasks_blocking(task_ids: Vec<String>) -> Result<serde_json::Val
 }
 
 #[tauri::command]
+async fn bind_local_tasks(
+    task_ids: Vec<String>,
+    target_cwd: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || bind_local_tasks_blocking(task_ids, target_cwd))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn bind_local_tasks_blocking(
+    task_ids: Vec<String>,
+    target_cwd: String,
+) -> Result<serde_json::Value, String> {
+    if is_codex_desktop_running() {
+        return Err("检测到 Codex/ChatGPT 桌面端正在运行。请先完全退出 Codex，再绑定本机项目，避免侧边栏状态被运行中的客户端覆盖。".to_string());
+    }
+    let target_cwd = target_cwd.trim();
+    if target_cwd.is_empty() {
+        return Err("请选择本机项目目录".to_string());
+    }
+    let target_cwd = fs::canonicalize(target_cwd)
+        .map_err(|error| format!("无法访问本机项目目录：{error}"))?;
+    if !target_cwd.is_dir() {
+        return Err("目标路径不是文件夹".to_string());
+    }
+    let requested: HashSet<_> = task_ids.into_iter().collect();
+    if requested.is_empty() {
+        return Err("请至少选择一个任务".to_string());
+    }
+
+    let home = codex_home();
+    let _write_guard = acquire_local_write_operation(&home)?;
+    let mut selected: Vec<_> = list_local_tasks()?
+        .into_iter()
+        .filter(|task| requested.contains(&task.id))
+        .collect();
+    if selected.is_empty() {
+        return Err("本机没有找到可对应的会话文件".to_string());
+    }
+    let target_cwd = target_cwd.to_string_lossy().to_string();
+    let mut rewritten_sessions = Vec::with_capacity(selected.len());
+    for task in &selected {
+        let contents = fs::read_to_string(&task.file_path).map_err(|error| error.to_string())?;
+        let rewritten = if task.cwd.trim().is_empty() {
+            rewrite_session_meta_cwd(&contents, &target_cwd)
+        } else {
+            rewrite_session_meta_cwd(
+                &rewrite_session_cwd(&contents, &task.cwd, &target_cwd),
+                &target_cwd,
+            )
+        };
+        rewritten_sessions.push((task.file_path.clone(), rewritten));
+    }
+    for task in &mut selected {
+        task.cwd = target_cwd.clone();
+        task.archived = false;
+        (
+            task.project_key,
+            task.project_name,
+            task.project_path,
+            task.project_exists,
+        ) = infer_project(task);
+    }
+
+    let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+    checkpoint_sqlite_database(&latest_state_database(&home))?;
+    checkpoint_sqlite_database(&home.join("sqlite").join("codex-dev.db"))?;
+    let mut transaction = ImportTransaction::new(&home);
+    for path in codex_state_paths(&home) {
+        transaction.backup(&path, &stamp)?;
+    }
+    for (path, rewritten) in rewritten_sessions {
+        transaction.write_file(&path, rewritten, &stamp)?;
+    }
+    append_index(&home, &selected)?;
+    register_threads(&home, &selected)?;
+    register_catalog_threads(&home, &selected)?;
+    register_desktop_project_state(&home, &selected)?;
+    verify_registered_threads(&home, &selected)?;
+    let backups = transaction.commit();
+    let mut response = serde_json::json!({
+        "bound": selected.iter().map(|task| serde_json::json!({
+            "id": task.id,
+            "title": task.title,
+            "cwd": task.cwd
+        })).collect::<Vec<_>>(),
+        "targetCwd": target_cwd,
+        "backups": backups,
+        "codexHome": home,
+        "message": "已绑定到本机项目。重新打开 Codex 后检查侧边栏。"
+    });
+    match append_operation_receipt(&home, "bind-project", &response) {
+        Ok(path) => {
+            if let Some(object) = response.as_object_mut() {
+                object.insert("receiptPath".to_string(), Value::String(path));
+            }
+        }
+        Err(error) => {
+            if let Some(object) = response.as_object_mut() {
+                object.insert("receiptWarning".to_string(), Value::String(error));
+            }
+        }
+    }
+    Ok(response)
+}
+
+#[tauri::command]
 fn inspect_archive(archive_path: String) -> Result<ArchiveInspection, String> {
     let manifest = archive_manifest(Path::new(&archive_path))?;
     let model_settings = codex_model_settings(&codex_home());
@@ -4368,6 +4483,7 @@ pub fn run() {
             delete_local_snapshots,
             export_tasks,
             restore_local_tasks,
+            bind_local_tasks,
             inspect_archive,
             import_archive,
             get_environment
@@ -4605,6 +4721,40 @@ mod tests {
         assert_eq!(
             lines[2]["payload"]["message"].as_str(),
             Some("Use /old/file in this command")
+        );
+    }
+
+    #[test]
+    fn rewrite_session_cwd_handles_a_changed_windows_username() {
+        let source = concat!(
+            r#"{"type":"session_meta","payload":{"cwd":"C:\\Users\\HUAWEI\\Projects\\demo"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"cwd":"C:\\Users\\HUAWEI\\Projects\\demo","writable_roots":["C:\\Users\\HUAWEI\\Projects\\demo"]}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"C:\\Users\\HUAWEI\\Projects\\demo should remain quoted"}}"#,
+            "\n"
+        );
+        let rewritten = rewrite_session_cwd(
+            source,
+            r#"C:\Users\HUAWEI\Projects\demo"#,
+            r#"C:\Users\Legion\Projects\demo"#,
+        );
+        let lines = rewritten
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines[0]["payload"]["cwd"].as_str(),
+            Some(r#"C:\Users\Legion\Projects\demo"#)
+        );
+        assert_eq!(
+            lines[1]["payload"]["writable_roots"][0].as_str(),
+            Some(r#"C:\Users\Legion\Projects\demo"#)
+        );
+        assert_eq!(
+            lines[2]["payload"]["message"].as_str(),
+            Some(r#"C:\Users\HUAWEI\Projects\demo should remain quoted"#)
         );
     }
 
