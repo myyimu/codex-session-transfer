@@ -913,9 +913,11 @@ h1 {
 
 .import-content {
   min-height: 0;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto auto auto auto;
+  display: flex;
+  flex-direction: column;
   gap: 12px;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .archive-summary,
@@ -985,6 +987,7 @@ h1 {
 }
 
 .import-list {
+  max-height: min(320px, 42vh);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -993,6 +996,7 @@ h1 {
   border-radius: 7px;
   background: #fff;
   box-shadow: 0 12px 28px rgba(50, 91, 112, 0.11);
+  overflow-y: auto;
 }
 
 .import-row {
@@ -1034,6 +1038,132 @@ h1 {
 .import-state.skip {
   color: #89969a;
   background: #edf0f1;
+}
+
+.view-slot {
+  display: contents;
+}
+
+.view-slot.is-hidden {
+  display: none;
+}
+
+.project-mapping-panel {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(172, 97, 119, 0.16);
+  border-radius: 7px;
+  background: rgba(255, 250, 252, 0.94);
+  box-shadow: 0 10px 24px rgba(50, 91, 112, 0.08);
+}
+
+.project-mapping-header {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.project-mapping-header > span:nth-child(2) {
+  min-width: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+}
+
+.project-mapping-header strong {
+  color: #344249;
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.project-mapping-header small,
+.mapping-source small,
+.mapping-target small {
+  margin-top: 2px;
+  overflow: hidden;
+  color: #8b989c;
+  font-size: 9px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-mapping-list {
+  min-height: 0;
+  max-height: 190px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  padding-right: 3px;
+}
+
+.project-mapping-row {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.8fr) minmax(300px, 1.2fr);
+  align-items: center;
+  gap: 12px;
+  padding: 8px 9px;
+  border: 1px solid rgba(48, 76, 87, 0.09);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.project-mapping-row.is-ambiguous {
+  border-color: rgba(172, 97, 119, 0.3);
+  background: #fff8fa;
+}
+
+.mapping-source,
+.mapping-target {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.mapping-source strong {
+  overflow: hidden;
+  color: #344249;
+  font-size: 11px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mapping-target-controls {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.mapping-target select {
+  min-width: 0;
+  flex: 1;
+  height: 31px;
+  padding: 0 8px;
+  border: 1px solid rgba(172, 97, 119, 0.22);
+  border-radius: 5px;
+  color: #4b5960;
+  background: #fff;
+  font-size: 10px;
+}
+
+.mapping-target small.is-ready {
+  color: #4b896a;
+}
+
+.mapping-target small.is-warning {
+  color: #a44761;
+}
+
+.project-mapping-empty {
+  padding: 12px 10px;
+  color: #7f8e92;
+  font-size: 10px;
+  text-align: center;
 }
 
 .setting-row {
@@ -1291,6 +1421,20 @@ h1 {
 .import-merge-toggle.is-disabled {
   color: #9aa3a6;
   cursor: not-allowed;
+}
+
+.import-merge-note {
+  min-width: 64px;
+  color: #7d8b90;
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 14px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.import-merge-note.is-warning {
+  color: #a44761;
 }
 
 .health-summary {

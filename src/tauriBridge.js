@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
@@ -29,7 +30,6 @@ export const tauriBridge = {
     return destination ? invoke("export_tasks", { taskIds, destination }) : canceled();
   },
   restoreLocalTasks: (taskIds) => invoke("restore_local_tasks", { taskIds }),
-  bindLocalTasks: (taskIds, targetCwd) => invoke("bind_local_tasks", { taskIds, targetCwd }),
   async chooseDirectory() {
     const directory = await open({
       title: "选择本机项目目录",
@@ -48,8 +48,8 @@ export const tauriBridge = {
     return archivePath ? invoke("inspect_archive", { archivePath }) : canceled();
   },
   inspectArchive: (archivePath) => invoke("inspect_archive", { archivePath }),
+  onArchiveDragDrop: (handler) => getCurrentWebview().onDragDropEvent((event) => handler(event.payload)),
   importArchive: (archivePath, options) => invoke("import_archive", { archivePath, options }),
-  getPathForFile: () => null,
   async revealPath(targetPath) {
     await revealItemInDir(targetPath);
     return { ok: true };

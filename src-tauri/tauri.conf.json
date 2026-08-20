@@ -19,7 +19,9 @@
       "visible": false,
       "titleBarStyle": "Overlay"
     }],
-    "security": { "csp": null }
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; frame-ancestors 'none'"
+    }
   },
   "bundle": {
     "active": true,

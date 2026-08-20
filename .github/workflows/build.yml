@@ -1,4 +1,4 @@
-name: Build portable apps
+name: Build desktop apps
 
 on:
   workflow_dispatch:
@@ -32,6 +32,8 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
+      - run: npm run format:check
+      - run: npm run clippy
       - run: npm test
       - run: npm run build:web
 
@@ -49,7 +51,7 @@ jobs:
           - os: windows-latest
             command: npm run build:win
             artifact: release/*.exe
-            name: Windows-portable
+            name: Windows-x64-setup
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

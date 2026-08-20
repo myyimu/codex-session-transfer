@@ -17,11 +17,17 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tauri::{Emitter, Manager};
+use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 const ARCHIVE_SCHEMA: &str = "codex-session-transfer/v1";
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 20_001;
+const MAX_ARCHIVE_TASKS: usize = 10_000;
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SESSION_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_BROWSER_SESSION_BYTES: u64 = 32 * 1024 * 1024;
 const TASK_SCAN_TIMEOUT: Duration = Duration::from_secs(90);
 const PAUSED_TASK_SCAN_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_PAUSED_TASK_SCANS: usize = 3;
@@ -91,6 +97,8 @@ struct Task {
     #[serde(skip_serializing, default)]
     browser_file: PathBuf,
 }
+
+type EnrichedTaskResult = (Vec<Task>, HashSet<String>);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -238,8 +246,7 @@ fn write_lock_is_stale(lock_path: &Path, now: SystemTime) -> bool {
 }
 
 fn lock_owner_is_running(lock_path: &Path) -> bool {
-    let Some((pid, started_at)) = read_lock_owner(lock_path)
-    else {
+    let Some((pid, started_at)) = read_lock_owner(lock_path) else {
         return false;
     };
     let is_running = process_is_running(pid);
@@ -272,10 +279,9 @@ fn process_is_running(pid: u32) -> bool {
         command
             .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
             .creation_flags(CREATE_NO_WINDOW);
-        command
-            .output()
-            .ok()
-            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+        command.output().ok().is_some_and(|output| {
+            String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+        })
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -309,7 +315,9 @@ fn process_started_at(pid: u32) -> Option<i64> {
             .output()
             .ok()
             .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|output| NaiveDateTime::parse_from_str(output.trim(), "%a %b %e %H:%M:%S %Y").ok())
+            .and_then(|output| {
+                NaiveDateTime::parse_from_str(output.trim(), "%a %b %e %H:%M:%S %Y").ok()
+            })
             .and_then(|started_at| Local.from_local_datetime(&started_at).single())
             .map(|started_at| started_at.timestamp())
     }
@@ -429,6 +437,20 @@ struct ArchiveInspection {
     path: String,
     created_at: String,
     tasks: Vec<InspectedTask>,
+    project_mappings: Vec<ImportProjectMapping>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportProjectMapping {
+    source_key: String,
+    source_name: String,
+    source_path: String,
+    candidates: Vec<String>,
+    suggested_path: String,
+    status: String,
+    task_count: usize,
+    task_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -444,9 +466,15 @@ struct InspectedTask {
 #[serde(rename_all = "camelCase")]
 struct SessionMergePreview {
     can_merge: bool,
+    strategy: String,
     archive_record_count: usize,
     local_record_count: usize,
     append_record_count: usize,
+    archive_unique_record_count: usize,
+    local_unique_record_count: usize,
+    archive_unique_user_turn_count: usize,
+    local_unique_user_turn_count: usize,
+    result_record_count: usize,
     archive_last_activity: String,
     local_last_activity: String,
     reason: String,
@@ -461,10 +489,19 @@ struct SessionMergeResult {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ImportOptions {
-    adapt_paths: Option<bool>,
     restore_existing: Option<bool>,
     merge_task_ids: Option<Vec<String>>,
-    target_cwd: Option<String>,
+    project_mappings: Option<Vec<ImportProjectMappingInput>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportProjectMappingInput {
+    source_key: String,
+    #[serde(default)]
+    target_cwd: String,
+    #[serde(default)]
+    keep_unbound: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -560,13 +597,30 @@ fn latest_state_database(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join("state_5.sqlite"))
 }
 
+#[cfg(test)]
 fn history_first_messages(home: &Path) -> HashMap<String, String> {
+    history_first_messages_cancellable(home, || false).unwrap_or_default()
+}
+
+fn history_first_messages_cancellable<F>(
+    home: &Path,
+    should_cancel: F,
+) -> Option<HashMap<String, String>>
+where
+    F: Fn() -> bool,
+{
     let mut messages = HashMap::new();
-    let Ok(contents) = fs::read_to_string(home.join("history.jsonl")) else {
-        return messages;
+    let Ok(file) = File::open(home.join("history.jsonl")) else {
+        return Some(messages);
     };
-    for line in contents.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        if index % 128 == 0 && should_cancel() {
+            return None;
+        }
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         let Some(id) = value.get("session_id").and_then(Value::as_str) else {
@@ -581,7 +635,7 @@ fn history_first_messages(home: &Path) -> HashMap<String, String> {
         };
         messages.entry(id.to_string()).or_insert(text);
     }
-    messages
+    Some(messages)
 }
 
 fn simple_toml_string(contents: &str, key: &str) -> Option<String> {
@@ -810,8 +864,7 @@ fn codex_desktop_processes() -> Vec<String> {
             .as_ref()
             .map(|item| String::from_utf8_lossy(&item.stdout).to_string())
             .unwrap_or_default();
-        text
-            .lines()
+        text.lines()
             .filter_map(|line| line.split(',').next())
             .map(|name| name.trim().trim_matches('"').to_string())
             .filter(|name| is_codex_desktop_process(name))
@@ -1313,6 +1366,88 @@ fn record_timestamp(record: &Value) -> Option<DateTime<Utc>> {
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
+fn session_record_user_message(record: &Value) -> Option<String> {
+    let payload = record.get("payload")?;
+    let role = payload.get("role").and_then(Value::as_str);
+    let payload_type = payload.get("type").and_then(Value::as_str);
+    if role != Some("user") && payload_type != Some("user_message") {
+        return None;
+    }
+    let text = if payload_type == Some("user_message") {
+        value_string(payload.get("message").or_else(|| payload.get("text")))
+    } else if payload_type == Some("message") {
+        content_text(payload.get("content"))
+    } else {
+        String::new()
+    };
+    meaningful_user_text(&text)
+}
+
+fn normalize_record_for_session_comparison(record: &mut Value) {
+    fn normalize_paths(value: &mut Value) {
+        match value {
+            Value::Array(items) => items.iter_mut().for_each(normalize_paths),
+            Value::Object(items) => items.iter_mut().for_each(|(name, item)| {
+                if is_path_field(name) {
+                    *item = Value::String("<local-path>".to_string());
+                } else {
+                    normalize_paths(item);
+                }
+            }),
+            _ => {}
+        }
+    }
+
+    normalize_paths(record);
+    let is_session_meta = record.get("type").and_then(Value::as_str) == Some("session_meta");
+    let is_turn_context = record.get("type").and_then(Value::as_str) == Some("turn_context");
+    if is_session_meta {
+        if let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut) {
+            for key in ["model_provider", "model", "reasoning_effort"] {
+                payload.remove(key);
+            }
+        }
+    }
+    if is_turn_context {
+        if let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut) {
+            for key in ["model", "effort", "reasoning_effort"] {
+                payload.remove(key);
+            }
+            if let Some(settings) = payload
+                .get_mut("collaboration_mode")
+                .and_then(Value::as_object_mut)
+                .and_then(|mode| mode.get_mut("settings"))
+                .and_then(Value::as_object_mut)
+            {
+                settings.remove("model");
+                settings.remove("reasoning_effort");
+            }
+        }
+    }
+    if record
+        .get("payload")
+        .and_then(|payload| payload.get("type"))
+        .and_then(Value::as_str)
+        == Some("thread_settings_applied")
+    {
+        if let Some(settings) = record
+            .get_mut("payload")
+            .and_then(Value::as_object_mut)
+            .and_then(|payload| payload.get_mut("thread_settings"))
+            .and_then(Value::as_object_mut)
+        {
+            for key in [
+                "model_provider_id",
+                "model_provider",
+                "model",
+                "reasoning_effort",
+            ] {
+                settings.remove(key);
+            }
+        }
+    }
+}
+
 fn safe_merge_session_jsonl(archive: &str, local: &str) -> SessionMergeResult {
     let archive_lines = archive
         .lines()
@@ -1327,15 +1462,27 @@ fn safe_merge_session_jsonl(archive: &str, local: &str) -> SessionMergeResult {
         .map(str::to_string)
         .collect::<Vec<_>>();
     let base_preview = |can_merge: bool,
+                        strategy: &str,
                         append_record_count: usize,
+                        archive_unique_record_count: usize,
+                        local_unique_record_count: usize,
+                        archive_unique_user_turn_count: usize,
+                        local_unique_user_turn_count: usize,
+                        result_record_count: usize,
                         archive_last: Option<DateTime<Utc>>,
                         local_last: Option<DateTime<Utc>>,
                         reason: &str| {
         SessionMergePreview {
             can_merge,
+            strategy: strategy.to_string(),
             archive_record_count: archive_lines.len(),
             local_record_count: local_lines.len(),
             append_record_count,
+            archive_unique_record_count,
+            local_unique_record_count,
+            archive_unique_user_turn_count,
+            local_unique_user_turn_count,
+            result_record_count,
             archive_last_activity: archive_last
                 .map(|time| time.to_rfc3339())
                 .unwrap_or_default(),
@@ -1345,17 +1492,37 @@ fn safe_merge_session_jsonl(archive: &str, local: &str) -> SessionMergeResult {
     };
     if archive_lines.is_empty() || local_lines.is_empty() {
         return SessionMergeResult {
-            preview: base_preview(false, 0, None, None, "归档或本机会话为空，无法安全比较。"),
+            preview: base_preview(
+                false,
+                "uncomparable",
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                "归档或本机会话为空，无法安全比较。",
+            ),
             contents: String::new(),
         };
     }
 
     let mut archive_last: Option<DateTime<Utc>> = None;
+    let mut archive_fingerprints = Vec::with_capacity(archive_lines.len());
+    let mut archive_user_turns = Vec::with_capacity(archive_lines.len());
     for line in &archive_lines {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
+        let Ok(mut record) = serde_json::from_str::<Value>(line) else {
             return SessionMergeResult {
                 preview: base_preview(
                     false,
+                    "uncomparable",
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
                     0,
                     None,
                     None,
@@ -1367,97 +1534,128 @@ fn safe_merge_session_jsonl(archive: &str, local: &str) -> SessionMergeResult {
         if let Some(timestamp) = record_timestamp(&record) {
             archive_last = Some(archive_last.map_or(timestamp, |last| last.max(timestamp)));
         }
+        archive_user_turns.push(session_record_user_message(&record).is_some());
+        normalize_record_for_session_comparison(&mut record);
+        archive_fingerprints
+            .push(serde_json::to_string(&record).unwrap_or_else(|_| line.to_string()));
     }
-    let Some(archive_last) = archive_last else {
-        return SessionMergeResult {
-            preview: base_preview(
-                false,
-                0,
-                None,
-                None,
-                "归档会话没有可比较的时间戳，无法安全追加。",
-            ),
-            contents: String::new(),
-        };
-    };
-
-    let archive_records = archive_lines
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
     let mut local_last: Option<DateTime<Utc>> = None;
-    let mut last_appended_timestamp: Option<DateTime<Utc>> = None;
-    let mut appended = Vec::new();
+    let mut local_fingerprints = Vec::with_capacity(local_lines.len());
+    let mut local_user_turns = Vec::with_capacity(local_lines.len());
     for line in &local_lines {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
+        let Ok(mut record) = serde_json::from_str::<Value>(line) else {
             return SessionMergeResult {
                 preview: base_preview(
                     false,
+                    "uncomparable",
                     0,
-                    Some(archive_last),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    archive_last,
                     local_last,
                     "本机会话包含无法解析的记录，已停止合并。",
                 ),
                 contents: String::new(),
             };
         };
-        let Some(timestamp) = record_timestamp(&record) else {
-            if !archive_records.contains(line.as_str()) {
-                return SessionMergeResult {
-                    preview: base_preview(
-                        false,
-                        0,
-                        Some(archive_last),
-                        local_last,
-                        "本机续聊包含无法安全排序的无时间戳记录，已停止自动合并。",
-                    ),
-                    contents: String::new(),
-                };
-            }
-            continue;
-        };
-        local_last = Some(local_last.map_or(timestamp, |last| last.max(timestamp)));
-        if timestamp > archive_last && !archive_records.contains(line.as_str()) {
-            if last_appended_timestamp.is_some_and(|last| timestamp < last) {
-                return SessionMergeResult {
-                    preview: base_preview(
-                        false,
-                        0,
-                        Some(archive_last),
-                        local_last,
-                        "本机续聊的新增记录时间顺序倒退，已停止自动合并。",
-                    ),
-                    contents: String::new(),
-                };
-            }
-            last_appended_timestamp = Some(timestamp);
-            appended.push(line.clone());
+        if let Some(timestamp) = record_timestamp(&record) {
+            local_last = Some(local_last.map_or(timestamp, |last| last.max(timestamp)));
         }
+        local_user_turns.push(session_record_user_message(&record).is_some());
+        normalize_record_for_session_comparison(&mut record);
+        local_fingerprints
+            .push(serde_json::to_string(&record).unwrap_or_else(|_| line.to_string()));
     }
-    if appended.is_empty() {
+
+    let common_prefix_count = archive_fingerprints
+        .iter()
+        .zip(local_fingerprints.iter())
+        .take_while(|(archive_record, local_record)| archive_record == local_record)
+        .count();
+    let archive_unique = archive_lines.len().saturating_sub(common_prefix_count);
+    let local_unique = local_lines.len().saturating_sub(common_prefix_count);
+    let archive_unique_user_turns = archive_user_turns[common_prefix_count..]
+        .iter()
+        .filter(|is_user_turn| **is_user_turn)
+        .count();
+    let local_unique_user_turns = local_user_turns[common_prefix_count..]
+        .iter()
+        .filter(|is_user_turn| **is_user_turn)
+        .count();
+
+    if archive_unique == 0 && local_unique == 0 {
         return SessionMergeResult {
             preview: base_preview(
                 false,
+                "identical",
                 0,
-                Some(archive_last),
+                0,
+                0,
+                0,
+                0,
+                local_lines.len(),
+                archive_last,
                 local_last,
-                "本机没有时间晚于归档末尾的可追加记录。",
+                "归档与本机会话内容一致，无需补全。",
             ),
-            contents: String::new(),
+            contents: format!("{}\n", local_lines.join("\n")),
+        };
+    }
+    if local_unique == 0 {
+        return SessionMergeResult {
+            preview: base_preview(
+                true,
+                "archive_superset",
+                archive_unique,
+                archive_unique,
+                0,
+                archive_unique_user_turns,
+                0,
+                archive_lines.len(),
+                archive_last,
+                local_last,
+                "归档完整包含本机会话，可安全补全本地缺少的记录。",
+            ),
+            contents: format!("{}\n", archive_lines.join("\n")),
+        };
+    }
+    if archive_unique == 0 {
+        return SessionMergeResult {
+            preview: base_preview(
+                false,
+                "local_superset",
+                0,
+                0,
+                local_unique,
+                0,
+                local_unique_user_turns,
+                local_lines.len(),
+                archive_last,
+                local_last,
+                "本机会话已完整包含归档，并有更多续聊记录；将保留本地版本。",
+            ),
+            contents: format!("{}\n", local_lines.join("\n")),
         };
     }
 
-    let mut merged = archive_lines.clone();
-    merged.extend(appended.iter().cloned());
     SessionMergeResult {
         preview: base_preview(
-            true,
-            appended.len(),
-            Some(archive_last),
+            false,
+            "diverged",
+            0,
+            archive_unique,
+            local_unique,
+            archive_unique_user_turns,
+            local_unique_user_turns,
+            0,
+            archive_last,
             local_last,
-            "将以归档为基线，追加本机较新的记录。",
+            "归档与本地在共同历史后分别产生了不同记录，无法安全自动合并。",
         ),
-        contents: format!("{}\n", merged.join("\n")),
+        contents: String::new(),
     }
 }
 
@@ -1577,6 +1775,13 @@ fn value_array_strings(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn unified_project_order(value: Option<&Value>) -> Vec<String> {
+    value_array_strings(value)
+        .into_iter()
+        .filter_map(|item| item.strip_prefix("codex:project:").map(str::to_string))
+        .collect()
+}
+
 fn read_desktop_project_state(home: &Path) -> Option<DesktopProjectState> {
     let contents = fs::read_to_string(home.join(".codex-global-state.json")).ok()?;
     let value: Value = serde_json::from_str(&contents).ok()?;
@@ -1589,8 +1794,12 @@ fn read_desktop_project_state(home: &Path) -> Option<DesktopProjectState> {
     } else {
         nested_state?
     };
+    let current_project_order = nested_state
+        .map(|nested| unified_project_order(nested.get("unified-sidebar-project-order-v1")))
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| value_array_strings(state.get("project-order")));
     let mut result = DesktopProjectState {
-        project_order: value_array_strings(state.get("project-order")),
+        project_order: current_project_order,
         projectless_threads: value_array_strings(state.get("projectless-thread-ids"))
             .into_iter()
             .collect(),
@@ -1655,6 +1864,164 @@ fn path_name(path: &str) -> String {
         .to_string()
 }
 
+fn archive_project_key(task: &Task) -> String {
+    if !task.project_key.trim().is_empty() {
+        task.project_key.trim().to_string()
+    } else if !task.cwd.trim().is_empty() {
+        task.cwd.trim().to_string()
+    } else {
+        format!("unbound-{}", task.id)
+    }
+}
+
+fn archive_project_name(task: &Task) -> String {
+    if !task.project_name.trim().is_empty() {
+        return task.project_name.trim().to_string();
+    }
+    let from_path = path_name(&task.cwd);
+    if !from_path.is_empty() {
+        return from_path;
+    }
+    let from_repository = repository_name(&task.git_origin_url);
+    if !from_repository.is_empty() {
+        return from_repository;
+    }
+    "未记录项目".to_string()
+}
+
+fn portable_path_string(path: &Path) -> String {
+    let value = path.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{}", rest);
+        }
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    value
+}
+
+fn push_import_candidate(candidates: &mut Vec<String>, path: &Path) {
+    let Ok(canonical) = fs::canonicalize(path) else {
+        return;
+    };
+    if !canonical.is_dir() {
+        return;
+    }
+    let value = portable_path_string(&canonical);
+    if is_codex_worktree(&value) {
+        return;
+    }
+    if !candidates
+        .iter()
+        .any(|item| item.eq_ignore_ascii_case(&value))
+    {
+        candidates.push(value);
+    }
+}
+
+fn import_project_candidates(name: &str, source_path: &str, local_tasks: &[Task]) -> Vec<String> {
+    let name = name.trim();
+    let mut candidates = Vec::new();
+    if !source_path.trim().is_empty() && Path::new(source_path).is_dir() {
+        push_import_candidate(&mut candidates, Path::new(source_path));
+    }
+    for task in local_tasks {
+        let path = if !task.project_path.trim().is_empty() {
+            &task.project_path
+        } else {
+            &task.cwd
+        };
+        if task.project_exists && path_name(path).eq_ignore_ascii_case(name) {
+            push_import_candidate(&mut candidates, Path::new(path));
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let roots = [
+            home.clone(),
+            home.join("work"),
+            home.join("Projects"),
+            home.join("Documents"),
+            home.join("Desktop"),
+        ];
+        for root in roots {
+            let direct = root.join(name);
+            push_import_candidate(&mut candidates, &direct);
+            let Ok(entries) = fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.eq_ignore_ascii_case(name))
+                {
+                    push_import_candidate(&mut candidates, &path);
+                }
+            }
+        }
+    }
+    candidates
+}
+
+fn suggest_import_project_mappings(
+    archive_tasks: &[ArchiveTask],
+    local_tasks: &[Task],
+) -> Vec<ImportProjectMapping> {
+    let mut groups = HashMap::<String, (String, String, Vec<String>)>::new();
+    for item in archive_tasks {
+        if item.task.cwd.trim().is_empty() {
+            continue;
+        }
+        let key = archive_project_key(&item.task);
+        let entry = groups.entry(key).or_insert_with(|| {
+            (
+                archive_project_name(&item.task),
+                item.task.cwd.clone(),
+                Vec::new(),
+            )
+        });
+        entry.2.push(item.task.id.clone());
+    }
+    let mut mappings = groups
+        .into_iter()
+        .map(|(source_key, (source_name, source_path, task_ids))| {
+            let candidates = import_project_candidates(&source_name, &source_path, local_tasks);
+            let exact = candidates.len() == 1 && candidates[0].eq_ignore_ascii_case(&source_path);
+            let suggested_path = if candidates.len() == 1 {
+                candidates[0].clone()
+            } else {
+                String::new()
+            };
+            let status = if exact {
+                "exact"
+            } else if candidates.len() == 1 {
+                "suggested"
+            } else if candidates.len() > 1 {
+                "ambiguous"
+            } else {
+                "missing"
+            };
+            ImportProjectMapping {
+                source_key,
+                source_name,
+                source_path,
+                candidates,
+                suggested_path,
+                status: status.to_string(),
+                task_count: task_ids.len(),
+                task_ids,
+            }
+        })
+        .collect::<Vec<_>>();
+    mappings.sort_by(|left, right| left.source_name.cmp(&right.source_name));
+    mappings
+}
+
 fn repository_name(url: &str) -> String {
     let mut name = url
         .trim()
@@ -1705,9 +2072,30 @@ fn first_existing_path(candidates: &[PathBuf]) -> Option<PathBuf> {
 }
 
 fn is_path_in_root(path: &str, root: &str) -> bool {
-    let path = Path::new(path);
-    let root = Path::new(root);
-    path == root || path.starts_with(root)
+    if path.trim().is_empty() || root.trim().is_empty() {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let path = path
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase();
+        let root = root
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase();
+        path == root
+            || path
+                .strip_prefix(&root)
+                .is_some_and(|suffix| suffix.starts_with('\\'))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let path = Path::new(path);
+        let root = Path::new(root);
+        path == root || path.starts_with(root)
+    }
 }
 
 fn path_segments(path: &str) -> Vec<String> {
@@ -1772,6 +2160,34 @@ fn matching_desktop_project<'a>(
     cwd: &str,
     inferred_path: &str,
 ) -> Option<&'a DesktopProject> {
+    matching_desktop_project_by_path(state, cwd, inferred_path).or_else(|| {
+        let candidates = state
+            .projects
+            .values()
+            .filter(|project| desktop_project_name_matches_path(project, cwd, inferred_path))
+            .collect::<Vec<_>>();
+        match candidates.as_slice() {
+            [project] => Some(*project),
+            _ => {
+                let pinned = candidates
+                    .iter()
+                    .copied()
+                    .filter(|project| project.pinned)
+                    .collect::<Vec<_>>();
+                match pinned.as_slice() {
+                    [project] => Some(*project),
+                    _ => None,
+                }
+            }
+        }
+    })
+}
+
+fn matching_desktop_project_by_path<'a>(
+    state: &'a DesktopProjectState,
+    cwd: &str,
+    inferred_path: &str,
+) -> Option<&'a DesktopProject> {
     state
         .projects
         .values()
@@ -1789,32 +2205,18 @@ fn matching_desktop_project<'a>(
                 .max()
                 .unwrap_or(0)
         })
-        .or_else(|| {
-            let candidates = state
-                .projects
-                .values()
-                .filter(|project| desktop_project_name_matches_path(project, cwd, inferred_path))
-                .collect::<Vec<_>>();
-            match candidates.as_slice() {
-                [project] => Some(*project),
-                _ => {
-                    let pinned = candidates
-                        .iter()
-                        .copied()
-                        .filter(|project| project.pinned)
-                        .collect::<Vec<_>>();
-                    match pinned.as_slice() {
-                        [project] => Some(*project),
-                        _ => None,
-                    }
-                }
-            }
-        })
 }
 
 fn stable_local_project_id(cwd: &str) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in cwd.as_bytes() {
+    #[cfg(target_os = "windows")]
+    let identity = cwd
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    #[cfg(not(target_os = "windows"))]
+    let identity = cwd.trim_end_matches('/').to_string();
+    for byte in identity.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -1849,6 +2251,10 @@ fn prepend_unique_string(items: &mut Vec<Value>, value: &str) {
     }
 }
 
+fn remove_string(items: &mut Vec<Value>, value: &str) {
+    items.retain(|item| item.as_str() != Some(value));
+}
+
 fn sort_tasks_by_project_order(tasks: &mut [Task], project_order: &[String]) {
     let positions = project_order
         .iter()
@@ -1873,136 +2279,120 @@ fn client_thread_state_value(thread_id: &str) -> String {
 
 fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), String> {
     let path = home.join(".codex-global-state.json");
-    if !path.exists() {
-        return Ok(());
-    }
+    let state_existed = path.exists();
     let existing_state = read_desktop_project_state(home).unwrap_or_default();
-    let mut value: Value =
+    let mut value: Value = if state_existed {
         serde_json::from_str(&fs::read_to_string(&path).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+    } else {
+        Value::Object(Map::new())
+    };
     let now_ms = Utc::now().timestamp_millis();
     let root = object_mut(&mut value);
-    let use_root = root.contains_key("local-projects")
+    let use_root = !state_existed
+        || root.contains_key("local-projects")
         || root.contains_key("thread-project-assignments")
         || root.contains_key("project-order");
 
     for task in tasks {
         let cwd = task.cwd.trim().to_string();
         let has_project_folder = Path::new(&cwd).is_dir();
-        let is_unbound = cwd.is_empty() || !has_project_folder;
-        let (project_id, project_name, project_roots) = {
-            // A missing historical cwd represents an unbound project.  Do not
-            // attach it to an unrelated folder merely because the names match.
-            let matched_project = has_project_folder
-                .then(|| matching_desktop_project(&existing_state, &cwd, &cwd))
-                .flatten();
-            let project_id = matched_project
-                .map(|project| project.id.clone())
-                .or_else(|| {
-                    existing_state
-                        .assignments
-                        .get(&task.id)
-                        .and_then(|assignment| {
-                            existing_state
-                                .projects
-                                .contains_key(&assignment.project_id)
-                                .then(|| assignment.project_id.clone())
-                        })
-                })
-                .unwrap_or_else(|| {
-                    if cwd.is_empty() {
-                        format!("unbound-{}", task.id)
-                    } else {
-                        stable_local_project_id(&cwd)
-                    }
-                });
-            let project_name = matched_project
-                .map(|project| project.name.clone())
-                .unwrap_or_else(|| {
-                    if is_unbound && cwd.is_empty() {
-                        "未绑定项目".to_string()
-                    } else {
-                        path_name(&cwd)
-                    }
-                });
-            let project_roots = matched_project
-                .map(|project| project.root_paths.clone())
-                .unwrap_or_else(|| {
-                    if has_project_folder {
-                        vec![cwd.clone()]
-                    } else {
-                        Vec::new()
-                    }
-                });
-            (project_id, project_name, project_roots)
-        };
-        let project_already_exists = existing_state.projects.contains_key(&project_id);
-
-        let root = object_mut(&mut value);
-        let persisted = if use_root {
-            root
-        } else {
-            object_mut(
-                root.entry("electron-persisted-atom-state")
-                    .or_insert_with(|| Value::Object(Map::new())),
-            )
-        };
-
-        let projects = object_mut(
-            persisted
-                .entry("local-projects")
-                .or_insert_with(|| Value::Object(Map::new())),
-        );
-        projects.insert(
-            project_id.clone(),
-            serde_json::json!({
-                "id": project_id,
-                "name": project_name,
-                "rootPaths": project_roots,
-                "createdAt": now_ms,
-                "updatedAt": now_ms
-            }),
-        );
-
-        let assignments = object_mut(
-            persisted
-                .entry("thread-project-assignments")
-                .or_insert_with(|| Value::Object(Map::new())),
-        );
-        assignments.insert(
-            task.id.clone(),
-            serde_json::json!({
-                "projectKind": "local",
-                "projectId": project_id,
-                "cwd": if has_project_folder { cwd.clone() } else { String::new() },
-                "pendingCoreUpdate": false
-            }),
-        );
-
-        let project_order = array_mut(
-            persisted
-                .entry("project-order")
-                .or_insert_with(|| Value::Array(Vec::new())),
-        );
-        // A recovered project no longer has an entry in Codex's previous order.
-        // Put it at the top instead of silently appending it below every existing
-        // project; existing projects retain their current position.
-        if project_already_exists {
-            push_unique_string(project_order, &project_id);
-        } else {
-            prepend_unique_string(project_order, &project_id);
-        }
-
-        if task.project_pinned && !project_already_exists {
-            let pinned_projects = array_mut(
-                persisted
-                    .entry("pinned-project-ids")
-                    .or_insert_with(|| Value::Array(Vec::new())),
-            );
-            push_unique_string(pinned_projects, &project_id);
-        }
+        let unbound_project_id = format!("unbound-{}", task.id);
+        let mut registered_project = None;
 
         if has_project_folder {
+            // Registration follows the path the user confirmed. Name-only matches
+            // and stale task assignments must never override an explicit mapping.
+            let matched_project = matching_desktop_project_by_path(&existing_state, &cwd, &cwd);
+            let project_id = matched_project
+                .map(|project| project.id.clone())
+                .unwrap_or_else(|| stable_local_project_id(&cwd));
+            let project_name = matched_project
+                .map(|project| project.name.clone())
+                .unwrap_or_else(|| path_name(&cwd));
+            let project_roots = matched_project
+                .map(|project| project.root_paths.clone())
+                .unwrap_or_else(|| vec![cwd.clone()]);
+            let project_already_exists = existing_state.projects.contains_key(&project_id);
+            registered_project = Some((project_id.clone(), project_already_exists));
+
+            let root = object_mut(&mut value);
+            let persisted = if use_root {
+                root
+            } else {
+                object_mut(
+                    root.entry("electron-persisted-atom-state")
+                        .or_insert_with(|| Value::Object(Map::new())),
+                )
+            };
+
+            let projectless = array_mut(
+                persisted
+                    .entry("projectless-thread-ids")
+                    .or_insert_with(|| Value::Array(Vec::new())),
+            );
+            remove_string(projectless, &task.id);
+
+            let projects = object_mut(
+                persisted
+                    .entry("local-projects")
+                    .or_insert_with(|| Value::Object(Map::new())),
+            );
+            projects.remove(&unbound_project_id);
+            let project = object_mut(
+                projects
+                    .entry(project_id.clone())
+                    .or_insert_with(|| Value::Object(Map::new())),
+            );
+            project.insert("id".to_string(), Value::String(project_id.clone()));
+            project.insert("name".to_string(), Value::String(project_name));
+            project.insert("rootPaths".to_string(), serde_json::json!(project_roots));
+            project
+                .entry("createdAt".to_string())
+                .or_insert_with(|| serde_json::json!(now_ms));
+            project.insert("updatedAt".to_string(), serde_json::json!(now_ms));
+
+            let assignments = object_mut(
+                persisted
+                    .entry("thread-project-assignments")
+                    .or_insert_with(|| Value::Object(Map::new())),
+            );
+            let assignment = object_mut(
+                assignments
+                    .entry(task.id.clone())
+                    .or_insert_with(|| Value::Object(Map::new())),
+            );
+            assignment.insert(
+                "projectKind".to_string(),
+                Value::String("local".to_string()),
+            );
+            assignment.insert("projectId".to_string(), Value::String(project_id.clone()));
+            assignment.insert("cwd".to_string(), Value::String(cwd.clone()));
+            assignment.insert("pendingCoreUpdate".to_string(), Value::Bool(false));
+
+            let project_order = array_mut(
+                persisted
+                    .entry("project-order")
+                    .or_insert_with(|| Value::Array(Vec::new())),
+            );
+            remove_string(project_order, &unbound_project_id);
+            // A newly recovered project belongs at the top; existing projects keep
+            // their current position.
+            if project_already_exists {
+                push_unique_string(project_order, &project_id);
+            } else {
+                prepend_unique_string(project_order, &project_id);
+            }
+
+            if task.project_pinned && !project_already_exists {
+                let pinned_projects = array_mut(
+                    persisted
+                        .entry("pinned-project-ids")
+                        .or_insert_with(|| Value::Array(Vec::new())),
+                );
+                push_unique_string(pinned_projects, &project_id);
+            }
+
             let active_roots = array_mut(
                 persisted
                     .entry("active-workspace-roots")
@@ -2013,6 +2403,52 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
                 None => true,
             });
             push_unique_string(active_roots, &cwd);
+        } else {
+            // A historical path that does not exist on this computer is truly
+            // projectless. Do not manufacture a project or retain a stale binding.
+            let root = object_mut(&mut value);
+            let persisted = if use_root {
+                root
+            } else {
+                object_mut(
+                    root.entry("electron-persisted-atom-state")
+                        .or_insert_with(|| Value::Object(Map::new())),
+                )
+            };
+            object_mut(
+                persisted
+                    .entry("thread-project-assignments")
+                    .or_insert_with(|| Value::Object(Map::new())),
+            )
+            .remove(&task.id);
+            object_mut(
+                persisted
+                    .entry("local-projects")
+                    .or_insert_with(|| Value::Object(Map::new())),
+            )
+            .remove(&unbound_project_id);
+            let projectless = array_mut(
+                persisted
+                    .entry("projectless-thread-ids")
+                    .or_insert_with(|| Value::Array(Vec::new())),
+            );
+            push_unique_string(projectless, &task.id);
+            remove_string(
+                array_mut(
+                    persisted
+                        .entry("project-order")
+                        .or_insert_with(|| Value::Array(Vec::new())),
+                ),
+                &unbound_project_id,
+            );
+            remove_string(
+                array_mut(
+                    persisted
+                        .entry("pinned-project-ids")
+                        .or_insert_with(|| Value::Array(Vec::new())),
+                ),
+                &unbound_project_id,
+            );
         }
 
         let root = object_mut(&mut value);
@@ -2023,6 +2459,21 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
         atom_state
             .entry(client_thread_state_key(&task.id))
             .or_insert_with(|| Value::String(client_thread_state_value(&task.id)));
+        let unified_order = array_mut(
+            atom_state
+                .entry("unified-sidebar-project-order-v1")
+                .or_insert_with(|| Value::Array(Vec::new())),
+        );
+        let unbound_order_id = format!("codex:project:{unbound_project_id}");
+        remove_string(unified_order, &unbound_order_id);
+        if let Some((project_id, project_already_exists)) = &registered_project {
+            let order_id = format!("codex:project:{project_id}");
+            if *project_already_exists {
+                push_unique_string(unified_order, &order_id);
+            } else {
+                prepend_unique_string(unified_order, &order_id);
+            }
+        }
 
         let workspace_hints = object_mut(
             root.entry("thread-workspace-root-hints")
@@ -2054,14 +2505,14 @@ fn register_desktop_project_state(home: &Path, tasks: &[Task]) -> Result<(), Str
         }
     }
 
-    fs::write(
-        path,
+    atomic_write(
+        &path,
         format!(
             "{}\n",
             serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
-        ),
-    )
-    .map_err(|error| error.to_string())?;
+        )
+        .as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -2188,18 +2639,36 @@ fn session_tasks(home: &Path) -> Vec<Task> {
     tasks
 }
 
-fn enrich_local_tasks_with_title_ids(
+fn enrich_local_tasks_with_title_ids_cancellable<F>(
     home: &Path,
     raw_tasks: Vec<Task>,
-) -> Result<(Vec<Task>, HashSet<String>), String> {
+    should_cancel: F,
+) -> Result<Option<EnrichedTaskResult>, String>
+where
+    F: Fn() -> bool,
+{
+    if should_cancel() {
+        return Ok(None);
+    }
     let index = read_index(home);
-    let history_messages = history_first_messages(home);
+    let Some(history_messages) = history_first_messages_cancellable(home, &should_cancel) else {
+        return Ok(None);
+    };
+    if should_cancel() {
+        return Ok(None);
+    }
     let database = database_tasks(home);
+    if should_cancel() {
+        return Ok(None);
+    }
     let catalog = catalog_tasks(home);
     let affected_title_ids = bad_title_ids_from_metadata(&index, &database, &catalog);
     let desktop_projects = read_desktop_project_state(home);
     let mut tasks = Vec::new();
-    for mut task in raw_tasks {
+    for (task_index, mut task) in raw_tasks.into_iter().enumerate() {
+        if task_index % 32 == 0 && should_cancel() {
+            return Ok(None);
+        }
         let indexed = index.get(&task.id);
         let database_task = database.get(&task.id);
         let catalog_task = catalog.as_ref().and_then(|items| items.get(&task.id));
@@ -2311,22 +2780,36 @@ fn enrich_local_tasks_with_title_ids(
                     // signal in this case, not the stale client-thread entry.
                     task.codex_visible = false;
                 }
+            } else if project_state.projectless_threads.contains(&task.id) {
+                // An explicit projectless registration is authoritative. Do not
+                // reattach it to a same-named folder discovered by inference.
+                task.project_key = "__projectless__".to_string();
+                task.project_name = "未绑定项目".to_string();
+                task.project_path = String::new();
+                task.project_exists = false;
+                task.project_pinned = false;
+                task.codex_visible = desktop_sidebar_visible(task.archived, true);
             } else if let Some(project) =
                 matching_desktop_project(project_state, &task.cwd, &task.project_path)
             {
                 apply_desktop_project(&mut task, project);
                 task.codex_visible = desktop_sidebar_visible(task.archived, true);
             } else {
-                task.codex_visible = desktop_sidebar_visible(
-                    task.archived,
-                    project_state.projectless_threads.contains(&task.id),
-                );
+                task.codex_visible = desktop_sidebar_visible(task.archived, false);
             }
         }
         tasks.push(task);
     }
     tasks.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-    Ok((tasks, affected_title_ids))
+    Ok(Some((tasks, affected_title_ids)))
+}
+
+fn enrich_local_tasks_with_title_ids(
+    home: &Path,
+    raw_tasks: Vec<Task>,
+) -> Result<(Vec<Task>, HashSet<String>), String> {
+    enrich_local_tasks_with_title_ids_cancellable(home, raw_tasks, || false)?
+        .ok_or_else(|| "读取本地任务元数据已取消".to_string())
 }
 
 fn list_local_tasks_with_title_ids() -> Result<(Vec<Task>, HashSet<String>), String> {
@@ -2407,26 +2890,73 @@ fn session_meta_forked_from_id<R: BufRead>(reader: R) -> Result<String, String> 
     Err("压缩包会话缺少 session_meta".to_string())
 }
 
+fn read_text_limited<R: Read>(reader: R, limit: u64, too_large: &str) -> Result<String, String> {
+    let mut contents = String::new();
+    reader
+        .take(limit + 1)
+        .read_to_string(&mut contents)
+        .map_err(|error| error.to_string())?;
+    if contents.len() as u64 > limit {
+        return Err(too_large.to_string());
+    }
+    Ok(contents)
+}
+
+fn read_bytes_limited<R: Read>(reader: R, limit: u64, too_large: &str) -> Result<Vec<u8>, String> {
+    let mut contents = Vec::new();
+    reader
+        .take(limit + 1)
+        .read_to_end(&mut contents)
+        .map_err(|error| error.to_string())?;
+    if contents.len() as u64 > limit {
+        return Err(too_large.to_string());
+    }
+    Ok(contents)
+}
+
+fn read_file_text_limited(path: &Path, limit: u64, too_large: &str) -> Result<String, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    read_text_limited(file, limit, too_large)
+}
+
 fn archive_manifest(path: &Path) -> Result<Manifest, String> {
     let file = File::open(path).map_err(|_| "找不到所选压缩包".to_string())?;
     let mut zip = ZipArchive::new(file).map_err(|_| "这不是有效的 ZIP 压缩包".to_string())?;
-    let mut size = 0;
+    if zip.len() > MAX_ARCHIVE_ENTRIES {
+        return Err("压缩包文件数量过多，已停止导入".to_string());
+    }
+    let mut size = 0_u64;
     for index in 0..zip.len() {
-        size += zip
-            .by_index(index)
-            .map_err(|_| "压缩包内容无效".to_string())?
-            .size();
+        size = size
+            .checked_add(
+                zip.by_index(index)
+                    .map_err(|_| "压缩包内容无效".to_string())?
+                    .size(),
+            )
+            .ok_or_else(|| "压缩包大小信息无效".to_string())?;
     }
     if size > MAX_ARCHIVE_BYTES {
         return Err("压缩包解压后超过 1 GB，已停止导入".to_string());
     }
-    let mut contents = String::new();
-    zip.by_name("manifest.json")
-        .map_err(|_| "压缩包缺少 manifest.json".to_string())?
-        .read_to_string(&mut contents)
-        .map_err(|error| error.to_string())?;
+    let manifest_file = zip
+        .by_name("manifest.json")
+        .map_err(|_| "压缩包缺少 manifest.json".to_string())?;
+    if manifest_file.size() > MAX_MANIFEST_BYTES {
+        return Err("压缩包 manifest 过大，已停止导入".to_string());
+    }
+    let contents = read_text_limited(
+        manifest_file,
+        MAX_MANIFEST_BYTES,
+        "压缩包 manifest 过大，已停止导入",
+    )?;
     let manifest: Manifest =
         serde_json::from_str(&contents).map_err(|_| "压缩包 manifest 无效".to_string())?;
+    if manifest.tasks.len() > MAX_ARCHIVE_TASKS {
+        return Err(format!(
+            "压缩包任务数量超过 {} 个，已停止导入",
+            MAX_ARCHIVE_TASKS
+        ));
+    }
     if manifest.schema != ARCHIVE_SCHEMA
         || manifest.tasks.iter().any(|task| {
             !is_safe_task_id(&task.task.id)
@@ -2451,6 +2981,9 @@ fn archive_manifest(path: &Path) -> Result<Manifest, String> {
         let session = zip
             .by_name(&task.session_file)
             .map_err(|_| "压缩包缺少会话文件".to_string())?;
+        if session.size() > MAX_SESSION_BYTES {
+            return Err(format!("任务 {} 的会话文件超过 128 MB", task.task.id));
+        }
         let session_id = session_meta_id(BufReader::new(session))?;
         if session_id != task.task.id {
             return Err("压缩包会话 ID 与 manifest 不一致".to_string());
@@ -2465,8 +2998,12 @@ fn archive_manifest(path: &Path) -> Result<Manifest, String> {
             return Err("压缩包会话关系与 manifest 不一致".to_string());
         }
         if let Some(browser_file) = &task.browser_file {
-            zip.by_name(browser_file)
+            let browser = zip
+                .by_name(browser_file)
                 .map_err(|_| "压缩包缺少浏览器配置".to_string())?;
+            if browser.size() > MAX_BROWSER_SESSION_BYTES {
+                return Err(format!("任务 {} 的浏览器配置超过 32 MB", task.task.id));
+            }
         }
     }
     Ok(manifest)
@@ -2478,57 +3015,38 @@ fn parse_time(value: &str) -> DateTime<Local> {
         .unwrap_or_else(|_| Local::now())
 }
 
-fn resolve_local_cwd(cwd: &str) -> String {
-    if cwd.is_empty() || Path::new(cwd).exists() {
-        return cwd.to_string();
+fn mapped_import_cwd(task: &Task, project_mappings: &HashMap<String, String>) -> String {
+    let project_key = archive_project_key(task);
+    if let Some(target) = project_mappings.get(&project_key) {
+        return if Path::new(target).is_dir() {
+            target.clone()
+        } else {
+            String::new()
+        };
     }
-    let name = path_name(cwd);
-    let home = dirs::home_dir().unwrap_or_default();
-    let fallback = home.join("work").join(&name);
-    for candidate in [
-        fallback.clone(),
-        home.join("Projects").join(&name),
-        home.join("Documents").join(&name),
-    ] {
-        if candidate.exists() {
-            return candidate.to_string_lossy().to_string();
-        }
-    }
-    if !name.is_empty() {
-        return fallback.to_string_lossy().to_string();
-    }
-    cwd.to_string()
+    String::new()
 }
 
-fn resolved_import_cwd(source_cwd: &str, target_cwd: Option<&str>, adapt_paths: bool) -> String {
-    if source_cwd.trim().is_empty() {
-        return String::new();
+fn split_import_project_mappings(
+    mappings: &[ImportProjectMappingInput],
+) -> (HashMap<String, String>, HashSet<String>) {
+    let mut project_mappings = HashMap::new();
+    let mut unbound_project_keys = HashSet::new();
+    for mapping in mappings {
+        let source_key = mapping.source_key.trim().to_string();
+        if source_key.is_empty() {
+            continue;
+        }
+        if mapping.keep_unbound {
+            unbound_project_keys.insert(source_key);
+            continue;
+        }
+        let target_cwd = mapping.target_cwd.trim().to_string();
+        if !target_cwd.is_empty() {
+            project_mappings.insert(source_key, target_cwd);
+        }
     }
-    // Worktrees are owned by Codex/Git. A historical worktree is restored as
-    // unbound when it is absent locally; this utility never creates or binds it.
-    if is_codex_worktree(source_cwd) && !Path::new(source_cwd).is_dir() {
-        return String::new();
-    }
-    if let Some(target) = target_cwd.map(str::trim).filter(|path| !path.is_empty()) {
-        return if Path::new(target).is_dir() {
-            target.to_string()
-        } else {
-            String::new()
-        };
-    }
-    if !adapt_paths {
-        return if Path::new(source_cwd).is_dir() {
-            source_cwd.to_string()
-        } else {
-            String::new()
-        };
-    }
-    let resolved = resolve_local_cwd(source_cwd);
-    if Path::new(&resolved).is_dir() {
-        resolved
-    } else {
-        String::new()
-    }
+    (project_mappings, unbound_project_keys)
 }
 
 fn is_path_field(name: &str) -> bool {
@@ -2545,9 +3063,75 @@ fn is_path_field(name: &str) -> bool {
     )
 }
 
+fn looks_like_windows_path(path: &str) -> bool {
+    path.contains('\\')
+        || path.starts_with("//")
+        || path
+            .as_bytes()
+            .get(1)
+            .is_some_and(|character| *character == b':')
+}
+
+fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
+    if from.trim().is_empty() {
+        return text.to_string();
+    }
+    let normalized_text = text.replace('\\', "/");
+    let normalized_from_value = from.replace('\\', "/");
+    let normalized_from = if normalized_from_value == "/" {
+        "/"
+    } else {
+        normalized_from_value.trim_end_matches('/')
+    };
+    let case_insensitive = looks_like_windows_path(from);
+    let comparable_text = if case_insensitive {
+        normalized_text.to_ascii_lowercase()
+    } else {
+        normalized_text.clone()
+    };
+    let comparable_from = if case_insensitive {
+        normalized_from.to_ascii_lowercase()
+    } else {
+        normalized_from.to_string()
+    };
+    let is_same = comparable_text == comparable_from;
+    let is_descendant = if comparable_from == "/" {
+        comparable_text.starts_with('/')
+    } else {
+        comparable_text
+            .strip_prefix(&comparable_from)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    };
+    if !is_same && !is_descendant {
+        return text.to_string();
+    }
+    if to.trim().is_empty() {
+        return String::new();
+    }
+
+    let suffix = &normalized_text[normalized_from.len()..];
+    let windows_target = looks_like_windows_path(to);
+    let separator = if windows_target { '\\' } else { '/' };
+    let base = if to == "/" {
+        "/".to_string()
+    } else {
+        to.trim_end_matches(['/', '\\']).to_string()
+    };
+    let suffix = if separator == '\\' {
+        suffix.replace('/', "\\")
+    } else {
+        suffix.to_string()
+    };
+    if base == "/" && suffix.starts_with('/') {
+        format!("{}{}", base, suffix.trim_start_matches('/'))
+    } else {
+        format!("{base}{suffix}")
+    }
+}
+
 fn replace_path_value(value: &mut Value, from: &str, to: &str) {
     match value {
-        Value::String(text) => *text = text.replace(from, to),
+        Value::String(text) => *text = replace_path_prefix(text, from, to),
         Value::Array(items) => items
             .iter_mut()
             .for_each(|item| replace_path_value(item, from, to)),
@@ -2746,7 +3330,7 @@ fn append_index(home: &Path, tasks: &[Task]) -> Result<(), String> {
             );
         }
     }
-    fs::write(path, format!("{}\n", lines.join("\n"))).map_err(|error| error.to_string())
+    atomic_write(&path, format!("{}\n", lines.join("\n")).as_bytes())
 }
 
 fn verify_registered_threads(home: &Path, tasks: &[Task]) -> Result<(), String> {
@@ -2757,12 +3341,45 @@ fn verify_registered_threads(home: &Path, tasks: &[Task]) -> Result<(), String> 
         return Err("未找到 Codex 的任务数据库，无法确认恢复结果".to_string());
     }
     let database = database_tasks(home);
+    let desktop_state_path = home.join(".codex-global-state.json");
+    if !desktop_state_path.exists() {
+        return Err("未找到 Codex 侧栏状态文件；请先启动一次 Codex 后再重试".to_string());
+    }
+    let desktop_state = read_desktop_project_state(home)
+        .ok_or_else(|| "无法确认 Codex 侧栏项目绑定结果".to_string())?;
     for task in tasks {
         if state_exists && !database.get(&task.id).is_some_and(|item| !item.archived) {
             return Err(format!("任务 {} 未成功登记到 Codex 状态库", task.id));
         }
         if catalog_available && !catalog_visibility(&catalog, &task.id).unwrap_or(false) {
             return Err(format!("任务 {} 未成功登记到 Codex 侧边栏目录", task.id));
+        }
+        if Path::new(task.cwd.trim()).is_dir() {
+            let assignment = desktop_state
+                .assignments
+                .get(&task.id)
+                .ok_or_else(|| format!("任务 {} 未成功绑定到 Codex 本机项目", task.id))?;
+            let project = desktop_state
+                .projects
+                .get(&assignment.project_id)
+                .ok_or_else(|| format!("任务 {} 的 Codex 项目记录不存在", task.id))?;
+            if !project
+                .root_paths
+                .iter()
+                .any(|root| is_path_in_root(task.cwd.trim(), root))
+            {
+                return Err(format!("任务 {} 的 Codex 项目路径登记不一致", task.id));
+            }
+            if !desktop_state.project_order.contains(&assignment.project_id) {
+                return Err(format!("任务 {} 的 Codex 项目未加入侧栏顺序", task.id));
+            }
+            if desktop_state.projectless_threads.contains(&task.id) {
+                return Err(format!("任务 {} 同时被登记为项目任务和未绑定任务", task.id));
+            }
+        } else if desktop_state.assignments.contains_key(&task.id)
+            || !desktop_state.projectless_threads.contains(&task.id)
+        {
+            return Err(format!("任务 {} 未成功登记为未绑定任务", task.id));
         }
     }
     Ok(())
@@ -2785,6 +3402,294 @@ fn codex_state_paths(home: &Path) -> Vec<PathBuf> {
         sqlite_sidecar(&catalog, "shm"),
         home.join(".codex-global-state.json"),
     ]
+}
+
+#[derive(Debug)]
+struct SqliteColumnShape {
+    name: String,
+    not_null: bool,
+    default_value: Option<String>,
+    primary_key: bool,
+}
+
+fn sqlite_table_shape(
+    connection: &Connection,
+    table: &str,
+) -> Result<Vec<SqliteColumnShape>, String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SqliteColumnShape {
+                name: row.get(1)?,
+                not_null: row.get::<_, i64>(3)? != 0,
+                default_value: row.get(4)?,
+                primary_key: row.get::<_, i64>(5)? != 0,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn validate_table_insert_shape(
+    connection: &Connection,
+    table: &str,
+    inserted_columns: &[&str],
+) -> Result<(), String> {
+    let shape = sqlite_table_shape(connection, table)?;
+    if shape.is_empty() {
+        return Err(format!("当前 Codex 数据库缺少 {table} 表，暂不支持写入"));
+    }
+    let names = shape
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<HashSet<_>>();
+    let missing = inserted_columns
+        .iter()
+        .copied()
+        .filter(|column| !names.contains(column))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "当前 Codex 数据库的 {table} 表缺少字段：{}。请更新迁移工具后重试",
+            missing.join(", ")
+        ));
+    }
+    let inserted = inserted_columns.iter().copied().collect::<HashSet<_>>();
+    let unsupported = shape
+        .iter()
+        .filter(|column| {
+            column.not_null
+                && column.default_value.is_none()
+                && !column.primary_key
+                && !inserted.contains(column.name.as_str())
+        })
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "当前 Codex 数据库的 {table} 表新增了必填字段：{}。请更新迁移工具后重试",
+            unsupported.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn validate_desktop_state_shape(home: &Path) -> Result<(), String> {
+    let path = home.join(".codex-global-state.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let value: Value =
+        serde_json::from_str(&fs::read_to_string(&path).map_err(|error| error.to_string())?)
+            .map_err(|_| "Codex 全局状态文件不是有效 JSON，已停止写入".to_string())?;
+    let root = value
+        .as_object()
+        .ok_or_else(|| "Codex 全局状态文件结构不受支持，已停止写入".to_string())?;
+    let uses_root = root.contains_key("local-projects")
+        || root.contains_key("thread-project-assignments")
+        || root.contains_key("project-order");
+    if root
+        .get("electron-persisted-atom-state")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err("Codex 全局状态中的 electron-persisted-atom-state 结构不受支持".to_string());
+    }
+    if let Some(unified_order) = root
+        .get("electron-persisted-atom-state")
+        .and_then(Value::as_object)
+        .and_then(|state| state.get("unified-sidebar-project-order-v1"))
+    {
+        let Some(items) = unified_order.as_array() else {
+            return Err("Codex 全局状态中的新版侧栏项目顺序结构不受支持".to_string());
+        };
+        if items.iter().any(|item| !item.is_string()) {
+            return Err("Codex 全局状态中的新版侧栏项目顺序成员不受支持".to_string());
+        }
+    }
+    let state = if uses_root {
+        root
+    } else if let Some(nested) = root.get("electron-persisted-atom-state") {
+        nested.as_object().ok_or_else(|| {
+            "Codex 全局状态中的 electron-persisted-atom-state 结构不受支持".to_string()
+        })?
+    } else if root.is_empty() {
+        root
+    } else {
+        return Err("Codex 全局状态使用了未知存储结构，已停止写入".to_string());
+    };
+    for key in ["local-projects", "thread-project-assignments"] {
+        if state.get(key).is_some_and(|value| !value.is_object()) {
+            return Err(format!("Codex 全局状态中的 {key} 结构不受支持"));
+        }
+    }
+    for key in [
+        "project-order",
+        "pinned-project-ids",
+        "active-workspace-roots",
+        "projectless-thread-ids",
+    ] {
+        if let Some(value) = state.get(key) {
+            let Some(items) = value.as_array() else {
+                return Err(format!("Codex 全局状态中的 {key} 结构不受支持"));
+            };
+            if items.iter().any(|item| !item.is_string()) {
+                return Err(format!("Codex 全局状态中的 {key} 成员结构不受支持"));
+            }
+        }
+    }
+    if let Some(projects) = state.get("local-projects").and_then(Value::as_object) {
+        for project in projects.values() {
+            let Some(project) = project.as_object() else {
+                return Err("Codex 全局状态中的项目记录结构不受支持".to_string());
+            };
+            if project.get("id").is_some_and(|value| !value.is_string())
+                || project.get("name").is_some_and(|value| !value.is_string())
+            {
+                return Err("Codex 全局状态中的项目字段结构不受支持".to_string());
+            }
+            if let Some(root_paths) = project.get("rootPaths") {
+                let Some(root_paths) = root_paths.as_array() else {
+                    return Err("Codex 全局状态中的项目路径结构不受支持".to_string());
+                };
+                if root_paths.iter().any(|path| !path.is_string()) {
+                    return Err("Codex 全局状态中的项目路径成员不受支持".to_string());
+                }
+            }
+        }
+    }
+    if let Some(assignments) = state
+        .get("thread-project-assignments")
+        .and_then(Value::as_object)
+    {
+        for assignment in assignments.values() {
+            let Some(assignment) = assignment.as_object() else {
+                return Err("Codex 全局状态中的任务项目映射结构不受支持".to_string());
+            };
+            if assignment
+                .get("projectId")
+                .is_some_and(|value| !value.is_string())
+                || assignment
+                    .get("cwd")
+                    .is_some_and(|value| !value.is_string())
+            {
+                return Err("Codex 全局状态中的任务项目映射字段不受支持".to_string());
+            }
+        }
+    }
+    for key in ["thread-workspace-root-hints", "thread-writable-roots"] {
+        if root.get(key).is_some_and(|value| !value.is_object()) {
+            return Err(format!("Codex 全局状态中的 {key} 结构不受支持"));
+        }
+    }
+    if let Some(hints) = root
+        .get("thread-workspace-root-hints")
+        .and_then(Value::as_object)
+    {
+        if hints.values().any(|value| !value.is_string()) {
+            return Err("Codex 全局状态中的工作区路径提示结构不受支持".to_string());
+        }
+    }
+    if let Some(writable_roots) = root.get("thread-writable-roots").and_then(Value::as_object) {
+        for roots in writable_roots.values() {
+            let Some(roots) = roots.as_array() else {
+                return Err("Codex 全局状态中的可写目录结构不受支持".to_string());
+            };
+            if roots.iter().any(|root| !root.is_string()) {
+                return Err("Codex 全局状态中的可写目录成员不受支持".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_codex_write_compatibility(home: &Path) -> Result<(), String> {
+    let state = latest_state_database(home);
+    if state.exists() {
+        let connection =
+            Connection::open_with_flags(&state, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| error.to_string())?;
+        validate_table_insert_shape(
+            &connection,
+            "threads",
+            &[
+                "id",
+                "rollout_path",
+                "created_at",
+                "updated_at",
+                "source",
+                "model_provider",
+                "cwd",
+                "title",
+                "sandbox_policy",
+                "approval_mode",
+                "git_branch",
+                "git_origin_url",
+                "first_user_message",
+                "memory_mode",
+                "preview",
+                "recency_at",
+                "recency_at_ms",
+                "history_mode",
+                "has_user_event",
+                "archived",
+                "archived_at",
+                "cli_version",
+                "model",
+                "reasoning_effort",
+                "thread_source",
+                "agent_path",
+                "agent_nickname",
+                "agent_role",
+                "created_at_ms",
+                "updated_at_ms",
+            ],
+        )?;
+    }
+    let catalog = home.join("sqlite").join("codex-dev.db");
+    if catalog.exists() {
+        let connection =
+            Connection::open_with_flags(&catalog, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| error.to_string())?;
+        if !sqlite_table_shape(&connection, "local_thread_catalog")?.is_empty() {
+            validate_table_insert_shape(
+                &connection,
+                "local_thread_catalog_hosts",
+                &["host_id", "host_kind"],
+            )?;
+            validate_table_insert_shape(
+                &connection,
+                "local_thread_catalog_metadata",
+                &["id", "catalog_revision"],
+            )?;
+            validate_table_insert_shape(
+                &connection,
+                "local_thread_catalog_sync_state",
+                &["host_id", "observation_sequence", "initial_build_complete"],
+            )?;
+            validate_table_insert_shape(
+                &connection,
+                "local_thread_catalog",
+                &[
+                    "host_id",
+                    "thread_id",
+                    "display_title",
+                    "source_created_at",
+                    "source_updated_at",
+                    "cwd",
+                    "source_kind",
+                    "source_detail",
+                    "model_provider",
+                    "git_branch",
+                    "observation_sequence",
+                    "missing_candidate",
+                ],
+            )?;
+        }
+    }
+    validate_desktop_state_shape(home)
 }
 
 fn checkpoint_sqlite_database(path: &Path) -> Result<(), String> {
@@ -2827,7 +3732,13 @@ impl ImportTransaction {
         if !path.exists() || !self.backed_paths.insert(path.to_path_buf()) {
             return Ok(());
         }
-        let target = PathBuf::from(format!("{}{}{}", path.display(), LOCAL_SNAPSHOT_MARKER, stamp));
+        let base = format!("{}{}{}", path.display(), LOCAL_SNAPSHOT_MARKER, stamp);
+        let mut target = PathBuf::from(&base);
+        let mut suffix = 0usize;
+        while target.exists() {
+            suffix += 1;
+            target = PathBuf::from(format!("{base}-{suffix}"));
+        }
         fs::copy(path, &target).map_err(|error| format!("无法备份 {}: {error}", path.display()))?;
         self.backups.push(target.to_string_lossy().to_string());
         Ok(())
@@ -2844,7 +3755,7 @@ impl ImportTransaction {
         if !existed {
             self.created_files.push(path.to_path_buf());
         }
-        fs::write(path, contents).map_err(|error| error.to_string())?;
+        atomic_write(path, contents.as_ref())?;
         Ok(())
     }
 
@@ -2852,6 +3763,26 @@ impl ImportTransaction {
         self.committed = true;
         std::mem::take(&mut self.backups)
     }
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("无法确定文件目录：{}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    temporary
+        .write_all(contents)
+        .map_err(|error| error.to_string())?;
+    temporary.flush().map_err(|error| error.to_string())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error.to_string())?;
+    Ok(())
 }
 
 impl Drop for ImportTransaction {
@@ -3737,31 +4668,31 @@ fn start_task_scan(
                 "total": total, "discovered": discovered
             }),
         );
-        if job_is_cancelled(&run_id) {
-            emit_scan_event(
+        match enrich_local_tasks_with_title_ids_cancellable(&home, preview_tasks, || {
+            job_is_cancelled(&run_id)
+        }) {
+            Ok(Some((tasks, affected_title_ids))) => {
+                if let Ok(mut scans) = paused_task_scans().lock() {
+                    scans.remove(&continuation_token);
+                }
+                let health = task_health_report(&tasks, &affected_title_ids);
+                emit_scan_event(
+                    &app,
+                    serde_json::json!({
+                        "runId": run_id, "kind": "complete", "stage": "complete", "scanned": total,
+                        "total": total, "discovered": tasks.len(), "tasks": tasks,
+                        "health": health, "codexHome": home.to_string_lossy()
+                    }),
+                );
+            }
+            Ok(None) => emit_scan_event(
                 &app,
                 serde_json::json!({"runId": run_id, "kind": "cancelled", "stage": "organizing", "scanned": total, "total": total, "discovered": discovered}),
-            );
-        } else if let Ok((tasks, affected_title_ids)) =
-            enrich_local_tasks_with_title_ids(&home, preview_tasks)
-        {
-            if let Ok(mut scans) = paused_task_scans().lock() {
-                scans.remove(&continuation_token);
-            }
-            let health = task_health_report(&tasks, &affected_title_ids);
-            emit_scan_event(
-                &app,
-                serde_json::json!({
-                    "runId": run_id, "kind": "complete", "stage": "complete", "scanned": total,
-                    "total": total, "discovered": tasks.len(), "tasks": tasks,
-                    "health": health, "codexHome": home.to_string_lossy()
-                }),
-            );
-        } else {
-            emit_scan_event(
+            ),
+            Err(_) => emit_scan_event(
                 &app,
                 serde_json::json!({"runId": run_id, "kind": "error", "message": "读取本地任务元数据失败"}),
-            );
+            ),
         }
         clear_background_job(&run_id);
     });
@@ -3894,39 +4825,40 @@ fn list_tasks() -> Result<TaskList, String> {
     })
 }
 
-#[tauri::command]
-fn export_tasks(task_ids: Vec<String>, destination: String) -> Result<serde_json::Value, String> {
-    let requested: HashSet<_> = task_ids.into_iter().collect();
-    let mut selected: Vec<_> = list_local_tasks()?
-        .into_iter()
-        .filter(|task| requested.contains(&task.id))
-        .collect();
-    if selected.is_empty() {
-        return Err("请至少选择一个任务".to_string());
-    }
-    if let Some(state) = read_desktop_project_state(&codex_home()) {
-        sort_tasks_by_project_order(&mut selected, &state.project_order);
-    }
-    let destination = PathBuf::from(destination);
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    let file = File::create(&destination).map_err(|error| error.to_string())?;
-    let mut zip = ZipWriter::new(file);
+fn write_export_archive(destination: &Path, selected: &[Task]) -> Result<u64, String> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    let mut zip = ZipWriter::new(temporary.as_file_mut());
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut archive_tasks = Vec::new();
-    for task in selected.iter() {
+    for task in selected {
+        let session_size = fs::metadata(&task.file_path)
+            .map_err(|error| error.to_string())?
+            .len();
+        if session_size > MAX_SESSION_BYTES {
+            return Err(format!("任务 {} 的会话文件超过 128 MB，无法导出", task.id));
+        }
         let session_file = archive_path(&task.id, "session.jsonl");
         zip.start_file(&session_file, options)
             .map_err(|error| error.to_string())?;
-        zip.write_all(&fs::read(&task.file_path).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
+        let mut source = File::open(&task.file_path).map_err(|error| error.to_string())?;
+        std::io::copy(&mut source, &mut zip).map_err(|error| error.to_string())?;
         let browser_file = if task.browser_file.exists() {
+            let browser_size = fs::metadata(&task.browser_file)
+                .map_err(|error| error.to_string())?
+                .len();
+            if browser_size > MAX_BROWSER_SESSION_BYTES {
+                return Err(format!("任务 {} 的浏览器配置超过 32 MB，无法导出", task.id));
+            }
             let archive_file = archive_path(&task.id, "browser.toml");
             zip.start_file(&archive_file, options)
                 .map_err(|error| error.to_string())?;
-            zip.write_all(&fs::read(&task.browser_file).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())?;
+            let mut source = File::open(&task.browser_file).map_err(|error| error.to_string())?;
+            std::io::copy(&mut source, &mut zip).map_err(|error| error.to_string())?;
             Some(archive_file)
         } else {
             None
@@ -3954,9 +4886,48 @@ fn export_tasks(task_ids: Vec<String>, destination: String) -> Result<serde_json
     )
     .map_err(|error| error.to_string())?;
     zip.finish().map_err(|error| error.to_string())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist(destination)
+        .map_err(|error| error.error.to_string())?;
+    fs::metadata(destination)
+        .map(|metadata| metadata.len())
+        .map_err(|error| error.to_string())
+}
+
+fn export_tasks_blocking(
+    task_ids: Vec<String>,
+    destination: String,
+) -> Result<serde_json::Value, String> {
+    let requested: HashSet<_> = task_ids.into_iter().collect();
+    let mut selected: Vec<_> = list_local_tasks()?
+        .into_iter()
+        .filter(|task| requested.contains(&task.id))
+        .collect();
+    if selected.is_empty() {
+        return Err("请至少选择一个任务".to_string());
+    }
+    if let Some(state) = read_desktop_project_state(&codex_home()) {
+        sort_tasks_by_project_order(&mut selected, &state.project_order);
+    }
+    let destination = PathBuf::from(destination);
+    let size = write_export_archive(&destination, &selected)?;
     Ok(
-        serde_json::json!({"canceled": false, "path": destination, "count": selected.len(), "size": fs::metadata(&destination).map_err(|error| error.to_string())?.len()}),
+        serde_json::json!({"canceled": false, "path": destination, "count": selected.len(), "size": size}),
     )
+}
+
+#[tauri::command]
+async fn export_tasks(
+    task_ids: Vec<String>,
+    destination: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || export_tasks_blocking(task_ids, destination))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -3979,6 +4950,7 @@ fn restore_local_tasks_blocking(task_ids: Vec<String>) -> Result<serde_json::Val
     if selected.is_empty() {
         return Err("请至少选择一个任务".to_string());
     }
+    validate_codex_write_compatibility(&home)?;
     let model_settings = codex_model_settings(&home);
     for task in &mut selected {
         task.archived = false;
@@ -4008,7 +4980,11 @@ fn restore_local_tasks_blocking(task_ids: Vec<String>) -> Result<serde_json::Val
         transaction.backup(&path, &stamp)?;
     }
     for task in &mut selected {
-        let contents = fs::read_to_string(&task.file_path).map_err(|error| error.to_string())?;
+        let contents = read_file_text_limited(
+            &task.file_path,
+            MAX_SESSION_BYTES,
+            "本机会话文件超过 128 MB，无法恢复",
+        )?;
         let rewritten = rewrite_session_model_context(&contents, &model_settings);
         let archived_source = task.file_path.starts_with(home.join("archived_sessions"));
         if archived_source {
@@ -4036,115 +5012,7 @@ fn restore_local_tasks_blocking(task_ids: Vec<String>) -> Result<serde_json::Val
     )
 }
 
-#[tauri::command]
-async fn bind_local_tasks(
-    task_ids: Vec<String>,
-    target_cwd: String,
-) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || bind_local_tasks_blocking(task_ids, target_cwd))
-        .await
-        .map_err(|error| error.to_string())?
-}
-
-fn bind_local_tasks_blocking(
-    task_ids: Vec<String>,
-    target_cwd: String,
-) -> Result<serde_json::Value, String> {
-    if is_codex_desktop_running() {
-        return Err("检测到 Codex/ChatGPT 桌面端正在运行。请先完全退出 Codex，再绑定本机项目，避免侧边栏状态被运行中的客户端覆盖。".to_string());
-    }
-    let target_cwd = target_cwd.trim();
-    if target_cwd.is_empty() {
-        return Err("请选择本机项目目录".to_string());
-    }
-    let target_cwd = fs::canonicalize(target_cwd)
-        .map_err(|error| format!("无法访问本机项目目录：{error}"))?;
-    if !target_cwd.is_dir() {
-        return Err("目标路径不是文件夹".to_string());
-    }
-    let requested: HashSet<_> = task_ids.into_iter().collect();
-    if requested.is_empty() {
-        return Err("请至少选择一个任务".to_string());
-    }
-
-    let home = codex_home();
-    let _write_guard = acquire_local_write_operation(&home)?;
-    let mut selected: Vec<_> = list_local_tasks()?
-        .into_iter()
-        .filter(|task| requested.contains(&task.id))
-        .collect();
-    if selected.is_empty() {
-        return Err("本机没有找到可对应的会话文件".to_string());
-    }
-    let target_cwd = target_cwd.to_string_lossy().to_string();
-    let mut rewritten_sessions = Vec::with_capacity(selected.len());
-    for task in &selected {
-        let contents = fs::read_to_string(&task.file_path).map_err(|error| error.to_string())?;
-        let rewritten = if task.cwd.trim().is_empty() {
-            rewrite_session_meta_cwd(&contents, &target_cwd)
-        } else {
-            rewrite_session_meta_cwd(
-                &rewrite_session_cwd(&contents, &task.cwd, &target_cwd),
-                &target_cwd,
-            )
-        };
-        rewritten_sessions.push((task.file_path.clone(), rewritten));
-    }
-    for task in &mut selected {
-        task.cwd = target_cwd.clone();
-        task.archived = false;
-        (
-            task.project_key,
-            task.project_name,
-            task.project_path,
-            task.project_exists,
-        ) = infer_project(task);
-    }
-
-    let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    checkpoint_sqlite_database(&latest_state_database(&home))?;
-    checkpoint_sqlite_database(&home.join("sqlite").join("codex-dev.db"))?;
-    let mut transaction = ImportTransaction::new(&home);
-    for path in codex_state_paths(&home) {
-        transaction.backup(&path, &stamp)?;
-    }
-    for (path, rewritten) in rewritten_sessions {
-        transaction.write_file(&path, rewritten, &stamp)?;
-    }
-    append_index(&home, &selected)?;
-    register_threads(&home, &selected)?;
-    register_catalog_threads(&home, &selected)?;
-    register_desktop_project_state(&home, &selected)?;
-    verify_registered_threads(&home, &selected)?;
-    let backups = transaction.commit();
-    let mut response = serde_json::json!({
-        "bound": selected.iter().map(|task| serde_json::json!({
-            "id": task.id,
-            "title": task.title,
-            "cwd": task.cwd
-        })).collect::<Vec<_>>(),
-        "targetCwd": target_cwd,
-        "backups": backups,
-        "codexHome": home,
-        "message": "已绑定到本机项目。重新打开 Codex 后检查侧边栏。"
-    });
-    match append_operation_receipt(&home, "bind-project", &response) {
-        Ok(path) => {
-            if let Some(object) = response.as_object_mut() {
-                object.insert("receiptPath".to_string(), Value::String(path));
-            }
-        }
-        Err(error) => {
-            if let Some(object) = response.as_object_mut() {
-                object.insert("receiptWarning".to_string(), Value::String(error));
-            }
-        }
-    }
-    Ok(response)
-}
-
-#[tauri::command]
-fn inspect_archive(archive_path: String) -> Result<ArchiveInspection, String> {
+fn inspect_archive_blocking(archive_path: String) -> Result<ArchiveInspection, String> {
     let manifest = archive_manifest(Path::new(&archive_path))?;
     let model_settings = codex_model_settings(&codex_home());
     let file = File::open(&archive_path).map_err(|_| "找不到所选压缩包".to_string())?;
@@ -4153,46 +5021,59 @@ fn inspect_archive(archive_path: String) -> Result<ArchiveInspection, String> {
         .into_iter()
         .map(|task| (task.id.clone(), task))
         .collect();
+    let local_tasks = existing.values().cloned().collect::<Vec<_>>();
+    let project_mappings = suggest_import_project_mappings(&manifest.tasks, &local_tasks);
+    let mut inspected_tasks = Vec::with_capacity(manifest.tasks.len());
+    for item in manifest.tasks {
+        let mut task = item.task;
+        let archive_file = zip
+            .by_name(&item.session_file)
+            .map_err(|_| "压缩包缺少会话文件".to_string())?;
+        let contents = read_text_limited(
+            archive_file,
+            MAX_SESSION_BYTES,
+            "压缩包中的会话文件超过 128 MB",
+        )?;
+        hydrate_task_from_session_content(&mut task, &contents);
+        normalize_task_title(&mut task);
+        if task.title.is_empty() {
+            task.title = format!("未命名任务 {}", &task.id[..task.id.len().min(8)]);
+        }
+        if task.model_provider.trim() == "custom" {
+            normalize_task_to_codex_model(&mut task, &model_settings);
+        }
+        let merge_preview = existing.get(&task.id).and_then(|local_task| {
+            read_file_text_limited(
+                &local_task.file_path,
+                MAX_SESSION_BYTES,
+                "本机会话文件超过 128 MB，无法自动比较",
+            )
+            .ok()
+            .map(|local_contents| safe_merge_session_jsonl(&contents, &local_contents).preview)
+        });
+        inspected_tasks.push(InspectedTask {
+            conflict: existing.contains_key(&task.id),
+            merge_preview,
+            task,
+        });
+    }
     Ok(ArchiveInspection {
         canceled: false,
         path: archive_path,
         created_at: manifest.created_at,
-        tasks: manifest
-            .tasks
-            .into_iter()
-            .map(|item| {
-                let mut task = item.task;
-                let mut contents = String::new();
-                if let Ok(mut file) = zip.by_name(&item.session_file) {
-                    if file.read_to_string(&mut contents).is_ok() {
-                        hydrate_task_from_session_content(&mut task, &contents);
-                    }
-                }
-                normalize_task_title(&mut task);
-                if task.title.is_empty() {
-                    task.title = format!("未命名任务 {}", &task.id[..task.id.len().min(8)]);
-                }
-                if task.model_provider.trim() == "custom" {
-                    normalize_task_to_codex_model(&mut task, &model_settings);
-                }
-                let merge_preview = existing
-                    .get(&task.id)
-                    .and_then(|local_task| fs::read_to_string(&local_task.file_path).ok())
-                    .map(|local_contents| {
-                        safe_merge_session_jsonl(&contents, &local_contents).preview
-                    });
-                InspectedTask {
-                    conflict: existing.contains_key(&task.id),
-                    merge_preview,
-                    task,
-                }
-            })
-            .collect(),
+        tasks: inspected_tasks,
+        project_mappings,
     })
 }
 
 #[tauri::command]
-fn import_archive(
+async fn inspect_archive(archive_path: String) -> Result<ArchiveInspection, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_archive_blocking(archive_path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn import_archive_blocking(
     archive_path: String,
     options: Option<ImportOptions>,
 ) -> Result<serde_json::Value, String> {
@@ -4203,6 +5084,7 @@ fn import_archive(
     let manifest = archive_manifest(&source)?;
     let home = codex_home();
     let _write_guard = acquire_local_write_operation(&home)?;
+    validate_codex_write_compatibility(&home)?;
     let model_settings = codex_model_settings(&home);
     fs::create_dir_all(home.join("sessions")).map_err(|error| error.to_string())?;
     fs::create_dir_all(home.join("browser").join("sessions")).map_err(|error| error.to_string())?;
@@ -4212,10 +5094,6 @@ fn import_archive(
         .collect();
     let file = File::open(source).map_err(|error| error.to_string())?;
     let mut zip = ZipArchive::new(file).map_err(|error| error.to_string())?;
-    let adapt_paths = options
-        .as_ref()
-        .and_then(|value| value.adapt_paths)
-        .unwrap_or(true);
     let restore_existing = options
         .as_ref()
         .and_then(|value| value.restore_existing)
@@ -4226,12 +5104,44 @@ fn import_archive(
         .unwrap_or_default()
         .into_iter()
         .collect::<HashSet<_>>();
-    let target_cwd = options
+    let mapping_inputs = options
         .as_ref()
-        .and_then(|value| value.target_cwd.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+        .and_then(|value| value.project_mappings.as_ref())
+        .ok_or_else(|| "请先检查并确认项目路径映射".to_string())?;
+    let (mut project_mappings, unbound_project_keys) =
+        split_import_project_mappings(mapping_inputs);
+    for target in project_mappings.values_mut() {
+        let Ok(canonical) = fs::canonicalize(&*target) else {
+            return Err(format!("项目映射目标不存在或不是目录：{}", target));
+        };
+        if !canonical.is_dir() {
+            return Err(format!("项目映射目标不存在或不是目录：{}", target));
+        }
+        let canonical_value = portable_path_string(&canonical);
+        if is_codex_worktree(&canonical_value) || is_codex_worktree(target) {
+            return Err(format!(
+                "不能绑定到 Codex 临时工作树：{}。请选择实际项目目录。",
+                canonical_value
+            ));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            *target = canonical_value;
+        }
+    }
+    for item in &manifest.tasks {
+        let will_process = !existing_tasks.contains_key(&item.task.id) || restore_existing;
+        if will_process
+            && !item.task.cwd.trim().is_empty()
+            && !project_mappings.contains_key(&archive_project_key(&item.task))
+            && !unbound_project_keys.contains(&archive_project_key(&item.task))
+        {
+            return Err(format!(
+                "项目路径尚未确认：{}",
+                archive_project_name(&item.task)
+            ));
+        }
+    }
     let stamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
     checkpoint_sqlite_database(&latest_state_database(&home))?;
     checkpoint_sqlite_database(&home.join("sqlite").join("codex-dev.db"))?;
@@ -4242,11 +5152,14 @@ fn import_archive(
     let mut skipped = Vec::new();
     for entry in manifest.tasks {
         let mut archive_task = entry.task;
-        let mut content = String::new();
-        zip.by_name(&entry.session_file)
-            .map_err(|_| "压缩包缺少会话文件".to_string())?
-            .read_to_string(&mut content)
-            .map_err(|error| error.to_string())?;
+        let archive_file = zip
+            .by_name(&entry.session_file)
+            .map_err(|_| "压缩包缺少会话文件".to_string())?;
+        let content = read_text_limited(
+            archive_file,
+            MAX_SESSION_BYTES,
+            "压缩包中的会话文件超过 128 MB",
+        )?;
         hydrate_task_from_session_content(&mut archive_task, &content);
         normalize_task_title(&mut archive_task);
         // Archives are history, not portable API configuration.  Always adapt
@@ -4260,7 +5173,11 @@ fn import_archive(
             if restore_existing {
                 let mut task = existing_task.clone();
                 let merge_result = if merge_task_ids.contains(&archive_task.id) {
-                    let local_contents = match fs::read_to_string(&task.file_path) {
+                    let local_contents = match read_file_text_limited(
+                        &task.file_path,
+                        MAX_SESSION_BYTES,
+                        "本机会话文件超过 128 MB，无法自动合并",
+                    ) {
                         Ok(contents) => contents,
                         Err(_) => {
                             skipped.push(serde_json::json!({"id": archive_task.id, "title": archive_task.title, "reason": "merge_local_session_unreadable"}));
@@ -4276,6 +5193,9 @@ fn import_archive(
                 } else {
                     None
                 };
+                let archive_superset_selected = merge_result
+                    .as_ref()
+                    .is_some_and(|result| result.preview.strategy == "archive_superset");
                 let normalize_existing =
                     normalize_to_codex || task.model_provider.trim() == "custom";
                 let original_cwd = task.cwd.clone();
@@ -4292,47 +5212,80 @@ fn import_archive(
                 {
                     task.preview = archive_task.preview.clone();
                 }
-                replace_if_present(&mut task.source, &archive_task.source);
-                replace_if_present(&mut task.model_provider, &archive_task.model_provider);
-                replace_if_present(&mut task.model, &archive_task.model);
-                replace_if_present(&mut task.reasoning_effort, &archive_task.reasoning_effort);
-                replace_if_present(&mut task.sandbox_policy, &archive_task.sandbox_policy);
-                replace_if_present(&mut task.approval_mode, &archive_task.approval_mode);
-                replace_if_present(&mut task.cli_version, &archive_task.cli_version);
-                replace_if_present(&mut task.thread_source, &archive_task.thread_source);
-                replace_if_present(&mut task.forked_from_id, &archive_task.forked_from_id);
-                replace_if_present(&mut task.agent_path, &archive_task.agent_path);
-                replace_if_present(&mut task.agent_nickname, &archive_task.agent_nickname);
-                replace_if_present(&mut task.agent_role, &archive_task.agent_role);
-                replace_if_present(&mut task.memory_mode, &archive_task.memory_mode);
-                replace_if_present(&mut task.history_mode, &archive_task.history_mode);
+                if archive_superset_selected {
+                    if meaningful_user_text(&archive_task.first_user_message).is_some() {
+                        task.first_user_message = archive_task.first_user_message.clone();
+                    }
+                    if meaningful_user_text(&archive_task.preview).is_some() {
+                        task.preview = archive_task.preview.clone();
+                    }
+                    if !archive_task.updated_at.trim().is_empty() {
+                        task.updated_at = archive_task.updated_at.clone();
+                    }
+                }
+                // Re-registering an existing task keeps receiving-machine metadata
+                // authoritative. Archive metadata may only fill fields that the local
+                // session/database did not know; it must not roll local settings back.
+                set_if_empty(&mut task.source, Some(&archive_task.source));
+                set_if_empty(&mut task.model_provider, Some(&archive_task.model_provider));
+                set_if_empty(&mut task.model, Some(&archive_task.model));
+                set_if_empty(
+                    &mut task.reasoning_effort,
+                    Some(&archive_task.reasoning_effort),
+                );
+                set_if_empty(&mut task.sandbox_policy, Some(&archive_task.sandbox_policy));
+                set_if_empty(&mut task.approval_mode, Some(&archive_task.approval_mode));
+                set_if_empty(&mut task.cli_version, Some(&archive_task.cli_version));
+                set_if_empty(&mut task.thread_source, Some(&archive_task.thread_source));
+                set_if_empty(&mut task.forked_from_id, Some(&archive_task.forked_from_id));
+                set_if_empty(&mut task.agent_path, Some(&archive_task.agent_path));
+                set_if_empty(&mut task.agent_nickname, Some(&archive_task.agent_nickname));
+                set_if_empty(&mut task.agent_role, Some(&archive_task.agent_role));
+                set_if_empty(&mut task.memory_mode, Some(&archive_task.memory_mode));
+                set_if_empty(&mut task.history_mode, Some(&archive_task.history_mode));
                 if normalize_existing {
                     normalize_task_to_codex_model(&mut task, &model_settings);
                 }
                 normalize_task_title(&mut task);
-                let resolved_cwd =
-                    resolved_import_cwd(&task.cwd, target_cwd.as_deref(), adapt_paths);
+                let resolved_cwd = mapped_import_cwd(&archive_task, &project_mappings);
                 let cwd_changed = resolved_cwd != task.cwd;
                 if cwd_changed {
                     task.cwd = resolved_cwd;
                 }
-                if cwd_changed || normalize_existing || merge_result.is_some() {
+                let archived_source = task.file_path.starts_with(home.join("archived_sessions"));
+                if archived_source || cwd_changed || normalize_existing || merge_result.is_some() {
                     let mut contents = if let Some(result) = &merge_result {
                         result.contents.clone()
-                    } else if let Ok(contents) = fs::read_to_string(&task.file_path) {
+                    } else if let Ok(contents) = read_file_text_limited(
+                        &task.file_path,
+                        MAX_SESSION_BYTES,
+                        "本机会话文件超过 128 MB，无法自动恢复",
+                    ) {
                         contents
                     } else {
                         skipped.push(serde_json::json!({"id": archive_task.id, "title": archive_task.title, "reason": "local_session_unreadable"}));
                         continue;
                     };
-                    if cwd_changed {
-                        contents = rewrite_session_cwd(&contents, &original_cwd, &task.cwd);
+                    if cwd_changed || archive_superset_selected {
+                        let content_source_cwd = if archive_superset_selected {
+                            &archive_task.cwd
+                        } else {
+                            &original_cwd
+                        };
+                        contents = rewrite_session_cwd(&contents, content_source_cwd, &task.cwd);
                         contents = rewrite_session_meta_cwd(&contents, &task.cwd);
                     }
                     if normalize_existing {
                         contents = rewrite_session_model_context(&contents, &model_settings);
                     }
-                    transaction.write_file(&task.file_path, contents, &stamp)?;
+                    task.size = contents.len() as u64;
+                    if archived_source {
+                        let active_path = active_session_copy_path(&home, &task);
+                        transaction.write_file(&active_path, contents, &stamp)?;
+                        task.file_path = active_path;
+                    } else {
+                        transaction.write_file(&task.file_path, contents, &stamp)?;
+                    }
                 }
                 task.archived = false;
                 (
@@ -4342,7 +5295,17 @@ fn import_archive(
                     task.project_exists,
                 ) = infer_project(&task);
                 if let Some(result) = &merge_result {
-                    merged.push(serde_json::json!({"id": task.id, "title": task.title, "appendedRecords": result.preview.append_record_count}));
+                    merged.push(serde_json::json!({
+                        "id": task.id,
+                        "title": task.title,
+                        "strategy": result.preview.strategy,
+                        "appendedRecords": result.preview.append_record_count,
+                        "archiveAddedRecords": result.preview.archive_unique_record_count,
+                        "archiveAddedUserTurns": result.preview.archive_unique_user_turn_count,
+                        "localPreservedRecords": result.preview.local_unique_record_count,
+                        "localPreservedUserTurns": result.preview.local_unique_user_turn_count,
+                        "resultRecords": result.preview.result_record_count
+                    }));
                 }
                 restored.push(task);
             } else {
@@ -4367,7 +5330,7 @@ fn import_archive(
             date.format("%Y-%m-%dT%H-%M-%S"),
             task.id
         ));
-        let local_cwd = resolved_import_cwd(&task.cwd, target_cwd.as_deref(), adapt_paths);
+        let local_cwd = mapped_import_cwd(&task, &project_mappings);
         let mut session_content = rewrite_session_cwd(&content, &task.cwd, &local_cwd);
         if local_cwd != task.cwd {
             session_content = rewrite_session_meta_cwd(&session_content, &local_cwd);
@@ -4378,11 +5341,14 @@ fn import_archive(
         }
         transaction.write_file(&rollout_path, session_content, &stamp)?;
         if let Some(browser_file) = entry.browser_file {
-            let mut contents = Vec::new();
-            zip.by_name(&browser_file)
-                .map_err(|_| "压缩包缺少浏览器配置".to_string())?
-                .read_to_end(&mut contents)
-                .map_err(|error| error.to_string())?;
+            let browser = zip
+                .by_name(&browser_file)
+                .map_err(|_| "压缩包缺少浏览器配置".to_string())?;
+            let contents = read_bytes_limited(
+                browser,
+                MAX_BROWSER_SESSION_BYTES,
+                "压缩包中的浏览器配置超过 32 MB",
+            )?;
             let browser_path = home
                 .join("browser")
                 .join("sessions")
@@ -4451,6 +5417,16 @@ fn import_archive(
 }
 
 #[tauri::command]
+async fn import_archive(
+    archive_path: String,
+    options: Option<ImportOptions>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || import_archive_blocking(archive_path, options))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 fn get_environment() -> serde_json::Value {
     let codex_processes = codex_desktop_processes();
     let home = codex_home();
@@ -4483,7 +5459,6 @@ pub fn run() {
             delete_local_snapshots,
             export_tasks,
             restore_local_tasks,
-            bind_local_tasks,
             inspect_archive,
             import_archive,
             get_environment
@@ -4501,11 +5476,11 @@ mod tests {
         local_snapshots, meaningful_user_text, prune_paused_task_scans, register_catalog_threads,
         register_desktop_project_state, register_threads, repository_name, rewrite_session_cwd,
         rewrite_session_model_context, safe_merge_session_jsonl, session_details,
-        simple_toml_string, sort_tasks_by_project_order, validated_local_snapshot_path,
-        verify_registered_threads, ArchiveTask,
-        CodexModelSettings, ImportTransaction, Manifest, PausedTaskScan, Task, ARCHIVE_SCHEMA,
-        LOCAL_SNAPSHOT_MARKER, LOCAL_WRITE_LOCK_FILE, MAX_PAUSED_TASK_SCANS,
-        PAUSED_TASK_SCAN_TTL,
+        simple_toml_string, sort_tasks_by_project_order, split_import_project_mappings,
+        validated_local_snapshot_path, verify_registered_threads, write_export_archive,
+        ArchiveTask, CodexModelSettings, ImportProjectMappingInput, ImportTransaction, Manifest,
+        PausedTaskScan, Task, ARCHIVE_SCHEMA, LOCAL_SNAPSHOT_MARKER, LOCAL_WRITE_LOCK_FILE,
+        MAX_PAUSED_TASK_SCANS, PAUSED_TASK_SCAN_TTL,
     };
     use rusqlite::Connection;
     use serde_json::Value;
@@ -4519,35 +5494,86 @@ mod tests {
     use zip::{write::SimpleFileOptions, ZipWriter};
 
     #[test]
-    fn safe_merge_session_jsonl_appends_only_newer_local_records() {
+    fn safe_merge_session_jsonl_uses_archive_when_it_is_a_strict_superset() {
         let archive = concat!(
             "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-01T10:00:00Z\",\"payload\":{\"id\":\"merge-task\"}}\n",
-            "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-01T10:01:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"历史消息\"}}\n"
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-01T10:01:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"历史消息\"}}\n",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-01T10:02:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"归档补充\"}}\n"
+        );
+        let local = archive.lines().take(2).collect::<Vec<_>>().join("\n") + "\n";
+
+        let merged = safe_merge_session_jsonl(archive, &local);
+
+        assert!(merged.preview.can_merge);
+        assert_eq!(merged.preview.strategy, "archive_superset");
+        assert_eq!(merged.preview.append_record_count, 1);
+        assert_eq!(merged.preview.archive_unique_user_turn_count, 1);
+        assert_eq!(merged.contents.lines().count(), 3);
+        assert!(merged.contents.contains("归档补充"));
+    }
+
+    #[test]
+    fn safe_merge_session_jsonl_keeps_local_when_it_is_a_strict_superset() {
+        let archive = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"merge-task\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"历史消息\"}}\n"
+        );
+        let local = format!(
+            "{}{}",
+            archive,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"本机续聊\"}}\n"
+        );
+
+        let merged = safe_merge_session_jsonl(archive, &local);
+
+        assert!(!merged.preview.can_merge);
+        assert_eq!(merged.preview.strategy, "local_superset");
+        assert_eq!(merged.preview.local_unique_record_count, 1);
+        assert_eq!(merged.preview.local_unique_user_turn_count, 1);
+        assert!(merged.contents.contains("本机续聊"));
+    }
+
+    #[test]
+    fn safe_merge_session_jsonl_rejects_diverged_histories() {
+        let base = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"merge-task\"}}\n";
+        let archive = format!(
+            "{}{}",
+            base,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"归档分支\"}}\n"
+        );
+        let local = format!(
+            "{}{}",
+            base,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"本地分支\"}}\n"
+        );
+
+        let merged = safe_merge_session_jsonl(&archive, &local);
+
+        assert!(!merged.preview.can_merge);
+        assert_eq!(merged.preview.strategy, "diverged");
+        assert_eq!(merged.preview.archive_unique_user_turn_count, 1);
+        assert_eq!(merged.preview.local_unique_user_turn_count, 1);
+        assert_eq!(merged.preview.append_record_count, 0);
+        assert!(merged.contents.is_empty());
+    }
+
+    #[test]
+    fn safe_merge_session_jsonl_ignores_receiving_environment_fields() {
+        let archive = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"merge-task\",\"cwd\":\"/old/project\",\"model_provider\":\"custom\",\"model\":\"old-model\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"历史消息\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"assistant_message\",\"message\":\"归档补充\"}}\n"
         );
         let local = concat!(
-            "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-01T10:00:00Z\",\"payload\":{\"id\":\"merge-task\"}}\n",
-            "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-01T10:01:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"历史消息\"}}\n",
-            "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-01T10:02:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"本机续聊\"}}\n"
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"merge-task\",\"cwd\":\"C:\\\\work\\\\project\",\"model_provider\":\"openai\",\"model\":\"gpt-current\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"历史消息\"}}\n"
         );
 
         let merged = safe_merge_session_jsonl(archive, local);
 
         assert!(merged.preview.can_merge);
-        assert_eq!(merged.preview.append_record_count, 1);
-        assert_eq!(merged.contents.lines().count(), 3);
-        assert!(merged.contents.contains("本机续聊"));
-    }
-
-    #[test]
-    fn safe_merge_session_jsonl_rejects_missing_comparable_timestamps() {
-        let archive = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"merge-task\"}}\n";
-        let local = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"本机续聊\"}}\n";
-
-        let merged = safe_merge_session_jsonl(archive, local);
-
-        assert!(!merged.preview.can_merge);
-        assert_eq!(merged.preview.append_record_count, 0);
-        assert!(merged.preview.reason.contains("时间戳"));
+        assert_eq!(merged.preview.strategy, "archive_superset");
+        assert_eq!(merged.preview.archive_unique_record_count, 1);
     }
 
     #[test]
@@ -4759,6 +5785,34 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_session_cwd_is_case_insensitive_for_windows_and_respects_boundaries() {
+        let source = concat!(
+            r#"{"type":"turn_context","payload":{"cwd":"c:\\users\\huawei\\projects\\demo\\src"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"cwd":"C:\\Users\\HUAWEI\\Projects\\demo-backup"}}"#,
+            "\n"
+        );
+        let rewritten = rewrite_session_cwd(
+            source,
+            r#"C:\Users\HUAWEI\Projects\demo"#,
+            r#"D:\Work\demo"#,
+        );
+        let lines = rewritten
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines[0]["payload"]["cwd"].as_str(),
+            Some(r#"D:\Work\demo\src"#)
+        );
+        assert_eq!(
+            lines[1]["payload"]["cwd"].as_str(),
+            Some(r#"C:\Users\HUAWEI\Projects\demo-backup"#)
+        );
+    }
+
+    #[test]
     fn context_title_filter_keeps_normal_messages_that_mention_cwd() {
         assert!(!is_codex_context_text("请解释 <cwd> 在命令行里代表什么"));
         assert!(is_codex_context_text(
@@ -4812,6 +5866,21 @@ mod tests {
         fs::remove_file(path).ok();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn failed_export_preserves_an_existing_destination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("existing.zip");
+        fs::write(&destination, b"trusted previous archive").unwrap();
+        let mut task = task_with("missing source", "/tmp/project", "");
+        task.id = "missing-source-task".to_string();
+        task.file_path = temporary.path().join("missing-session.jsonl");
+
+        let result = write_export_archive(&destination, &[task]);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"trusted previous archive");
     }
 
     #[test]
@@ -5034,7 +6103,18 @@ mod tests {
             .unwrap();
         drop(state);
         Connection::open(home.join("sqlite").join("codex-dev.db")).unwrap();
-        let mut task = task_with("task", "/tmp/project", "");
+        fs::write(
+            home.join(".codex-global-state.json"),
+            serde_json::json!({
+                "electron-persisted-atom-state": {
+                    "projectless-thread-ids": ["state-only-task"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let missing_project = home.join("missing-project");
+        let mut task = task_with("task", &missing_project.to_string_lossy(), "");
         task.id = "state-only-task".to_string();
 
         let result = verify_registered_threads(&home, &[task]);
@@ -5044,32 +6124,180 @@ mod tests {
     }
 
     #[test]
-    fn empty_cwd_registers_an_unbound_project_without_home_directory() {
-        let home = env::temp_dir().join(format!(
-            "codex-session-transfer-unbound-project-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&home).unwrap();
-        fs::write(home.join(".codex-global-state.json"), "{}").unwrap();
-        let mut task = task_with("task", "", "");
+    fn missing_cwd_registers_as_projectless_and_removes_a_stale_assignment() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let old_root = home.join("old-project");
+        fs::create_dir_all(&old_root).unwrap();
+        fs::write(
+            home.join(".codex-global-state.json"),
+            serde_json::json!({
+                "electron-persisted-atom-state": {
+                    "local-projects": {
+                        "old-project": {
+                            "id": "old-project",
+                            "name": "旧项目",
+                            "rootPaths": [old_root],
+                            "futureField": "keep"
+                        }
+                    },
+                    "thread-project-assignments": {
+                        "unbound-task": {"projectId": "old-project", "cwd": old_root}
+                    },
+                    "project-order": ["old-project"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let missing = home.join("missing-project");
+        let mut task = task_with("task", &missing.to_string_lossy(), "");
         task.id = "unbound-task".to_string();
 
-        register_desktop_project_state(&home, &[task]).unwrap();
+        register_desktop_project_state(home, &[task]).unwrap();
         let value: Value = serde_json::from_str(
             &fs::read_to_string(home.join(".codex-global-state.json")).unwrap(),
         )
         .unwrap();
-        fs::remove_dir_all(&home).ok();
 
         let state = &value["electron-persisted-atom-state"];
+        assert!(state["thread-project-assignments"]
+            .get("unbound-task")
+            .is_none());
+        assert!(state["projectless-thread-ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "unbound-task"));
         assert_eq!(
-            state["thread-project-assignments"]["unbound-task"]["cwd"],
-            ""
+            state["local-projects"]["old-project"]["futureField"],
+            "keep"
+        );
+        assert!(state["local-projects"]
+            .get("unbound-unbound-task")
+            .is_none());
+    }
+
+    #[test]
+    fn desktop_registration_creates_missing_state_and_registers_projectless_task() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let missing = home.join("missing-project");
+        let mut task = task_with("task", &missing.to_string_lossy(), "");
+        task.id = "new-projectless-task".to_string();
+
+        register_desktop_project_state(home, &[task]).unwrap();
+        let value: Value = serde_json::from_str(
+            &fs::read_to_string(home.join(".codex-global-state.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert!(value["projectless-thread-ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "new-projectless-task"));
+        assert!(
+            value["electron-persisted-atom-state"]["unified-sidebar-project-order-v1"].is_array()
+        );
+    }
+
+    #[test]
+    fn explicit_mapping_does_not_reuse_a_same_named_stale_project() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let old_root = home.join("old").join("project");
+        let new_root = home.join("new").join("project");
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir_all(&new_root).unwrap();
+        fs::write(
+            home.join(".codex-global-state.json"),
+            serde_json::json!({
+                "electron-persisted-atom-state": {
+                    "local-projects": {
+                        "old-project": {
+                            "id": "old-project",
+                            "name": "project",
+                            "rootPaths": [old_root],
+                            "futureField": "keep"
+                        }
+                    },
+                    "thread-project-assignments": {
+                        "mapped-task": {
+                            "projectId": "old-project",
+                            "cwd": old_root,
+                            "futureAssignmentField": "keep"
+                        }
+                    },
+                    "project-order": ["old-project"],
+                    "projectless-thread-ids": ["mapped-task"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut task = task_with("task", &new_root.to_string_lossy(), "");
+        task.id = "mapped-task".to_string();
+        let expected_project_id = super::stable_local_project_id(&new_root.to_string_lossy());
+
+        register_desktop_project_state(home, &[task]).unwrap();
+        let value: Value = serde_json::from_str(
+            &fs::read_to_string(home.join(".codex-global-state.json")).unwrap(),
+        )
+        .unwrap();
+        let state = &value["electron-persisted-atom-state"];
+
+        assert_eq!(
+            state["thread-project-assignments"]["mapped-task"]["projectId"],
+            expected_project_id
         );
         assert_eq!(
-            state["local-projects"]["unbound-unbound-task"]["rootPaths"],
-            serde_json::json!([])
+            state["thread-project-assignments"]["mapped-task"]["futureAssignmentField"],
+            "keep"
         );
+        assert_eq!(
+            state["local-projects"]["old-project"]["rootPaths"],
+            serde_json::json!([old_root])
+        );
+        assert_eq!(
+            state["local-projects"]["old-project"]["futureField"],
+            "keep"
+        );
+        assert_eq!(
+            state["local-projects"][&expected_project_id]["rootPaths"],
+            serde_json::json!([new_root])
+        );
+        assert!(!state["projectless-thread-ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "mapped-task"));
+        assert_eq!(
+            value["electron-persisted-atom-state"]["unified-sidebar-project-order-v1"][0],
+            format!("codex:project:{expected_project_id}")
+        );
+    }
+
+    #[test]
+    fn import_mapping_distinguishes_unbound_confirmation_from_an_unresolved_mapping() {
+        let mappings = vec![
+            ImportProjectMappingInput {
+                source_key: "keep-unbound".to_string(),
+                target_cwd: String::new(),
+                keep_unbound: true,
+            },
+            ImportProjectMappingInput {
+                source_key: "unresolved".to_string(),
+                target_cwd: String::new(),
+                keep_unbound: false,
+            },
+        ];
+
+        let (bound, unbound) = split_import_project_mappings(&mappings);
+
+        assert!(bound.is_empty());
+        assert!(unbound.contains("keep-unbound"));
+        assert!(!unbound.contains("unresolved"));
     }
 
     #[test]
@@ -5254,6 +6482,43 @@ mod tests {
     #[test]
     fn dangling_project_assignment_is_not_sidebar_visible() {
         assert!(!super::desktop_sidebar_visible(false, false));
+    }
+
+    #[test]
+    fn explicit_projectless_state_wins_over_a_same_named_project() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let local_root = home.join("current").join("project");
+        fs::create_dir_all(&local_root).unwrap();
+        fs::write(
+            home.join(".codex-global-state.json"),
+            serde_json::json!({
+                "electron-persisted-atom-state": {
+                    "local-projects": {
+                        "local-project": {
+                            "id": "local-project",
+                            "name": "project",
+                            "rootPaths": [local_root]
+                        }
+                    },
+                    "thread-project-assignments": {},
+                    "project-order": ["local-project"],
+                    "projectless-thread-ids": ["projectless-task"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let missing = home.join("old-computer").join("project");
+        let mut task = task_with("task", &missing.to_string_lossy(), "");
+        task.id = "projectless-task".to_string();
+
+        let (tasks, _) = super::enrich_local_tasks_with_title_ids(home, vec![task]).unwrap();
+
+        assert_eq!(tasks[0].project_key, "__projectless__");
+        assert_eq!(tasks[0].project_name, "未绑定项目");
+        assert!(!tasks[0].project_exists);
+        assert!(tasks[0].codex_visible);
     }
 
     #[test]
@@ -5460,6 +6725,184 @@ mod tests {
     }
 
     #[test]
+    fn import_mapping_preselects_a_unique_local_project() {
+        let root = env::temp_dir().join(format!(
+            "codex-session-transfer-mapping-{}-unique",
+            std::process::id()
+        ));
+        let local_path = root.join("unique-local-project");
+        fs::create_dir_all(&local_path).unwrap();
+
+        let mut archive_task = task_with("历史任务", r"C:\Users\Old\work\unique-local-project", "");
+        archive_task.project_key = "old-project-key".to_string();
+        archive_task.project_name = "unique-local-project".to_string();
+        archive_task.project_path = archive_task.cwd.clone();
+        archive_task.project_exists = false;
+        let archive_tasks = vec![ArchiveTask {
+            task: archive_task,
+            session_file: "sessions/task.jsonl".to_string(),
+            browser_file: None,
+        }];
+
+        let mut local_task = task_with("本机任务", &local_path.to_string_lossy(), "");
+        local_task.project_key = local_path.to_string_lossy().to_string();
+        local_task.project_name = "unique-local-project".to_string();
+        local_task.project_path = local_path.to_string_lossy().to_string();
+
+        let mappings = super::suggest_import_project_mappings(&archive_tasks, &[local_task]);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].status, "suggested");
+        assert_eq!(
+            mappings[0].suggested_path,
+            super::portable_path_string(&fs::canonicalize(&local_path).unwrap())
+        );
+        assert_eq!(mappings[0].task_ids, vec!["test-task"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn import_mapping_keeps_multiple_same_named_projects_for_manual_choice() {
+        let root = env::temp_dir().join(format!(
+            "codex-session-transfer-mapping-{}-ambiguous",
+            std::process::id()
+        ));
+        let first_path = root.join("one").join("ambiguous-local-project");
+        let second_path = root.join("two").join("ambiguous-local-project");
+        fs::create_dir_all(&first_path).unwrap();
+        fs::create_dir_all(&second_path).unwrap();
+
+        let mut archive_task = task_with("历史任务", &first_path.to_string_lossy(), "");
+        archive_task.project_key = "ambiguous-old-project-key".to_string();
+        archive_task.project_name = "ambiguous-local-project".to_string();
+        let archive_tasks = vec![ArchiveTask {
+            task: archive_task,
+            session_file: "sessions/task.jsonl".to_string(),
+            browser_file: None,
+        }];
+        let local_tasks = [first_path, second_path]
+            .iter()
+            .map(|path| {
+                let mut task = task_with("本机任务", &path.to_string_lossy(), "");
+                task.project_name = "ambiguous-local-project".to_string();
+                task.project_path = path.to_string_lossy().to_string();
+                task
+            })
+            .collect::<Vec<_>>();
+
+        let mappings = super::suggest_import_project_mappings(&archive_tasks, &local_tasks);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].status, "ambiguous");
+        assert!(mappings[0].suggested_path.is_empty());
+        assert_eq!(mappings[0].candidates.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn portable_path_string_removes_windows_extended_prefix() {
+        assert_eq!(
+            super::portable_path_string(std::path::Path::new(r"\\?\C:\Users\Legion\work\demo")),
+            r"C:\Users\Legion\work\demo"
+        );
+        assert_eq!(
+            super::portable_path_string(std::path::Path::new(r"\\?\UNC\server\share\demo")),
+            r"\\server\share\demo"
+        );
+    }
+
+    #[test]
+    fn import_candidates_exclude_codex_temporary_worktrees() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-transfer-worktree-candidate-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let worktree = root
+            .join(".codex")
+            .join("worktrees")
+            .join("4329")
+            .join("novel");
+        fs::create_dir_all(&worktree).unwrap();
+
+        let mut candidates = Vec::new();
+        super::push_import_candidate(&mut candidates, &worktree);
+
+        assert!(candidates.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compatibility_check_rejects_missing_or_new_required_columns() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE sample (id TEXT PRIMARY KEY, required_new TEXT NOT NULL);")
+            .unwrap();
+        let missing =
+            super::validate_table_insert_shape(&connection, "sample", &["id", "cwd"]).unwrap_err();
+        assert!(missing.contains("cwd"));
+
+        let required =
+            super::validate_table_insert_shape(&connection, "sample", &["id"]).unwrap_err();
+        assert!(required.contains("required_new"));
+    }
+
+    #[test]
+    fn compatibility_check_rejects_unknown_desktop_state_shape() {
+        let root = env::temp_dir().join(format!(
+            "codex-session-transfer-state-shape-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(".codex-global-state.json"),
+            r#"{"electron-persisted-atom-state":[]}"#,
+        )
+        .unwrap();
+        assert!(super::validate_desktop_state_shape(&root).is_err());
+        fs::write(
+            root.join(".codex-global-state.json"),
+            r#"{"future-state-container":{}}"#,
+        )
+        .unwrap();
+        assert!(super::validate_desktop_state_shape(&root).is_err());
+        fs::write(
+            root.join(".codex-global-state.json"),
+            r#"{"electron-persisted-atom-state":{"local-projects":{"project":[]}}}"#,
+        )
+        .unwrap();
+        assert!(super::validate_desktop_state_shape(&root).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn snapshot_names_do_not_collide_within_the_same_second() {
+        let root = env::temp_dir().join(format!(
+            "codex-session-transfer-snapshot-collision-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let state = root.join("state_5.sqlite");
+        fs::write(&state, "first").unwrap();
+
+        let mut first = ImportTransaction::new(&root);
+        first.backup(&state, "same-stamp").unwrap();
+        first.commit();
+        fs::write(&state, "second").unwrap();
+        let mut second = ImportTransaction::new(&root);
+        second.backup(&state, "same-stamp").unwrap();
+        second.commit();
+
+        let snapshots = local_snapshots(&root).unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_ne!(snapshots[0].path, snapshots[1].path);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn path_name_handles_windows_separators() {
         assert_eq!(
             super::path_name(r"E:\github项目集合\codex-session-transfer"),
@@ -5495,22 +6938,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_codex_worktree_stays_unbound_on_import() {
+    fn import_cwd_uses_only_an_explicit_confirmed_mapping() {
         let cwd = r"Z:\historical\.codex\worktrees\77c3\RAGTest";
-        assert!(super::resolved_import_cwd(cwd, None, true).is_empty());
-        assert!(super::resolved_import_cwd(cwd, Some(r"Z:\target"), true).is_empty());
-    }
+        let task = task_with("task", cwd, "");
+        assert!(super::mapped_import_cwd(&task, &HashMap::new()).is_empty());
 
-    #[test]
-    fn resolve_local_cwd_falls_back_to_home_work_for_missing_path() {
-        let name = format!("codex-session-transfer-missing-{}", std::process::id());
-        let original = format!(r"Z:\old-drive\{name}");
-        let resolved = super::resolve_local_cwd(&original);
-
-        assert_ne!(resolved, original);
-        assert!(
-            resolved.ends_with(&format!("work/{name}"))
-                || resolved.ends_with(&format!(r"work\{name}"))
+        let target = tempfile::tempdir().unwrap();
+        let mappings = HashMap::from([(
+            super::archive_project_key(&task),
+            target.path().to_string_lossy().to_string(),
+        )]);
+        assert_eq!(
+            super::mapped_import_cwd(&task, &mappings),
+            target.path().to_string_lossy()
         );
     }
 

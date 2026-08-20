@@ -65,25 +65,66 @@ export const demoBridge = {
       canceled: false,
       path: "/Users/yimu/Downloads/codex-tasks-2026-07-19.zip",
       createdAt: new Date(now - 3600000).toISOString(),
-      tasks: demoTasks.slice(0, 4).map((task, index) => ({ ...task, conflict: index === 2 })),
+      tasks: demoTasks.slice(0, 4).map((task, index) => ({
+        ...task,
+        conflict: index === 2,
+        mergePreview: index === 2 ? {
+          canMerge: true,
+          strategy: "archive_superset",
+          archiveRecordCount: 68,
+          localRecordCount: 61,
+          appendRecordCount: 7,
+          archiveUniqueRecordCount: 7,
+          localUniqueRecordCount: 0,
+          archiveUniqueUserTurnCount: 2,
+          localUniqueUserTurnCount: 0,
+          resultRecordCount: 68,
+          reason: "归档完整包含本机会话，可安全补全本地缺少的记录。",
+        } : null,
+      })),
+      projectMappings: [
+        {
+          sourceKey: demoTasks[0].projectKey,
+          sourceName: demoTasks[0].projectName,
+          sourcePath: demoTasks[0].cwd,
+          candidates: [demoTasks[0].cwd],
+          suggestedPath: demoTasks[0].cwd,
+          status: "exact",
+          taskCount: 4,
+          taskIds: demoTasks.slice(0, 4).map((task) => task.id),
+        },
+      ],
     };
     return archive;
   },
   async inspectArchive() {
     return this.chooseArchive();
   },
+  async chooseDirectory() {
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    return "/Users/yimu/work/migrated-project";
+  },
   async importArchive(_archivePath, options = {}) {
     await new Promise((resolve) => setTimeout(resolve, 700));
-    const targetCwd = options.targetCwd || "";
+    const mappings = new Map((options.projectMappings || []).map((mapping) => [mapping.sourceKey, mapping]));
+    const mappedCwd = (task) => {
+      const mapping = mappings.get(task.projectKey);
+      if (!mapping) return task.cwd;
+      return mapping.keepUnbound ? "" : mapping.targetCwd;
+    };
     const imported = archive.tasks
       .filter((task) => !task.conflict)
-      .map((task) => ({ ...task, cwd: targetCwd || task.cwd }));
+      .map((task) => ({ ...task, cwd: mappedCwd(task) }));
     const restored = options.restoreExisting
-      ? archive.tasks.filter((task) => task.conflict).map((task) => ({ ...task, cwd: targetCwd || task.cwd }))
+      ? archive.tasks.filter((task) => task.conflict).map((task) => ({ ...task, cwd: mappedCwd(task) }))
       : [];
+    const merged = archive.tasks
+      .filter((task) => options.mergeTaskIds?.includes(task.id))
+      .map((task) => ({ id: task.id, title: task.title, strategy: "archive_superset", archiveAddedRecords: task.mergePreview?.archiveUniqueRecordCount || 0 }));
     return {
       imported,
       restored,
+      merged,
       skipped: options.restoreExisting ? [] : archive.tasks.filter((task) => task.conflict),
       backups: ["state_5.sqlite.backup-demo"],
       codexHome: "/Users/yimu/.codex",

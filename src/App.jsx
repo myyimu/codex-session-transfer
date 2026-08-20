@@ -21,6 +21,14 @@ import {
 } from "@phosphor-icons/react";
 import { demoBridge } from "./demoBridge.js";
 import { tauriBridge } from "./tauriBridge.js";
+import {
+  activeProjectMappings,
+  isCodexWorktreePath,
+  normalizeDisplayPath,
+  prepareProjectMappings,
+  projectMappingStatus,
+  repairableTaskIds,
+} from "./taskLogic.js";
 
 const bridge = window.__TAURI_INTERNALS__ ? tauriBridge : demoBridge;
 const isMacOS = /Macintosh|Mac OS X/.test(navigator.userAgent);
@@ -76,6 +84,18 @@ function modelLabel(task) {
 function compactPath(value) {
   const path = String(value || "");
   return path.replace(/^\/Users\/([^/]+)/, "~");
+}
+
+function historyDifferenceText(preview, source, label) {
+  const isArchive = source === "archive";
+  const recordCount = isArchive
+    ? (preview?.archiveUniqueRecordCount || preview?.appendRecordCount || 0)
+    : (preview?.localUniqueRecordCount || 0);
+  const userTurnCount = isArchive
+    ? preview?.archiveUniqueUserTurnCount
+    : preview?.localUniqueUserTurnCount;
+  const turnSummary = Number.isInteger(userTurnCount) ? `，约 ${userTurnCount} 轮对话` : "";
+  return `${label || `${isArchive ? "归档" : "本地"}版本更完整`}：多 ${recordCount} 条会话记录${turnSummary}`;
 }
 
 function projectMatchesSearch(project, query) {
@@ -388,7 +408,7 @@ function NavButton({ active, disabled, icon: Icon, title, subtitle, onSelect }) 
   );
 }
 
-function ExportView({ environment, showToast, refreshEnvironment, onOperationChange }) {
+function ExportView({ environment, showToast, refreshEnvironment, onOperationChange, libraryRevision }) {
   const [tasks, setTasks] = useState([]);
   const [query, setQuery] = useState("");
   const [project, setProject] = useState("all");
@@ -410,6 +430,7 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
   const [visibleLimit, setVisibleLimit] = useState(120);
   const [scanProgress, setScanProgress] = useState(null);
   const scanRunRef = useRef(null);
+  const libraryRevisionRef = useRef(libraryRevision);
   const scannedTaskIdsRef = useRef(new Set());
   const healthDrawerRef = useRef(null);
   const healthTriggerRef = useRef(null);
@@ -487,6 +508,12 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
     };
   }, [load]);
 
+  useEffect(() => {
+    if (libraryRevisionRef.current === libraryRevision) return;
+    libraryRevisionRef.current = libraryRevision;
+    load();
+  }, [libraryRevision, load]);
+
   const projects = useMemo(() => buildProjects(tasks), [tasks]);
 
   const filtered = useMemo(() => {
@@ -508,6 +535,11 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
   const selectedTasks = tasks.filter((task) => selected.has(task.id));
   const selectedBytes = selectedTasks.reduce((sum, task) => sum + (task.size || 0), 0);
   const allVisibleSelected = visibleTasks.length > 0 && visibleTasks.every((task) => selected.has(task.id));
+  const repairableIds = useMemo(() => new Set(repairableTaskIds(healthReport)), [healthReport]);
+  const selectedRepairableIds = useMemo(
+    () => [...selected].filter((id) => repairableIds.has(id)),
+    [repairableIds, selected],
+  );
 
   const toggle = (id) => {
     setSelected((current) => {
@@ -554,34 +586,6 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
       }
     } catch (error) {
       showToast("error", "导出失败", error.message);
-    } finally {
-      setOperation("");
-      onOperationChange("");
-    }
-  };
-
-  const bindSelected = async () => {
-    if (!selected.size || !bridge.bindLocalTasks || !bridge.chooseDirectory) return;
-    let targetCwd;
-    try {
-      targetCwd = await bridge.chooseDirectory();
-    } catch (error) {
-      showToast("error", "无法选择项目目录", error.message);
-      return;
-    }
-    if (!targetCwd) return;
-    const confirmed = window.confirm(`将所选 ${selected.size} 个任务绑定到：\n${targetCwd}\n\n软件会先创建本地安全备份，并更新会话工作目录。`);
-    if (!confirmed) return;
-    setOperation("bind");
-    onOperationChange("bind");
-    try {
-      const result = await bridge.bindLocalTasks([...selected], targetCwd);
-      setSelected(new Set());
-      showToast("success", `已绑定 ${result.bound?.length || selected.size} 个任务`, result.message || targetCwd);
-      await load();
-      refreshEnvironment?.();
-    } catch (error) {
-      showToast("error", "绑定项目失败", error.message);
     } finally {
       setOperation("");
       onOperationChange("");
@@ -820,21 +824,23 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
           </button>
           <button
             className="secondary-button"
-            disabled={!selected.size || operation || codexRunning}
-            onClick={bindSelected}
-            title="明确选择一个本机项目目录，将所选任务的历史路径改为该目录"
-          >
-            <FolderOpen size={18} weight="bold" />
-            {operation === "bind" ? "正在绑定…" : "绑定本机项目"}
-          </button>
-          <button
-            className="secondary-button"
-            disabled={operation || !healthReport}
-            onClick={() => openHealth([...selected])}
-            title={selected.size ? "把当前已选任务带入修复建议" : "查看本地任务健康检查与可安全执行的修复建议"}
+            disabled={operation
+              || !healthReport
+              || (!selected.size && !repairableIds.size)
+              || (selected.size > 0 && !selectedRepairableIds.length)}
+            onClick={() => openHealth(selectedRepairableIds)}
+            title={selected.size
+              ? selectedRepairableIds.length
+                ? `把 ${selectedRepairableIds.length} 个可修复任务带入修复建议`
+                : "当前所选任务没有可安全执行的修复项"
+              : "查看本地任务健康检查与可安全执行的修复建议"}
           >
             <Wrench size={18} weight="bold" />
-            {operation === "health" ? "正在修复…" : selected.size ? `修复所选 ${selected.size} 个任务` : "检查并修复"}
+            {operation === "health"
+              ? "正在修复…"
+              : selected.size
+                ? selectedRepairableIds.length ? `修复所选可修复 ${selectedRepairableIds.length} 个任务` : "所选任务无需修复"
+                : repairableIds.size ? "检查并修复" : "没有需要修复的任务"}
           </button>
         </div>
       </footer>
@@ -916,12 +922,6 @@ function sortTasksByUpdated(tasks) {
   return [...tasks].sort((left, right) => String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")));
 }
 
-function repairableTaskIds(report) {
-  return report?.tasks
-    ?.filter((task) => task.safeActions?.includes("reregister") && !task.requiresManualReview)
-    .map((task) => task.id) || [];
-}
-
 function buildRepairGroups(items, tasks, query, selectedIds) {
   const taskById = new Map(tasks.map((task) => [task.id, task]));
   const needle = query.trim().toLocaleLowerCase();
@@ -948,35 +948,71 @@ function buildRepairGroups(items, tasks, query, selectedIds) {
     .sort((left, right) => Number(right.hasSelected) - Number(left.hasSelected) || left.name.localeCompare(right.name, "zh-CN"));
 }
 
-function ImportView({ environment, showToast, onOperationChange }) {
+function ImportView({ active, environment, showToast, onOperationChange, onLibraryChanged }) {
   const [archive, setArchive] = useState(null);
-  const [adaptPaths, setAdaptPaths] = useState(true);
   const [restoreExisting, setRestoreExisting] = useState(false);
   const [mergeTaskIds, setMergeTaskIds] = useState(new Set());
-  const [targetCwd, setTargetCwd] = useState("");
-  const [localTasks, setLocalTasks] = useState([]);
+  const [projectMappings, setProjectMappings] = useState([]);
+  const [visibleTaskLimit, setVisibleTaskLimit] = useState(120);
   const [dragging, setDragging] = useState(false);
   const [working, setWorking] = useState(false);
   const [result, setResult] = useState(null);
   const codexRunning = Boolean(environment?.codexRunning);
 
-  useEffect(() => {
-    bridge.listTasks().then((next) => setLocalTasks(next.tasks || [])).catch(() => setLocalTasks([]));
+  const acceptArchive = useCallback((next) => {
+    setArchive(next);
+    setResult(null);
+    setRestoreExisting(false);
+    setMergeTaskIds(new Set());
+    setProjectMappings(prepareProjectMappings(next.projectMappings));
+    setVisibleTaskLimit(120);
   }, []);
+
+  const inspectArchivePath = useCallback(async (archivePath) => {
+    try {
+      const next = await bridge.inspectArchive(archivePath);
+      acceptArchive(next);
+    } catch (error) {
+      showToast("error", "无法读取压缩包", error.message);
+    }
+  }, [acceptArchive, showToast]);
 
   const choose = async () => {
     try {
       const next = await bridge.chooseArchive();
-      if (!next.canceled) {
-        setArchive(next);
-        setResult(null);
-        setRestoreExisting(false);
-        setMergeTaskIds(new Set());
-      }
+      if (!next.canceled) acceptArchive(next);
     } catch (error) {
       showToast("error", "无法读取压缩包", error.message);
     }
   };
+
+  useEffect(() => {
+    if (!active || !bridge.onArchiveDragDrop) {
+      setDragging(false);
+      return undefined;
+    }
+    let disposed = false;
+    let unlisten;
+    bridge.onArchiveDragDrop((event) => {
+      if (disposed) return;
+      if (event.type === "enter" || event.type === "over") {
+        setDragging(true);
+      } else if (event.type === "leave") {
+        setDragging(false);
+      } else if (event.type === "drop") {
+        setDragging(false);
+        const [archivePath] = event.paths || [];
+        if (archivePath) inspectArchivePath(archivePath);
+      }
+    }).then((dispose) => {
+      if (disposed) dispose();
+      else unlisten = dispose;
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [active, inspectArchivePath]);
 
   const handleDrop = async (event) => {
     event.preventDefault();
@@ -989,30 +1025,33 @@ function ImportView({ environment, showToast, onOperationChange }) {
         showToast("error", "请使用选择文件", "Tauri 版本会通过系统文件选择器安全读取压缩包");
         return;
       }
-      const next = await bridge.inspectArchive(archivePath);
-      setArchive(next);
-      setResult(null);
-      setRestoreExisting(false);
-      setMergeTaskIds(new Set());
+      await inspectArchivePath(archivePath);
     } catch (error) {
       showToast("error", "无法读取压缩包", error.message);
     }
   };
 
   const runImport = async () => {
+    if (!archive || result || working) return;
     setWorking(true);
     onOperationChange("import");
     try {
-      const next = await bridge.importArchive(archive.path, { adaptPaths, restoreExisting, mergeTaskIds: [...mergeTaskIds], targetCwd });
+      const next = await bridge.importArchive(archive.path, {
+        restoreExisting,
+        mergeTaskIds: [...mergeTaskIds],
+        projectMappings: visibleProjectMappings.map(({ sourceKey, targetCwd, keepUnbound }) => ({ sourceKey, targetCwd, keepUnbound })),
+      });
       const importedCount = next.imported?.length || 0;
       const restoredCount = next.restored?.length || 0;
       const mergedCount = next.merged?.length || 0;
       const skippedCount = next.skipped?.length || 0;
       setResult(next);
+      if (importedCount || restoredCount || mergedCount) onLibraryChanged?.();
+      const affectedCount = importedCount + restoredCount + mergedCount;
       showToast(
         "success",
-        importedCount || restoredCount ? `已处理 ${importedCount + restoredCount} 个任务` : "没有需要导入的任务",
-        mergedCount ? `${mergedCount} 个任务已追加本机续聊记录` : skippedCount ? `${skippedCount} 个重复任务已跳过` : "重启 Codex 后即可看到",
+        affectedCount ? `已处理 ${affectedCount} 个任务` : "没有需要导入的任务",
+        mergedCount ? `${mergedCount} 个任务已从归档补全本地记录` : skippedCount ? `${skippedCount} 个重复任务已跳过` : "重启 Codex 后即可看到",
       );
     } catch (error) {
       showToast("error", "导入失败", error.message);
@@ -1025,9 +1064,39 @@ function ImportView({ environment, showToast, onOperationChange }) {
   const importableCount = archive?.tasks.filter((task) => !task.conflict).length || 0;
   const conflictCount = archive?.tasks.filter((task) => task.conflict).length || 0;
   const mergeableCount = archive?.tasks.filter((task) => task.conflict && task.mergePreview?.canMerge).length || 0;
+  const localRicherCount = archive?.tasks.filter((task) => task.conflict && task.mergePreview?.strategy === "local_superset").length || 0;
+  const divergedCount = archive?.tasks.filter((task) => task.conflict && task.mergePreview?.strategy === "diverged").length || 0;
   const actionCount = importableCount + (restoreExisting ? conflictCount : 0);
-  const localProjects = useMemo(() => buildProjects(localTasks).filter((item) => !item.missing && !item.hidden && item.path), [localTasks]);
-  const targetName = targetCwd ? (localProjects.find((item) => item.path === targetCwd)?.name || filename(targetCwd)) : "";
+  const visibleProjectMappings = useMemo(
+    () => activeProjectMappings(projectMappings, archive?.tasks || [], restoreExisting),
+    [archive, projectMappings, restoreExisting],
+  );
+  const unresolvedMappings = visibleProjectMappings.filter((mapping) => !mapping.targetCwd && !mapping.keepUnbound).length;
+  const mappingsReady = unresolvedMappings === 0;
+  const visibleArchiveTasks = archive?.tasks.slice(0, visibleTaskLimit) || [];
+  const updateProjectMapping = (sourceKey, targetCwd) => {
+    const normalizedTarget = normalizeDisplayPath(targetCwd);
+    if (isCodexWorktreePath(normalizedTarget)) {
+      showToast("error", "不能绑定临时工作树", "请选择实际项目目录，不要选择 .codex\\worktrees 下的临时目录。");
+      return;
+    }
+    setProjectMappings((current) => current.map((mapping) => (
+      mapping.sourceKey === sourceKey ? { ...mapping, targetCwd: normalizedTarget, keepUnbound: false, status: normalizedTarget ? "manual" : mapping.status } : mapping
+    )));
+  };
+  const keepProjectUnbound = (sourceKey) => {
+    setProjectMappings((current) => current.map((mapping) => (
+      mapping.sourceKey === sourceKey ? { ...mapping, targetCwd: "", keepUnbound: true, status: "unbound" } : mapping
+    )));
+  };
+  const chooseMappingDirectory = async (sourceKey) => {
+    try {
+      const targetCwd = await bridge.chooseDirectory();
+      if (targetCwd) updateProjectMapping(sourceKey, targetCwd);
+    } catch (error) {
+      showToast("error", "无法选择项目目录", error.message);
+    }
+  };
   const toggleMergeTask = (taskId) => {
     setMergeTaskIds((current) => {
       const next = new Set(current);
@@ -1042,7 +1111,7 @@ function ImportView({ environment, showToast, onOperationChange }) {
         <div>
           <span className="eyebrow rose">导入到这台电脑</span>
           <h1 id="import-title">恢复 Codex 任务</h1>
-          <p>可跳过重复任务，也可从本地历史恢复到 Codex 列表</p>
+          <p>重复任务会先比较内容；归档更完整时可安全补全本地历史</p>
         </div>
       </header>
 
@@ -1071,7 +1140,7 @@ function ImportView({ environment, showToast, onOperationChange }) {
           </div>
 
           <div className="import-list">
-            {archive.tasks.map((task) => (
+            {visibleArchiveTasks.map((task) => (
               <div className="import-row" key={task.id}>
                 <span className={`import-state ${task.conflict ? "skip" : "ready"}`}>
                   {task.conflict ? <ArrowClockwise size={15} /> : <Check size={15} weight="bold" />}
@@ -1084,16 +1153,38 @@ function ImportView({ environment, showToast, onOperationChange }) {
                   <span title={task.cwd || "未记录工作目录"}>{task.cwd || "未记录工作目录"}</span>
                 </span>
                 <span className={`status-chip ${task.conflict ? "neutral" : "ready"}`}>
-                  {task.conflict ? (restoreExisting ? (mergeTaskIds.has(task.id) ? `将合并 ${task.mergePreview?.appendRecordCount || 0} 条续聊` : "将恢复") : "已存在，将跳过") : "可导入"}
+                  {task.conflict ? (
+                    !restoreExisting ? "已存在，将跳过"
+                      : mergeTaskIds.has(task.id) ? historyDifferenceText(task.mergePreview, "archive", "将补全本地")
+                        : task.mergePreview?.strategy === "archive_superset" ? historyDifferenceText(task.mergePreview, "archive")
+                          : task.mergePreview?.strategy === "local_superset" ? historyDifferenceText(task.mergePreview, "local")
+                            : task.mergePreview?.strategy === "identical" ? "内容一致，将恢复"
+                              : task.mergePreview?.strategy === "diverged" ? "历史分叉，将保留本地"
+                                : "将恢复本地历史"
+                  ) : "可导入"}
                 </span>
                 {task.conflict && restoreExisting && task.mergePreview && (
-                  <label className={`import-merge-toggle ${task.mergePreview.canMerge ? "" : "is-disabled"}`} title={task.mergePreview.reason}>
-                    <input type="checkbox" checked={mergeTaskIds.has(task.id)} disabled={!task.mergePreview.canMerge} onChange={() => toggleMergeTask(task.id)} />
-                    <span>{task.mergePreview.canMerge ? "合并续聊" : "不可合并"}</span>
-                  </label>
+                  task.mergePreview.canMerge ? (
+                    <label className="import-merge-toggle" title={task.mergePreview.reason}>
+                      <input type="checkbox" checked={mergeTaskIds.has(task.id)} disabled={Boolean(result)} onChange={() => toggleMergeTask(task.id)} />
+                      <span>补全本地</span>
+                    </label>
+                  ) : (
+                    <span className={`import-merge-note ${task.mergePreview.strategy === "diverged" ? "is-warning" : ""}`} title={task.mergePreview.reason}>
+                      {task.mergePreview.strategy === "local_superset" ? "本地更完整"
+                        : task.mergePreview.strategy === "identical" ? "无需补全"
+                          : task.mergePreview.strategy === "diverged" ? "需人工处理"
+                            : "无法比较"}
+                    </span>
+                  )
                 )}
               </div>
             ))}
+            {archive.tasks.length > visibleArchiveTasks.length && (
+              <button className="text-button load-more-tasks" onClick={() => setVisibleTaskLimit((current) => current + 120)}>
+                显示更多任务（剩余 {archive.tasks.length - visibleArchiveTasks.length} 个）
+              </button>
+            )}
           </div>
 
           {conflictCount > 0 && (
@@ -1101,11 +1192,15 @@ function ImportView({ environment, showToast, onOperationChange }) {
               <span className="setting-icon"><ArrowClockwise size={19} /></span>
               <span>
                 <strong>重复任务处理</strong>
-                <small>{conflictCount} 个任务本地历史已存在；可重新登记，其中 {mergeableCount} 个可安全比较续聊</small>
+                <small>
+                  {conflictCount} 个任务本地历史已存在；{mergeableCount} 个可从归档安全补全
+                  {localRicherCount ? `，${localRicherCount} 个本地更完整` : ""}
+                  {divergedCount ? `，${divergedCount} 个历史已分叉` : ""}
+                </small>
               </span>
               <span className="segmented-control" role="group" aria-label="重复任务处理">
-                <button type="button" className={!restoreExisting ? "is-active" : ""} onClick={() => setRestoreExisting(false)}>跳过</button>
-                <button type="button" className={restoreExisting ? "is-active" : ""} onClick={() => setRestoreExisting(true)}>从本地历史恢复</button>
+                <button type="button" disabled={Boolean(result)} className={!restoreExisting ? "is-active" : ""} onClick={() => setRestoreExisting(false)}>跳过</button>
+                <button type="button" disabled={Boolean(result)} className={restoreExisting ? "is-active" : ""} onClick={() => setRestoreExisting(true)}>从本地历史恢复</button>
               </span>
             </div>
           )}
@@ -1120,24 +1215,45 @@ function ImportView({ environment, showToast, onOperationChange }) {
             </div>
           )}
 
-          <div className="setting-row project-target-row">
-            <span className="setting-icon"><FolderOpen size={19} /></span>
-            <span>
-              <strong>导入到项目</strong>
-              <small title={targetCwd ? `恢复到 ${targetName || targetCwd}` : "默认保留压缩包记录的项目路径"}>{targetCwd ? `恢复到 ${targetName || targetCwd}` : "默认保留压缩包记录的项目路径"}</small>
-            </span>
-            <ImportProjectPicker projects={localProjects} value={targetCwd} onChange={setTargetCwd} />
-          </div>
-
-          <label className="setting-row">
-            <span className="setting-icon"><Path size={19} /></span>
-            <span>
-              <strong>自动适配项目路径</strong>
-              <small>原路径不存在时，查找本机 `work`、`Projects` 和 `Documents`</small>
-            </span>
-            <input type="checkbox" checked={adaptPaths} onChange={(event) => setAdaptPaths(event.target.checked)} />
-            <span className="switch" aria-hidden="true"><span /></span>
-          </label>
+          <section className="project-mapping-panel" aria-label="项目路径映射">
+            <header className="project-mapping-header">
+              <span className="setting-icon"><FolderOpen size={19} /></span>
+              <span>
+                <strong>确认项目路径映射</strong>
+                <small>唯一同名目录已预选；多个候选目录请手动选择。没有候选时可浏览本机目录。</small>
+              </span>
+              <span className={`status-chip ${mappingsReady ? "ready" : "neutral"}`}>
+                {mappingsReady ? "映射已确认" : `待处理 ${unresolvedMappings} 项`}
+              </span>
+            </header>
+            <div className="project-mapping-list">
+              {visibleProjectMappings.map((mapping) => (
+                <div className={`project-mapping-row ${mapping.status === "ambiguous" ? "is-ambiguous" : ""}`} key={mapping.sourceKey}>
+                  <span className="mapping-source">
+                    <strong title={mapping.sourceName}>{mapping.sourceName}</strong>
+                    <small title={mapping.sourcePath}>{mapping.sourcePath || "未记录原项目路径"} · {mapping.activeTaskCount} 个待处理任务</small>
+                  </span>
+                  <span className="mapping-target">
+                    <span className="mapping-target-controls">
+                      <select
+                        value={mapping.keepUnbound ? "__keep_unbound__" : mapping.targetCwd}
+                        disabled={Boolean(result)}
+                        onChange={(event) => (event.target.value === "__keep_unbound__" ? keepProjectUnbound(mapping.sourceKey) : updateProjectMapping(mapping.sourceKey, event.target.value))}
+                        aria-label={`选择 ${mapping.sourceName} 的本机目录`}
+                      >
+                        <option value="">请选择本机目录</option>
+                        <option value="__keep_unbound__">保持未绑定</option>
+                        {(mapping.candidates || []).map((candidate) => <option value={candidate} key={candidate}>{candidate}</option>)}
+                      </select>
+                      <button type="button" className="text-button compact" disabled={Boolean(result)} onClick={() => chooseMappingDirectory(mapping.sourceKey)}>浏览…</button>
+                    </span>
+                    <small className={mapping.targetCwd || mapping.keepUnbound ? "is-ready" : "is-warning"}>{projectMappingStatus(mapping)}</small>
+                  </span>
+                </div>
+              ))}
+              {!visibleProjectMappings.length && <div className="project-mapping-empty">本次待处理任务没有可绑定的项目路径，将保持未绑定。</div>}
+            </div>
+          </section>
 
           {result && (
             <div className="result-strip">
@@ -1152,12 +1268,12 @@ function ImportView({ environment, showToast, onOperationChange }) {
 
       <footer className="action-bar">
         <div>
-          <strong>{archive ? (restoreExisting ? `${importableCount} 个新任务，${conflictCount} 个可恢复，${mergeTaskIds.size} 个将合并续聊` : `${importableCount} 个新任务可导入`) : "等待选择压缩包"}</strong>
+          <strong>{result ? "本次导入已完成；重新选择压缩包可再次检查" : archive ? (unresolvedMappings ? `还有 ${unresolvedMappings} 个项目需要确认路径` : (restoreExisting ? `${importableCount} 个新任务，${conflictCount} 个可恢复，${mergeTaskIds.size} 个将从归档补全` : `${importableCount} 个新任务可导入`)) : "等待选择压缩包"}</strong>
           <span title={environment?.codexHome}>{environment?.codexHome}</span>
         </div>
-        <button className="primary-button rose-button" disabled={!archive || !actionCount || working || codexRunning} onClick={runImport}>
+        <button className="primary-button rose-button" disabled={!archive || !actionCount || !mappingsReady || working || codexRunning || Boolean(result)} onClick={runImport}>
           <TrayArrowDown size={18} weight="bold" />
-          {working ? "正在导入…" : codexRunning ? "请先退出 Codex" : "导入到 Codex"}
+          {working ? "正在导入…" : result ? "导入已完成" : codexRunning ? "请先退出 Codex" : unresolvedMappings ? "先确认项目映射" : "确认映射并导入"}
         </button>
       </footer>
     </section>
@@ -1169,6 +1285,7 @@ export function App() {
   const [activeOperation, setActiveOperation] = useState("");
   const [environment, setEnvironment] = useState(null);
   const [toast, setToast] = useState(null);
+  const [libraryRevision, setLibraryRevision] = useState(0);
   const toastTimerRef = useRef(null);
 
   const refreshEnvironment = useCallback(() => {
@@ -1249,11 +1366,12 @@ export function App() {
         </div>
       </aside>
 
-      {mode === "export" ? (
-        <ExportView environment={environment} showToast={showToast} refreshEnvironment={refreshEnvironment} onOperationChange={setActiveOperation} />
-      ) : (
-        <ImportView environment={environment} showToast={showToast} onOperationChange={setActiveOperation} />
-      )}
+      <div className={`view-slot ${mode === "export" ? "is-active" : "is-hidden"}`} aria-hidden={mode !== "export"}>
+        <ExportView environment={environment} showToast={showToast} refreshEnvironment={refreshEnvironment} onOperationChange={setActiveOperation} libraryRevision={libraryRevision} />
+      </div>
+      <div className={`view-slot ${mode === "import" ? "is-active" : "is-hidden"}`} aria-hidden={mode !== "import"}>
+        <ImportView active={mode === "import"} environment={environment} showToast={showToast} onOperationChange={setActiveOperation} onLibraryChanged={() => setLibraryRevision((current) => current + 1)} />
+      </div>
       <Toast toast={toast} onClose={() => setToast(null)} />
     </main>
   );

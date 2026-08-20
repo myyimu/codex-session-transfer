@@ -1,0 +1,47 @@
+- main [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e7]:
+      - strong [ref=e8]: Codex 迁移
+      - generic [ref=e9]: Session Transfer
+    - navigation "主要功能" [ref=e10]:
+      - button "导出任务 打包这台电脑的会话" [ref=e11] [cursor=pointer]:
+        - generic:
+          - strong: 导出任务
+          - generic: 打包这台电脑的会话
+      - button "导入任务 恢复到新的电脑" [ref=e12] [cursor=pointer]:
+        - generic:
+          - strong: 导入任务
+          - generic: 恢复到新的电脑
+    - generic [ref=e17]:
+      - strong [ref=e18]: 本地处理
+      - generic [ref=e19]: 不会上传会话内容
+    - generic [ref=e22]:
+      - strong [ref=e23]: 浏览器演示数据
+      - generic "真实测试请看桌面 app" [ref=e24]
+  - region [ref=e26]:
+    - generic [ref=e27]:
+      - generic [ref=e28]:
+        - generic [ref=e29]: 从这台电脑导出
+        - heading "选择要带走的任务" [level=1] [ref=e30]
+        - paragraph [ref=e31]: 正在扫描…
+      - generic [ref=e32]:
+        - button "取消扫描" [ref=e33] [cursor=pointer]
+        - button "重新扫描" [disabled] [ref=e34]
+    - generic [ref=e37]:
+      - generic [ref=e38]:
+        - textbox [ref=e42]:
+          - /placeholder: 搜索任务名、路径或内容
+        - button "全部项目 · 0" [ref=e44] [cursor=pointer]
+      - generic [ref=e51]:
+        - button "全选已显示 0 条" [disabled] [ref=e52]
+        - button "导出已选任务" [disabled] [ref=e55]
+    - generic [ref=e59]:
+      - strong [ref=e62]: 正在扫描 Codex 任务
+      - generic [ref=e63]: 扫描到的任务会立即显示在这里
+    - generic [ref=e64]:
+      - generic [ref=e65]:
+        - strong [ref=e66]: 尚未选择任务
+        - generic "/Users/yimu/.codex" [ref=e67]
+      - generic [ref=e68]:
+        - button "导出压缩包" [disabled] [ref=e69]
+        - button "没有需要修复的任务" [disabled] [ref=e72]

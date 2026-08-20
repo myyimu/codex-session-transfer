@@ -4,7 +4,7 @@ A local-first desktop app that keeps local Codex tasks usable through device cha
 
 It scans local Codex task history, displays tasks by project and title, exports selected sessions into a ZIP archive, and imports that archive into the current Codex data directory on another machine. All processing happens locally; session content is not uploaded.
 
-[中文 README](./README.md) | [Product strategy, UX, and roadmap](./docs/product-strategy.md)
+[中文 README](./README.md) | [Product strategy, UX, and roadmap](./docs/product-strategy.en.md)
 
 ## Positioning
 
@@ -20,7 +20,7 @@ Codex Session Transfer is designed for:
 - Syncing selected Codex task history across multiple machines without copying the entire `.codex` directory.
 - Backing up important task sessions, including project paths, task titles, original session logs, and optional browser session config.
 - Restoring existing local session files back into the Codex task list when the files exist locally but no longer appear in the Codex sidebar.
-- Reviewing archive contents, duplicate tasks, and target projects before a local import changes Codex state.
+- Reviewing archive contents, duplicate tasks, and per-project path mappings before a local import changes Codex state.
 
 ## Features
 
@@ -30,17 +30,18 @@ Codex Session Transfer is designed for:
 - **Task search**: search by task title, project path, and session content.
 - **Project state labels**: missing projects or projects not shown in the Codex sidebar are marked and placed later in the picker.
 - **Import tasks**: preview an archive and import it into the current Codex data directory.
-- **Duplicate handling**: skip existing task IDs by default, or restore existing local history back into the Codex task list.
-- **Target project selection**: choose which local project imported or restored tasks should appear under.
-- **Third-party routed session adaptation**: sessions created through `cc switch` or another third-party API route are imported as normal Codex sessions and continue with the new computer's current Codex default model.
-- **Path adaptation**: map old missing project paths to same-name folders under `~/work`, `~/Projects`, and `~/Documents`.
+- **Duplicate handling**: skip existing task IDs by default or re-register local history. An archive can explicitly supplement local history only when it is a strict superset; richer local history is retained and diverged histories are not auto-merged.
+- **Per-project path mapping**: confirm a local folder for each project in the archive. Exact paths and a single same-name candidate are preselected; ambiguous or missing matches require user selection.
+- **Write compatibility preflight**: before import or re-registration, verify the current Codex database and sidebar-state shapes; stop safely when an unknown newer shape is detected.
+- **Receiving-config adaptation**: imported history keeps its original conversation and historical model metadata, while resumable session context is rewritten to the receiving computer's current Codex provider, model, and reasoning settings.
+- **Path candidate discovery**: look for same-name projects among existing Codex projects and common locations such as the user directory, `~/work`, `~/Projects`, `~/Documents`, and `~/Desktop`; never create placeholder folders.
 - **Running-app protection**: import is blocked while the Codex/ChatGPT desktop main process is running, preventing the client from overwriting restored sidebar state.
 - **Show tasks again**: when a local session still exists but is not shown in Codex, choose the affected tasks by project and safely re-register them.
 - **Local safety backups**: preserve a local Codex-state backup automatically before importing or re-registering tasks.
 
 ## Recovery Boundaries
 
-- In scope: session portability, task titles and project metadata, making tasks visible in the sidebar again, target-project binding, and local safety backups before writes.
+- In scope: session portability, task titles and project metadata, making tasks visible in the sidebar again, per-project path mapping and binding, and local safety backups before writes.
 - Not guaranteed: complete Codex-directory replacement, forced repair of every cache or sort preference, undeclared internal task relationships, or exact long-term-memory merging across tasks.
 - Safety rule: any write to local Codex state should happen after Codex is closed, after impact has been previewed, and with a local safety backup.
 
@@ -76,28 +77,27 @@ Switch to Import Tasks, then drag or choose a `.zip` archive created by this app
 
 ![Import archive](./docs/screenshots/readme/import-empty.png)
 
-### 5. Handle Duplicates and Target Project
+### 5. Handle Duplicates and Project Mapping
 
 After selecting an archive, each task receives an import status:
 
 - `Ready`: the task does not exist locally and can be imported.
 - `Already exists, skip`: the same task ID exists locally and will not be overwritten.
 - `Restore from local history`: re-register an existing local session into the Codex task list.
+- `Supplement local`: available only when the archive fully contains local history and adds more records. Richer local history is retained, while diverged histories are never merged automatically.
 
-You can also choose a target project so imported or restored tasks appear under the intended Codex project group.
+The app shows path mappings for tasks that will actually be processed. An exact path or single same-name local directory is preselected; multiple candidates require manual selection, and a missing match can be resolved with the folder picker. Projects containing only skipped tasks do not block import. Tasks without a recorded project path remain unbound.
 
-![Import settings](./docs/screenshots/readme/import-settings.png)
+## Model and API Route Adaptation
 
-## Third-Party API Routed Sessions
-
-If some tasks on the old computer were created through `cc switch` or another third-party API route, the app migrates them as Codex history sessions instead of migrating the third-party service configuration.
+During import, the app treats conversation content as portable history and provider, model, and reasoning settings as local runtime configuration. Whether a task originally used the official setup or a custom API route, its resumable session context is adapted to the receiving computer's current Codex configuration.
 
 - The exported ZIP keeps the original session content and task history.
-- During import or restore, the task is registered as a normal local Codex session on the new computer.
-- When you continue the task in Codex, it uses the new computer's current Codex default model instead of the old third-party API provider.
+- Historical provider and model labels shown in the task list identify the source only; they do not mean the imported task will keep using that configuration.
+- During import or restore, resumable session context is rewritten to the receiving computer's current provider, model, and reasoning settings.
 - The app does not migrate third-party API keys, route settings, proxy settings, or external model service accounts.
 
-This is intended for bringing history back into Codex and continuing from there. If you want the new computer to keep using the same third-party route, configure that route separately on the new computer.
+If you want the new computer to use the same third-party route as the old one, configure that provider, its API key, and network settings on the new computer before importing.
 
 ## Usage
 
@@ -112,11 +112,11 @@ This is intended for bringing history back into Codex and continuing from there.
 ### Import on the new computer
 
 1. Copy the ZIP archive to the new computer.
-2. Fully quit the Codex/ChatGPT desktop app, preferably with `Cmd + Q` on macOS.
+2. Fully quit the Codex/ChatGPT desktop app: use `Cmd + Q` on macOS; on Windows, quit from the tray or app menu and confirm that the main process has stopped.
 3. Open `Codex Session Transfer` and go to Import Tasks.
 4. Choose the ZIP archive and review the preview.
-5. Choose duplicate handling, target project, and path adaptation options.
-6. Click Import to Codex.
+5. Review duplicate handling and confirm the local path mapping for each project.
+6. Click Confirm Mapping and Import.
 7. Reopen Codex/ChatGPT and check the restored projects and tasks in the sidebar.
 
 ## Duplicate and Restore Rules
@@ -126,7 +126,10 @@ Imports do not overwrite existing tasks by default. The app detects duplicates b
 - New task IDs are written into the Codex session directory.
 - Existing local tasks are skipped by default.
 - Restore from local history re-registers an existing local session into the Codex task list and clears archived/hidden state.
-- Target project selection binds imported or restored tasks to the selected local project.
+- Duplicate histories are compared as ordered session records after receiving-machine path, provider, and model fields are normalized. When the archive is a strict superset, you can explicitly choose **Supplement local**.
+- A local strict superset is retained, identical histories are left unchanged, and histories with additions on both sides are marked as diverged. The app never guesses from timestamps or overwrites JSONL speculatively.
+- Project mappings accept existing local directories only. A missing historical project is never replaced with a newly created placeholder folder.
+- Imported archive sessions are adapted to the receiving computer's current Codex provider, model, and reasoning settings.
 - Import is blocked while Codex/ChatGPT is running to avoid sidebar state being overwritten by the running client.
 
 ## Download
@@ -136,7 +139,7 @@ Download the latest build from GitHub Releases:
 **Latest releases:** [github.com/myyimu/codex-session-transfer/releases/latest](https://github.com/myyimu/codex-session-transfer/releases/latest)
 
 - macOS: `Codex-Session-Transfer-*-arm64.zip`
-- Windows: `Codex-Session-Transfer-*-Windows-portable.zip`
+- Windows: `Codex-Session-Transfer-*-x64-setup.exe`
 
 On macOS, unzip the archive and open the `.app`. If macOS blocks the app, right-click it in Finder and choose Open.
 
@@ -195,6 +198,8 @@ Build outputs are written to `release/`.
 
 The exported ZIP contains a root `manifest.json`. Each task is stored under `tasks/<task-id>/` and includes the original `session.jsonl` plus an optional `browser.toml`.
 
+An archive may contain complete conversations, project paths, tool-execution context, and browser session configuration. Treat the ZIP as sensitive local data; do not upload it to public file shares, issues, or chat rooms.
+
 Current schema version:
 
 ```text
@@ -203,7 +208,7 @@ codex-session-transfer/v1
 
 ## Privacy
 
-The app only reads your local Codex data directory and creates or imports local ZIP files. It does not upload session content and does not require a server.
+The app only reads your local Codex data directory and creates or imports local ZIP files. It does not upload session content and does not require a server. You are responsible for exported archives; uninstalling the app does not remove ZIP files saved elsewhere.
 
 ## License
 

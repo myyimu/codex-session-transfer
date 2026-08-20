@@ -1,5 +1,7 @@
 # Design QA
 
+> Historical evidence notice (2026-08-20): this file records earlier visual QA runs. The absolute source and implementation paths below are retained for provenance and may no longer exist. Because the import flow now includes per-project path mapping and safe continuation merge controls, these captures are not current release-acceptance evidence.
+
 - Source visual truth: `/var/folders/_q/vhx98_y91hlgsx7pml4js18r0000gn/T/codex-clipboard-6b8db959-d0f9-4264-8340-e4de81c05cdf.jpg`
 - Export implementation: `/Users/yimu/work/codex-session-transfer/design-export.png`
 - Import implementation: `/Users/yimu/work/codex-session-transfer/design-import-final.png`
@@ -67,4 +69,4 @@ The 1120 x 760 captures keep list titles, timestamps, paths, statuses, and persi
 
 The browser-only demo bridge does not return a health report, so it cannot open the native repair-plan drawer for a screenshot matched to the supplied drawer reference. The code path is compiled successfully, but this exact native state still needs one visual pass in the desktop app.
 
-- final result: blocked
+- historical result on 2026-07-29: blocked for an exact native repair-drawer capture; this is not an assessment of the current build
