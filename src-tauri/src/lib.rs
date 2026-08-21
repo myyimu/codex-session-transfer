@@ -883,7 +883,7 @@ fn codex_desktop_processes() -> Vec<String> {
             .unwrap_or_default();
         text.lines()
             .filter(|line| is_codex_desktop_process(line))
-            .map(|line| clean_text(line))
+            .map(clean_text)
             .collect()
     }
 }
