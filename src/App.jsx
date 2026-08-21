@@ -434,8 +434,6 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
   const scannedTaskIdsRef = useRef(new Set());
   const healthDrawerRef = useRef(null);
   const healthTriggerRef = useRef(null);
-  const codexRunning = Boolean(environment?.codexRunning);
-
   const load = useCallback(async (resumeToken) => {
     const continuation = typeof resumeToken === "string" ? resumeToken : undefined;
     if (scanRunRef.current && bridge.cancelBackgroundJob) bridge.cancelBackgroundJob(scanRunRef.current);
@@ -580,12 +578,31 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
     setOperation("export");
     onOperationChange("export");
     try {
+      const refreshed = await load();
+      if (!refreshed) return;
+      const refreshedTasks = Array.isArray(refreshed.tasks) ? refreshed.tasks : [];
+      const refreshedIds = new Set(refreshedTasks.map((task) => task.id));
+      const missingSelected = [...selected].filter((id) => !refreshedIds.has(id));
+      if (missingSelected.length) {
+        setSelected((current) => new Set([...current].filter((id) => refreshedIds.has(id))));
+        showToast(
+          "error",
+          "任务列表已更新",
+          `有 ${missingSelected.length} 个已选任务在刷新后不可用，请重新确认选择后再导出。`,
+        );
+        return;
+      }
       const result = await bridge.exportTasks([...selected]);
       if (!result.canceled) {
         showToast("success", `已打包 ${result.count} 个任务`, filename(result.path));
       }
     } catch (error) {
-      showToast("error", "导出失败", error.message);
+      const message = error.message || "导出过程中发生未知错误";
+      if (message.includes("会话仍在更新")) {
+        showToast("error", "会话可能仍在运行", message);
+      } else {
+        showToast("error", "导出失败", message);
+      }
     } finally {
       setOperation("");
       onOperationChange("");
@@ -1045,13 +1062,18 @@ function ImportView({ active, environment, showToast, onOperationChange, onLibra
       const restoredCount = next.restored?.length || 0;
       const mergedCount = next.merged?.length || 0;
       const skippedCount = next.skipped?.length || 0;
+      const incompleteSkippedCount = next.skipped?.filter((item) => item.reason === "incomplete_session").length || 0;
       setResult(next);
       if (importedCount || restoredCount || mergedCount) onLibraryChanged?.();
       const affectedCount = importedCount + restoredCount + mergedCount;
+      const skippedDetails = [
+        incompleteSkippedCount ? `${incompleteSkippedCount} 个不完整会话已跳过` : "",
+        skippedCount - incompleteSkippedCount > 0 ? `${skippedCount - incompleteSkippedCount} 个其他任务已跳过` : "",
+      ].filter(Boolean).join("；");
       showToast(
         "success",
         affectedCount ? `已处理 ${affectedCount} 个任务` : "没有需要导入的任务",
-        mergedCount ? `${mergedCount} 个任务已从归档补全本地记录` : skippedCount ? `${skippedCount} 个重复任务已跳过` : "重启 Codex 后即可看到",
+        mergedCount ? `${mergedCount} 个任务已从归档补全本地记录${skippedDetails ? `；${skippedDetails}` : ""}` : skippedDetails || "重启 Codex 后即可看到",
       );
     } catch (error) {
       showToast("error", "导入失败", error.message);
@@ -1061,15 +1083,20 @@ function ImportView({ active, environment, showToast, onOperationChange, onLibra
     }
   };
 
-  const importableCount = archive?.tasks.filter((task) => !task.conflict).length || 0;
-  const conflictCount = archive?.tasks.filter((task) => task.conflict).length || 0;
-  const mergeableCount = archive?.tasks.filter((task) => task.conflict && task.mergePreview?.canMerge).length || 0;
-  const localRicherCount = archive?.tasks.filter((task) => task.conflict && task.mergePreview?.strategy === "local_superset").length || 0;
-  const divergedCount = archive?.tasks.filter((task) => task.conflict && task.mergePreview?.strategy === "diverged").length || 0;
+  const incompleteCount = archive?.tasks.filter((task) => task.importError).length || 0;
+  const importableArchiveTasks = useMemo(
+    () => archive?.tasks.filter((task) => !task.importError) || [],
+    [archive],
+  );
+  const importableCount = importableArchiveTasks.filter((task) => !task.conflict).length;
+  const conflictCount = importableArchiveTasks.filter((task) => task.conflict).length;
+  const mergeableCount = importableArchiveTasks.filter((task) => task.conflict && task.mergePreview?.canMerge).length;
+  const localRicherCount = importableArchiveTasks.filter((task) => task.conflict && task.mergePreview?.strategy === "local_superset").length;
+  const divergedCount = importableArchiveTasks.filter((task) => task.conflict && task.mergePreview?.strategy === "diverged").length;
   const actionCount = importableCount + (restoreExisting ? conflictCount : 0);
   const visibleProjectMappings = useMemo(
-    () => activeProjectMappings(projectMappings, archive?.tasks || [], restoreExisting),
-    [archive, projectMappings, restoreExisting],
+    () => activeProjectMappings(projectMappings, importableArchiveTasks, restoreExisting),
+    [importableArchiveTasks, projectMappings, restoreExisting],
   );
   const unresolvedMappings = visibleProjectMappings.filter((mapping) => !mapping.targetCwd && !mapping.keepUnbound).length;
   const mappingsReady = unresolvedMappings === 0;
@@ -1134,26 +1161,26 @@ function ImportView({ active, environment, showToast, onOperationChange, onLibra
             <span className="archive-icon"><FileArchive size={26} weight="duotone" /></span>
             <span>
               <strong title={filename(archive.path)}>{filename(archive.path)}</strong>
-              <small title={`${archive.tasks.length} 个任务 · 打包于 ${formatDate(archive.createdAt)}`}>{archive.tasks.length} 个任务 · 打包于 {formatDate(archive.createdAt)}</small>
+              <small title={`${archive.tasks.length} 个任务 · 打包于 ${formatDate(archive.createdAt)}`}>{archive.tasks.length} 个任务 · 打包于 {formatDate(archive.createdAt)}{incompleteCount ? ` · ${incompleteCount} 个不完整` : ""}</small>
             </span>
             <button className="text-button compact" onClick={choose}>重新选择</button>
           </div>
 
           <div className="import-list">
             {visibleArchiveTasks.map((task) => (
-              <div className="import-row" key={task.id}>
-                <span className={`import-state ${task.conflict ? "skip" : "ready"}`}>
-                  {task.conflict ? <ArrowClockwise size={15} /> : <Check size={15} weight="bold" />}
+              <div className={`import-row ${task.importError ? "is-incomplete" : ""}`} key={task.id}>
+                <span className={`import-state ${task.importError || task.conflict ? "skip" : "ready"}`}>
+                  {task.importError ? <X size={15} weight="bold" /> : task.conflict ? <ArrowClockwise size={15} /> : <Check size={15} weight="bold" />}
                 </span>
                 <span className="task-copy">
                   <strong title={task.title || "未命名任务"}>
                     {task.title || "未命名任务"}
                     {modelLabel(task) && <span className="status-chip neutral" title={modelLabel(task)}>{modelLabel(task)}</span>}
                   </strong>
-                  <span title={task.cwd || "未记录工作目录"}>{task.cwd || "未记录工作目录"}</span>
+                  <span title={task.importError || task.cwd || "未记录工作目录"}>{task.importError || task.cwd || "未记录工作目录"}</span>
                 </span>
-                <span className={`status-chip ${task.conflict ? "neutral" : "ready"}`}>
-                  {task.conflict ? (
+                <span className={`status-chip ${task.importError ? "warning" : task.conflict ? "neutral" : "ready"}`}>
+                  {task.importError ? "会话不完整，将跳过" : task.conflict ? (
                     !restoreExisting ? "已存在，将跳过"
                       : mergeTaskIds.has(task.id) ? historyDifferenceText(task.mergePreview, "archive", "将补全本地")
                         : task.mergePreview?.strategy === "archive_superset" ? historyDifferenceText(task.mergePreview, "archive")
@@ -1211,6 +1238,16 @@ function ImportView({ active, environment, showToast, onOperationChange, onLibra
               <span>
                 <strong>请先完全退出 Codex</strong>
                 <small>导入会修改本地侧栏状态；Codex 正在运行时可能把恢复结果覆盖掉</small>
+              </span>
+            </div>
+          )}
+
+          {incompleteCount > 0 && (
+            <div className="result-strip warning-strip">
+              <X size={20} weight="bold" />
+              <span>
+                <strong>{incompleteCount} 个会话不完整</strong>
+                <small>这些会话会被跳过，其他完整会话仍可正常导入</small>
               </span>
             </div>
           )}

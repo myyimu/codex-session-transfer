@@ -460,6 +460,7 @@ struct InspectedTask {
     task: Task,
     conflict: bool,
     merge_preview: Option<SessionMergePreview>,
+    import_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2919,7 +2920,44 @@ fn read_file_text_limited(path: &Path, limit: u64, too_large: &str) -> Result<St
     read_text_limited(file, limit, too_large)
 }
 
-fn archive_manifest(path: &Path) -> Result<Manifest, String> {
+fn validate_archive_task(zip: &mut ZipArchive<File>, task: &ArchiveTask) -> Result<(), String> {
+    let session = zip
+        .by_name(&task.session_file)
+        .map_err(|_| "压缩包缺少会话文件".to_string())?;
+    if session.size() > MAX_SESSION_BYTES {
+        return Err(format!("任务 {} 的会话文件超过 128 MB", task.task.id));
+    }
+    let session_id = session_meta_id(BufReader::new(session))?;
+    if session_id != task.task.id {
+        return Err("压缩包会话 ID 与 manifest 不一致".to_string());
+    }
+    let session = zip
+        .by_name(&task.session_file)
+        .map_err(|_| "压缩包缺少会话文件".to_string())?;
+    let session_forked_from_id = session_meta_forked_from_id(BufReader::new(session))?;
+    if !task.task.forked_from_id.is_empty() && task.task.forked_from_id != session_forked_from_id {
+        return Err("压缩包会话关系与 manifest 不一致".to_string());
+    }
+    let session = zip
+        .by_name(&task.session_file)
+        .map_err(|_| "压缩包缺少会话文件".to_string())?;
+    read_text_limited(session, MAX_SESSION_BYTES, "压缩包中的会话文件超过 128 MB")?;
+    if let Some(browser_file) = &task.browser_file {
+        let browser = zip
+            .by_name(browser_file)
+            .map_err(|_| "压缩包缺少浏览器配置".to_string())?;
+        read_bytes_limited(
+            browser,
+            MAX_BROWSER_SESSION_BYTES,
+            &format!("任务 {} 的浏览器配置超过 32 MB", task.task.id),
+        )?;
+    }
+    Ok(())
+}
+
+fn archive_manifest_with_task_errors(
+    path: &Path,
+) -> Result<(Manifest, HashMap<String, String>), String> {
     let file = File::open(path).map_err(|_| "找不到所选压缩包".to_string())?;
     let mut zip = ZipArchive::new(file).map_err(|_| "这不是有效的 ZIP 压缩包".to_string())?;
     if zip.len() > MAX_ARCHIVE_ENTRIES {
@@ -2974,36 +3012,23 @@ fn archive_manifest(path: &Path) -> Result<Manifest, String> {
         return Err("这不是有效的 Codex 会话迁移压缩包".to_string());
     }
     let mut ids = HashSet::new();
+    let mut task_errors = HashMap::new();
     for task in &manifest.tasks {
         if !ids.insert(task.task.id.as_str()) {
             return Err("压缩包包含重复会话 ID".to_string());
         }
-        let session = zip
-            .by_name(&task.session_file)
-            .map_err(|_| "压缩包缺少会话文件".to_string())?;
-        if session.size() > MAX_SESSION_BYTES {
-            return Err(format!("任务 {} 的会话文件超过 128 MB", task.task.id));
+        if let Err(error) = validate_archive_task(&mut zip, task) {
+            task_errors.insert(task.task.id.clone(), error);
         }
-        let session_id = session_meta_id(BufReader::new(session))?;
-        if session_id != task.task.id {
-            return Err("压缩包会话 ID 与 manifest 不一致".to_string());
-        }
-        let session = zip
-            .by_name(&task.session_file)
-            .map_err(|_| "压缩包缺少会话文件".to_string())?;
-        let session_forked_from_id = session_meta_forked_from_id(BufReader::new(session))?;
-        if !task.task.forked_from_id.is_empty()
-            && task.task.forked_from_id != session_forked_from_id
-        {
-            return Err("压缩包会话关系与 manifest 不一致".to_string());
-        }
-        if let Some(browser_file) = &task.browser_file {
-            let browser = zip
-                .by_name(browser_file)
-                .map_err(|_| "压缩包缺少浏览器配置".to_string())?;
-            if browser.size() > MAX_BROWSER_SESSION_BYTES {
-                return Err(format!("任务 {} 的浏览器配置超过 32 MB", task.task.id));
-            }
+    }
+    Ok((manifest, task_errors))
+}
+
+fn archive_manifest(path: &Path) -> Result<Manifest, String> {
+    let (manifest, task_errors) = archive_manifest_with_task_errors(path)?;
+    for task in &manifest.tasks {
+        if let Some(error) = task_errors.get(&task.task.id) {
+            return Err(error.clone());
         }
     }
     Ok(manifest)
@@ -4825,6 +4850,11 @@ fn list_tasks() -> Result<TaskList, String> {
     })
 }
 
+fn file_changed_since(path: &Path, before: &fs::Metadata) -> Result<bool, String> {
+    let after = fs::metadata(path).map_err(|error| error.to_string())?;
+    Ok(after.len() != before.len() || after.modified().ok() != before.modified().ok())
+}
+
 fn write_export_archive(destination: &Path, selected: &[Task]) -> Result<u64, String> {
     let parent = destination
         .parent()
@@ -4836,9 +4866,8 @@ fn write_export_archive(destination: &Path, selected: &[Task]) -> Result<u64, St
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut archive_tasks = Vec::new();
     for task in selected {
-        let session_size = fs::metadata(&task.file_path)
-            .map_err(|error| error.to_string())?
-            .len();
+        let session_metadata = fs::metadata(&task.file_path).map_err(|error| error.to_string())?;
+        let session_size = session_metadata.len();
         if session_size > MAX_SESSION_BYTES {
             return Err(format!("任务 {} 的会话文件超过 128 MB，无法导出", task.id));
         }
@@ -4847,6 +4876,12 @@ fn write_export_archive(destination: &Path, selected: &[Task]) -> Result<u64, St
             .map_err(|error| error.to_string())?;
         let mut source = File::open(&task.file_path).map_err(|error| error.to_string())?;
         std::io::copy(&mut source, &mut zip).map_err(|error| error.to_string())?;
+        if file_changed_since(&task.file_path, &session_metadata)? {
+            return Err(format!(
+                "会话仍在更新：任务「{}」在打包期间发生变化。请先结束该会话后重试；也可以取消选择此任务，导出其他正常会话。",
+                task.title
+            ));
+        }
         let browser_file = if task.browser_file.exists() {
             let browser_size = fs::metadata(&task.browser_file)
                 .map_err(|error| error.to_string())?
@@ -4890,6 +4925,7 @@ fn write_export_archive(destination: &Path, selected: &[Task]) -> Result<u64, St
         .as_file()
         .sync_all()
         .map_err(|error| error.to_string())?;
+    archive_manifest(temporary.path()).map_err(|error| format!("导出校验失败：{error}"))?;
     temporary
         .persist(destination)
         .map_err(|error| error.error.to_string())?;
@@ -5013,7 +5049,7 @@ fn restore_local_tasks_blocking(task_ids: Vec<String>) -> Result<serde_json::Val
 }
 
 fn inspect_archive_blocking(archive_path: String) -> Result<ArchiveInspection, String> {
-    let manifest = archive_manifest(Path::new(&archive_path))?;
+    let (manifest, task_errors) = archive_manifest_with_task_errors(Path::new(&archive_path))?;
     let model_settings = codex_model_settings(&codex_home());
     let file = File::open(&archive_path).map_err(|_| "找不到所选压缩包".to_string())?;
     let mut zip = ZipArchive::new(file).map_err(|_| "这不是有效的 ZIP 压缩包".to_string())?;
@@ -5022,19 +5058,36 @@ fn inspect_archive_blocking(archive_path: String) -> Result<ArchiveInspection, S
         .map(|task| (task.id.clone(), task))
         .collect();
     let local_tasks = existing.values().cloned().collect::<Vec<_>>();
-    let project_mappings = suggest_import_project_mappings(&manifest.tasks, &local_tasks);
+    let valid_archive_tasks = manifest
+        .tasks
+        .iter()
+        .filter(|item| !task_errors.contains_key(&item.task.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let project_mappings = suggest_import_project_mappings(&valid_archive_tasks, &local_tasks);
     let mut inspected_tasks = Vec::with_capacity(manifest.tasks.len());
     for item in manifest.tasks {
+        let mut import_error = task_errors.get(&item.task.id).cloned();
         let mut task = item.task;
-        let archive_file = zip
-            .by_name(&item.session_file)
-            .map_err(|_| "压缩包缺少会话文件".to_string())?;
-        let contents = read_text_limited(
-            archive_file,
-            MAX_SESSION_BYTES,
-            "压缩包中的会话文件超过 128 MB",
-        )?;
-        hydrate_task_from_session_content(&mut task, &contents);
+        let mut contents = None;
+        if import_error.is_none() {
+            match zip
+                .by_name(&item.session_file)
+                .map_err(|_| "压缩包缺少会话文件".to_string())
+                .and_then(|archive_file| {
+                    read_text_limited(
+                        archive_file,
+                        MAX_SESSION_BYTES,
+                        "压缩包中的会话文件超过 128 MB",
+                    )
+                }) {
+                Ok(session_contents) => {
+                    hydrate_task_from_session_content(&mut task, &session_contents);
+                    contents = Some(session_contents);
+                }
+                Err(error) => import_error = Some(error),
+            }
+        }
         normalize_task_title(&mut task);
         if task.title.is_empty() {
             task.title = format!("未命名任务 {}", &task.id[..task.id.len().min(8)]);
@@ -5042,18 +5095,21 @@ fn inspect_archive_blocking(archive_path: String) -> Result<ArchiveInspection, S
         if task.model_provider.trim() == "custom" {
             normalize_task_to_codex_model(&mut task, &model_settings);
         }
-        let merge_preview = existing.get(&task.id).and_then(|local_task| {
-            read_file_text_limited(
-                &local_task.file_path,
-                MAX_SESSION_BYTES,
-                "本机会话文件超过 128 MB，无法自动比较",
-            )
-            .ok()
-            .map(|local_contents| safe_merge_session_jsonl(&contents, &local_contents).preview)
+        let merge_preview = contents.as_deref().and_then(|contents| {
+            existing.get(&task.id).and_then(|local_task| {
+                read_file_text_limited(
+                    &local_task.file_path,
+                    MAX_SESSION_BYTES,
+                    "本机会话文件超过 128 MB，无法自动比较",
+                )
+                .ok()
+                .map(|local_contents| safe_merge_session_jsonl(contents, &local_contents).preview)
+            })
         });
         inspected_tasks.push(InspectedTask {
             conflict: existing.contains_key(&task.id),
             merge_preview,
+            import_error,
             task,
         });
     }
@@ -5081,7 +5137,7 @@ fn import_archive_blocking(
         return Err("检测到 Codex/ChatGPT 桌面端正在运行。请先完全退出 Codex，再执行导入或恢复，避免侧边栏状态被运行中的客户端覆盖。".to_string());
     }
     let source = PathBuf::from(&archive_path);
-    let manifest = archive_manifest(&source)?;
+    let (manifest, task_errors) = archive_manifest_with_task_errors(&source)?;
     let home = codex_home();
     let _write_guard = acquire_local_write_operation(&home)?;
     validate_codex_write_compatibility(&home)?;
@@ -5130,6 +5186,9 @@ fn import_archive_blocking(
         }
     }
     for item in &manifest.tasks {
+        if task_errors.contains_key(&item.task.id) {
+            continue;
+        }
         let will_process = !existing_tasks.contains_key(&item.task.id) || restore_existing;
         if will_process
             && !item.task.cwd.trim().is_empty()
@@ -5151,15 +5210,61 @@ fn import_archive_blocking(
     let mut merged = Vec::new();
     let mut skipped = Vec::new();
     for entry in manifest.tasks {
+        if let Some(error) = task_errors.get(&entry.task.id) {
+            skipped.push(serde_json::json!({
+                "id": entry.task.id,
+                "title": entry.task.title,
+                "reason": "incomplete_session",
+                "detail": error,
+            }));
+            continue;
+        }
         let mut archive_task = entry.task;
-        let archive_file = zip
+        let content = match zip
             .by_name(&entry.session_file)
-            .map_err(|_| "压缩包缺少会话文件".to_string())?;
-        let content = read_text_limited(
-            archive_file,
-            MAX_SESSION_BYTES,
-            "压缩包中的会话文件超过 128 MB",
-        )?;
+            .map_err(|_| "压缩包缺少会话文件".to_string())
+            .and_then(|archive_file| {
+                read_text_limited(
+                    archive_file,
+                    MAX_SESSION_BYTES,
+                    "压缩包中的会话文件超过 128 MB",
+                )
+            }) {
+            Ok(content) => content,
+            Err(error) => {
+                skipped.push(serde_json::json!({
+                    "id": archive_task.id,
+                    "title": archive_task.title,
+                    "reason": "incomplete_session",
+                    "detail": error,
+                }));
+                continue;
+            }
+        };
+        let browser_contents = match entry.browser_file.as_ref() {
+            Some(browser_file) => match zip
+                .by_name(browser_file)
+                .map_err(|_| "压缩包缺少浏览器配置".to_string())
+                .and_then(|browser| {
+                    read_bytes_limited(
+                        browser,
+                        MAX_BROWSER_SESSION_BYTES,
+                        "压缩包中的浏览器配置超过 32 MB",
+                    )
+                }) {
+                Ok(contents) => Some(contents),
+                Err(error) => {
+                    skipped.push(serde_json::json!({
+                        "id": archive_task.id,
+                        "title": archive_task.title,
+                        "reason": "incomplete_session",
+                        "detail": error,
+                    }));
+                    continue;
+                }
+            },
+            None => None,
+        };
         hydrate_task_from_session_content(&mut archive_task, &content);
         normalize_task_title(&mut archive_task);
         // Archives are history, not portable API configuration.  Always adapt
@@ -5340,15 +5445,7 @@ fn import_archive_blocking(
             normalize_task_to_codex_model(&mut task, &model_settings);
         }
         transaction.write_file(&rollout_path, session_content, &stamp)?;
-        if let Some(browser_file) = entry.browser_file {
-            let browser = zip
-                .by_name(&browser_file)
-                .map_err(|_| "压缩包缺少浏览器配置".to_string())?;
-            let contents = read_bytes_limited(
-                browser,
-                MAX_BROWSER_SESSION_BYTES,
-                "压缩包中的浏览器配置超过 32 MB",
-            )?;
+        if let Some(contents) = browser_contents {
             let browser_path = home
                 .join("browser")
                 .join("sessions")
@@ -5470,8 +5567,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_local_write_operation, append_index, archive_manifest, codex_model_settings,
-        codex_state_paths, history_first_messages, infer_project, is_bad_title,
+        acquire_local_write_operation, append_index, archive_manifest,
+        archive_manifest_with_task_errors, codex_model_settings, codex_state_paths,
+        file_changed_since, history_first_messages, infer_project, is_bad_title,
         is_codex_context_text, is_codex_desktop_process, is_safe_task_id, latest_state_database,
         local_snapshots, meaningful_user_text, prune_paused_task_scans, register_catalog_threads,
         register_desktop_project_state, register_threads, repository_name, rewrite_session_cwd,
@@ -5869,6 +5967,59 @@ mod tests {
     }
 
     #[test]
+    fn archive_manifest_keeps_valid_tasks_when_another_session_is_incomplete() {
+        let path = env::temp_dir().join(format!(
+            "codex-session-transfer-partial-{}.zip",
+            std::process::id()
+        ));
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let mut good_task = task_with("完整任务", "/tmp/project", "");
+        good_task.id = "good-task-id".to_string();
+        let mut incomplete_task = task_with("不完整任务", "/tmp/project", "");
+        incomplete_task.id = "incomplete-task-id".to_string();
+        let manifest = Manifest {
+            schema: ARCHIVE_SCHEMA.to_string(),
+            created_at: "2026-07-22T12:00:00Z".to_string(),
+            source_platform: "macos".to_string(),
+            tasks: vec![
+                ArchiveTask {
+                    task: good_task,
+                    session_file: "tasks/good-task-id/session.jsonl".to_string(),
+                    browser_file: None,
+                },
+                ArchiveTask {
+                    task: incomplete_task,
+                    session_file: "tasks/incomplete-task-id/session.jsonl".to_string(),
+                    browser_file: None,
+                },
+            ],
+        };
+        zip.start_file("manifest.json", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(serde_json::to_string(&manifest).unwrap().as_bytes())
+            .unwrap();
+        zip.start_file(
+            "tasks/good-task-id/session.jsonl",
+            SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(br#"{"type":"session_meta","payload":{"id":"good-task-id"}}"#)
+            .unwrap();
+        zip.finish().unwrap();
+
+        let (manifest, errors) = archive_manifest_with_task_errors(&path).unwrap();
+        fs::remove_file(path).ok();
+
+        assert_eq!(manifest.tasks.len(), 2);
+        assert!(!errors.contains_key("good-task-id"));
+        assert_eq!(
+            errors.get("incomplete-task-id").map(String::as_str),
+            Some("压缩包缺少会话文件")
+        );
+    }
+
+    #[test]
     fn failed_export_preserves_an_existing_destination() {
         let temporary = tempfile::tempdir().unwrap();
         let destination = temporary.path().join("existing.zip");
@@ -5880,6 +6031,41 @@ mod tests {
         let result = write_export_archive(&destination, &[task]);
 
         assert!(result.is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"trusted previous archive");
+    }
+
+    #[test]
+    fn export_detects_source_file_changes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("session.jsonl");
+        fs::write(&source, b"before").unwrap();
+        let before = fs::metadata(&source).unwrap();
+        fs::write(&source, b"after-content").unwrap();
+
+        assert!(file_changed_since(&source, &before).unwrap());
+    }
+
+    #[test]
+    fn failed_export_rejects_session_metadata_mismatch_before_replacing_destination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("existing.zip");
+        let source = temporary.path().join("session.jsonl");
+        fs::write(&destination, b"trusted previous archive").unwrap();
+        fs::write(
+            &source,
+            br#"{"type":"session_meta","payload":{"id":"actual-session-id"}}
+"#,
+        )
+        .unwrap();
+        let mut task = task_with("mismatched session", "/tmp/project", "");
+        task.id = "manifest-task-id".to_string();
+        task.file_path = source;
+
+        let result = write_export_archive(&destination, &[task]);
+
+        assert!(result
+            .unwrap_err()
+            .contains("压缩包会话 ID 与 manifest 不一致"));
         assert_eq!(fs::read(&destination).unwrap(), b"trusted previous archive");
     }
 

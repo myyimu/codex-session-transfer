@@ -1,6 +1,6 @@
 {
   "name": "codex-session-transfer",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "description": "Local-first desktop utility for exporting, importing, syncing, and restoring selected Codex project task sessions across computers.",
   "author": "myyimu",
   "license": "MIT",
