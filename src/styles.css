@@ -37,6 +37,35 @@ button {
   background: #eaf7fc url("/watercolor-dreamscape.jpg") center / cover no-repeat;
 }
 
+.app-shell.app-error-state {
+  grid-template-columns: minmax(0, 1fr);
+  place-items: center;
+  padding: 32px;
+}
+
+.error-panel {
+  width: min(520px, 100%);
+  display: grid;
+  gap: 12px;
+  padding: 28px;
+  border: 1px solid rgba(37, 105, 137, 0.2);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 18px 48px rgba(45, 108, 143, 0.16);
+}
+
+.error-panel strong {
+  color: #244653;
+  font-size: 16px;
+}
+
+.error-panel span {
+  color: #667b84;
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+
 .app-shell::after {
   content: "";
   position: absolute;
@@ -1594,7 +1623,6 @@ h1 {
   display: flex;
   justify-content: flex-end;
   background: rgba(22, 44, 53, 0.18);
-  backdrop-filter: blur(2px);
 }
 
 .health-drawer {

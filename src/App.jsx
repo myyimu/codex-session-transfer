@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
   ArrowClockwise,
@@ -32,6 +32,32 @@ import {
 
 const bridge = window.__TAURI_INTERNALS__ ? tauriBridge : demoBridge;
 const isMacOS = /Macintosh|Mac OS X/.test(navigator.userAgent);
+
+class RenderErrorBoundary extends Component {
+  state = { error: null };
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    console.error("Codex 会话迁移界面渲染失败", error, info);
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    const message = this.state.error?.message || "界面发生未知错误";
+    return (
+      <main className="app-shell app-error-state">
+        <section className="error-panel" role="alert">
+          <strong>界面加载失败</strong>
+          <span>{message}</span>
+          <button type="button" className="primary-button" onClick={() => window.location.reload()}>重新加载界面</button>
+        </section>
+      </main>
+    );
+  }
+}
 
 function formatDate(value) {
   if (!value) return "时间未知";
@@ -429,6 +455,7 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
   const [confirmSnapshotDelete, setConfirmSnapshotDelete] = useState(false);
   const [visibleLimit, setVisibleLimit] = useState(120);
   const [scanProgress, setScanProgress] = useState(null);
+  const codexRunning = Boolean(environment?.codexRunning);
   const scanRunRef = useRef(null);
   const libraryRevisionRef = useRef(libraryRevision);
   const scannedTaskIdsRef = useRef(new Set());
@@ -700,7 +727,7 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
   );
 
   const toggleAllRepairable = () => {
-    const actionable = repairPlan?.items.filter((item) => item.canApply).map((item) => item.id) || [];
+    const actionable = (repairPlan?.items || []).filter((item) => item.canApply).map((item) => item.id);
     setHealthSelection((current) => current.size === actionable.length ? new Set() : new Set(actionable));
   };
 
@@ -915,8 +942,8 @@ function ExportView({ environment, showToast, refreshEnvironment, onOperationCha
                       ))}
                     </section>
                   ))}
-                  {!planning && !repairPlan?.items.length && <div className="repair-plan-empty">没有发现可安全修复的任务</div>}
-                  {!planning && repairPlan?.items.length > 0 && !repairGroups.length && <div className="repair-plan-empty">没有匹配的修复建议</div>}
+                  {!planning && !(repairPlan?.items || []).length && <div className="repair-plan-empty">没有发现可安全修复的任务</div>}
+                  {!planning && (repairPlan?.items || []).length > 0 && !repairGroups.length && <div className="repair-plan-empty">没有匹配的修复建议</div>}
                 </div>
               </>
             )}
@@ -977,11 +1004,12 @@ function ImportView({ active, environment, showToast, onOperationChange, onLibra
   const codexRunning = Boolean(environment?.codexRunning);
 
   const acceptArchive = useCallback((next) => {
+    if (!next || typeof next !== "object") return;
     setArchive(next);
     setResult(null);
     setRestoreExisting(false);
     setMergeTaskIds(new Set());
-    setProjectMappings(prepareProjectMappings(next.projectMappings));
+    setProjectMappings(prepareProjectMappings(Array.isArray(next.projectMappings) ? next.projectMappings : []));
     setVisibleTaskLimit(120);
   }, []);
 
@@ -1083,10 +1111,11 @@ function ImportView({ active, environment, showToast, onOperationChange, onLibra
     }
   };
 
-  const incompleteCount = archive?.tasks.filter((task) => task.importError).length || 0;
+  const archiveTasks = Array.isArray(archive?.tasks) ? archive.tasks : [];
+  const incompleteCount = archiveTasks.filter((task) => task.importError).length;
   const importableArchiveTasks = useMemo(
-    () => archive?.tasks.filter((task) => !task.importError) || [],
-    [archive],
+    () => archiveTasks.filter((task) => !task.importError),
+    [archiveTasks],
   );
   const importableCount = importableArchiveTasks.filter((task) => !task.conflict).length;
   const conflictCount = importableArchiveTasks.filter((task) => task.conflict).length;
@@ -1100,7 +1129,7 @@ function ImportView({ active, environment, showToast, onOperationChange, onLibra
   );
   const unresolvedMappings = visibleProjectMappings.filter((mapping) => !mapping.targetCwd && !mapping.keepUnbound).length;
   const mappingsReady = unresolvedMappings === 0;
-  const visibleArchiveTasks = archive?.tasks.slice(0, visibleTaskLimit) || [];
+  const visibleArchiveTasks = archiveTasks.slice(0, visibleTaskLimit);
   const updateProjectMapping = (sourceKey, targetCwd) => {
     const normalizedTarget = normalizeDisplayPath(targetCwd);
     if (isCodexWorktreePath(normalizedTarget)) {
@@ -1161,7 +1190,7 @@ function ImportView({ active, environment, showToast, onOperationChange, onLibra
             <span className="archive-icon"><FileArchive size={26} weight="duotone" /></span>
             <span>
               <strong title={filename(archive.path)}>{filename(archive.path)}</strong>
-              <small title={`${archive.tasks.length} 个任务 · 打包于 ${formatDate(archive.createdAt)}`}>{archive.tasks.length} 个任务 · 打包于 {formatDate(archive.createdAt)}{incompleteCount ? ` · ${incompleteCount} 个不完整` : ""}</small>
+              <small title={`${archiveTasks.length} 个任务 · 打包于 ${formatDate(archive.createdAt)}`}>{archiveTasks.length} 个任务 · 打包于 {formatDate(archive.createdAt)}{incompleteCount ? ` · ${incompleteCount} 个不完整` : ""}</small>
             </span>
             <button className="text-button compact" onClick={choose}>重新选择</button>
           </div>
@@ -1207,9 +1236,9 @@ function ImportView({ active, environment, showToast, onOperationChange, onLibra
                 )}
               </div>
             ))}
-            {archive.tasks.length > visibleArchiveTasks.length && (
+            {archiveTasks.length > visibleArchiveTasks.length && (
               <button className="text-button load-more-tasks" onClick={() => setVisibleTaskLimit((current) => current + 120)}>
-                显示更多任务（剩余 {archive.tasks.length - visibleArchiveTasks.length} 个）
+                显示更多任务（剩余 {archiveTasks.length - visibleArchiveTasks.length} 个）
               </button>
             )}
           </div>
@@ -1317,7 +1346,7 @@ function ImportView({ active, environment, showToast, onOperationChange, onLibra
   );
 }
 
-export function App() {
+function AppShell() {
   const [mode, setMode] = useState("export");
   const [activeOperation, setActiveOperation] = useState("");
   const [environment, setEnvironment] = useState(null);
@@ -1411,5 +1440,13 @@ export function App() {
       </div>
       <Toast toast={toast} onClose={() => setToast(null)} />
     </main>
+  );
+}
+
+export function App() {
+  return (
+    <RenderErrorBoundary>
+      <AppShell />
+    </RenderErrorBoundary>
   );
 }
