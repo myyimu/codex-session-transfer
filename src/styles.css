@@ -1009,6 +1009,10 @@ h1 {
   border-bottom: 1px solid rgba(50, 77, 87, 0.08);
 }
 
+.import-row.is-incomplete {
+  background: #fff8fa;
+}
+
 .import-row .task-copy {
   gap: 2px;
 }
